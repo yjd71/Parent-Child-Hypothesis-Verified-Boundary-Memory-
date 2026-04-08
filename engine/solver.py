@@ -209,7 +209,7 @@ class SemiSupervisedTrainer:
             model=self.model if not self.config.distributed_train else self.model.module,
         )
         for testset_name, testloader in self.test_loaders.items():
-            evaluator.inference_on_dataset(testloader, testset_name)
+            evaluator.inference_on_dataset(testloader, testset_name, epoch=epoch)
             result = evaluator.evaluate_inference_result(testloader, testset_name, epoch=epoch)
             wandb.log(
                 {

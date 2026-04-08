@@ -30,11 +30,13 @@ class Evaluator:
         logger.freeze_info("[+] Evaluator will be initialize with existing model...")
         return cls(config, logger, resume, device, model)
     
-    def inference_on_dataset(self, dataloader: data.DataLoader, testset_name: str, ema=False) -> None:
+    def inference_on_dataset(self, dataloader: data.DataLoader, testset_name: str, ema=False, epoch: int=None) -> None:
         model_training_state = self.model.training
         # if model_training_state:
         #     self.model.eval()
-        current_save_dir = os.path.join(self.config.pred_save_root, self.config.task, testset_name)
+        current_save_dir = os.path.join(self.config.pred_save_root, testset_name)
+        if epoch is not None:
+            current_save_dir = os.path.join(current_save_dir, f'epoch_{epoch}')
         os.makedirs(current_save_dir, exist_ok=True)
         
         for batch in tqdm(dataloader, total=len(dataloader)):
@@ -55,7 +57,7 @@ class Evaluator:
                 save_tensor_img(res, os.path.join(current_save_dir, save_imgfile_name))
                 
     def evaluate_inference_result(self, dataloader: data.DataLoader, testset_name: str, save_dir_replace: str=None, epoch: int=None) -> dict:
-        results_dir = os.path.join(self.config.pred_save_root, self.config.task, 'results')
+        results_dir = os.path.join(self.config.pred_save_root, 'results')
         os.makedirs(results_dir, exist_ok=True)
 
         default_log_savedir = os.path.join(results_dir, '{}.log'.format(testset_name))
@@ -63,8 +65,10 @@ class Evaluator:
         log_save_parent = os.path.dirname(log_savedir)
         if log_save_parent:
             os.makedirs(log_save_parent, exist_ok=True)
-        
-        current_result_dir = os.path.join(self.config.pred_save_root, self.config.task, testset_name)
+
+        current_result_dir = os.path.join(self.config.pred_save_root, testset_name)
+        if epoch is not None:
+            current_result_dir = os.path.join(current_result_dir, f'epoch_{epoch}')
         gt_path = os.path.join(self.config.data_root_dir, self.config.task, testset_name)
         assert os.path.isdir(current_result_dir), f"[x] {current_result_dir} not exists!"
         
