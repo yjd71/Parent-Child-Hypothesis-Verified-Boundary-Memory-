@@ -29,12 +29,13 @@ def build_model(config: Config) -> torch.nn.Module:
 def build_model_optimizers(config: Config, logger: Logger, device: torch.device, resume: str = None) -> any:
     model = build_model(config)
     epoch_st = 0
+    checkpoint = None
 
     if resume is not None:
         if os.path.isfile(resume):
             logger.key_info("[+] Loading model checkpoint from '{}'".format(resume))
-            state_dict = torch.load(resume, map_location='cpu')
-            model.load_state_dict(state_dict['model'], strict=False)
+            checkpoint = torch.load(resume, map_location='cpu')
+            model.load_state_dict(checkpoint['model'], strict=False)
         else:
             logger.warn_info("[!] No checkpoint found at '{}'".format(resume))
 
@@ -61,6 +62,15 @@ def build_model_optimizers(config: Config, logger: Logger, device: torch.device,
         milestones=[lde if lde > 0 else config.tot_epochs + lde + 1 for lde in config.lr_decay_epochs],
         gamma=config.lr_decay_rate,
     )
+
+    if checkpoint is not None:
+        if 'optimizer' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+        if 'lr_scheduler' in checkpoint:
+            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+        if 'epoch' in checkpoint:
+            epoch_st = checkpoint['epoch'] + 1
+            logger.key_info("[+] Resume training from epoch {}".format(epoch_st))
 
     logger.freeze_info("Optimizer details: {}".format(str(optimizer)))
     logger.freeze_info("Scheduler details: {}".format(str(lr_scheduler.state_dict())))
