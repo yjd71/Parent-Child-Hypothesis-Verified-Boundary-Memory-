@@ -1,362 +1,610 @@
-# 半监督 COD 双原型库融合改造完整方案（训练 + 推理 + Evaluator 全链路版）
+# Mean-Teacher 半监督 COD 的动态原型库融合方案
 
-## Summary
-- 在现有 `BaseLine` mean-teacher 框架中加入“双原型库纠偏分支”，并将其覆盖到训练、在线验证、离线推理和 evaluator。
-- 原型特征默认使用 backbone 原始第三层 `f3`，但实现上不再假设固定通道数或固定空间尺寸；通过 `config.base.prototype.py` 指定使用哪一层，并在模型初始化时动态推断该层的 `channels / height / width / stride`。
-- 原型库构建只在主训练流的监督 batch 中进行，不额外切 `eval()` 再跑一遍 backbone。
-- warm-up 和半监督阶段的每一个 epoch 都完整建库：
-  - 当前 epoch：监督 batch 在线收集本 epoch 原型
-  - epoch 末：聚合为 `next_bank`
-  - 下一 epoch：激活为 `active_bank`
-- 推理和 evaluator 引入原型库后，默认使用 `rectified_logit` 作为最终预测；同时保留配置开关，允许回退到 baseline 输出做对照。
+## 摘要
+- 目标是在 `BaseLine` 的 Mean-Teacher 框架中，融合 `RISE` 的空库初始化思想、`EASE` 的前/背景双库检索与 `M(x)` 生成、`CRLN` 的“原型参与纠正预测 + 融合模块单独监督”策略，且统一基于 decoder `p3` 特征。
+- 原型库改为动态规模：每个 epoch 清空；每张有标签图在 `p3` 空间提取 `1` 个前景原型和 `1` 个背景原型；直接拼接成当轮全局库；不设固定库容量，不做 KMeans，不跨 epoch 累积。
+- 监督改为两条路径：
+  - 主模型：监督 student 主输出 `\hat y` 和原型图 `H(x)`
+  - 融合标量 `μ`：只用 labeled 数据，通过纠正预测 `\hat y_r` 的损失单独更新
+- 推理与 evaluator 同样接入原型库，最终输出使用纠正后的 `y_final = y + (1-\mu)H(x)`。
 
-## Public Interfaces
-- `ModelEMA.forward`
-  - 改为 `forward(x, ema=False, **kwargs)`
-  - `ema=False` 走 student，`ema=True` 走 teacher，其他参数全部透传
-- `TalNet.forward`
-  - `forward(x)`：保持旧行为，返回原 `scaled_preds`
-  - `forward(x, return_aux=True, proto_enable=False, proto_bank=None, proto_gamma=1.0, proto_infer_output="rectified")`：返回字典
-- `TalNet.forward(..., return_aux=True)` 返回字段固定为：
-  - `scaled_preds`
-  - `gdt`
-  - `raw_feats`
-  - `proto`
-  - `rectified_logit`
-  - `final_logit`
-- `raw_feats`
-  - 固定包含 `{"f1","f2","f3","f4"}`
-  - 全部来自 backbone 原始输出，不包含半尺度复算拼接结果
-- `proto`
-  - 固定返回 `sim_fg / sim_bg / fu_fg / fu_bg / alpha / theta / proto_logit / m_prob / proto_logit_full`
-- `final_logit`
-  - 训练时：
-    - 若 `proto_enable=False` 或 bank 不可用，`final_logit = scaled_preds[-1]`
-    - 若 `proto_enable=True`，`final_logit = rectified_logit`
-  - 推理时：
-    - 根据配置决定取 `rectified_logit`、`scaled_preds[-1]` 或 `m_prob`
+## 核心设计
+### 1. 原型库构建
+- 输入特征固定为 decoder `p3`，即 `p3 ∈ R^{B×C×h×w}`，`C/h/w` 动态读取，不能写死。
+- 每个 epoch 开始时清空库：
+  \[
+  \mathcal P_{fg} = \emptyset,\quad \mathcal P_{bg} = \emptyset
+  \]
+- 对每张 labeled 图：
+  1. 将 `gt` resize 到 `p3` 空间
+  2. `fg_mask = gt > 0.5`, `bg_mask = 1 - fg_mask`
+  3. 对 `p3` 做 masked average pooling，分别得到 `1` 个前景原型、`1` 个背景原型
+  4. 若某类像素数 `< prototype_min_pixels`，则跳过该类
+  5. 将所有有效图像原型直接拼接成全局库
+- 库规模是动态的：
+  \[
+  |\mathcal P_{fg}| = N_{fg}^{valid},\quad |\mathcal P_{bg}| = N_{bg}^{valid}
+  \]
+  其中 `N_valid` 为当前 epoch 已见到的有效 labeled 图数。
 
-## Configuration
-- 在 [mkcfg.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\config\mkcfg.py) 中新增：
-  - `PROTOTYPE_CONFIG_DIR = 'config/base/prototype.py'`
-  - merge 顺序固定为：
-    - `common.py`
-    - `model.py`
-    - `prototype.py`
-    - `run_cfg`
-- 在 [prototype.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\config\base\prototype.py) 新增固定配置：
-  - `proto_enabled = True`
-  - `proto_feature_name = "f3"`
-  - `proto_topk = 16`
-  - `proto_sim_temperature = 0.07`
-  - `proto_tau = 0.2`
-  - `proto_gamma = 1.0`
-  - `proto_sup_m_weight = 0.5`
-  - `proto_sup_rect_weight = 1.0`
-  - `proto_unsup_weight = 0.1`
-  - `proto_kde_points = 256`
-  - `proto_infer_enabled = True`
-  - `proto_infer_output = "rectified"`
-  - `proto_eval_use_bank = True`
-  - `proto_checkpoint_save_bank = True`
-  - `proto_checkpoint_bank_policy = "next_bank"`
-- `proto_feature_name`
-  - 默认为 `f3`
-  - 实现必须支持切换到 `f1/f2/f4`
-  - 所有通道数和空间尺寸都从动态推断得到，不能写死
+### 2. 原型检索
+- 对当前 batch 的 `p3` 展平得到查询特征：
+  \[
+  Q \in R^{B\times HW\times C}
+  \]
+- 分别与前景/背景原型库做余弦相似度：
+  \[
+  Sim_{fg} = QP_{fg}^\top,\quad Sim_{bg} = QP_{bg}^\top
+  \]
+- 逐行取 Top-k，`k=16`：
+  \[
+  S^{fg}_{topk} = TopK(Sim_{fg}),\quad S^{bg}_{topk} = TopK(Sim_{bg})
+  \]
+- 用温度系数 `T=prototype_sim_temperature` 做加权融合：
+  \[
+  \alpha^{fg} = Softmax(S^{fg}_{topk}/T),\quad
+  fu_{fg} = \sum_j \alpha^{fg}_j \odot S^{fg}_{topk,j}
+  \]
+  \[
+  \alpha^{bg} = Softmax(S^{bg}_{topk}/T),\quad
+  fu_{bg} = \sum_j \alpha^{bg}_j \odot S^{bg}_{topk,j}
+  \]
 
-## Prototype Modules
-- 原型相关实现统一放在 [Paired_Background_Guidance](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\Paired_Background_Guidance) 目录下。
-- 因为目录结构后续再定，首版全部集中在 [__init__.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\Paired_Background_Guidance\__init__.py)：
-  - `kde_min_threshold`
-  - `PrototypeRectifier`
-  - `PrototypeBankManager`
-  - `serialize_prototype_bank`
-  - `deserialize_prototype_bank`
-- `kde_min_threshold(diff_map, num_points)`
-  - 输入 `[B,1,Hf,Wf]`
-  - 每张图 flatten 后做 `gaussian_kde`
-  - 在 `num_points=256` 个采样点估计密度
-  - 取最高两个峰之间的最低谷作为 `theta_img`
-  - 若峰不足 2、方差过小、数值退化或 KDE 异常，回退 `0.0`
-  - 输出 `[B,1,1,1]`，并 `detach`
-- `PrototypeRectifier`
-  - `in_channels` 取自 `raw_feat_specs[proto_feature_name]["channels"]`
-  - `topk / sim_temperature / tau` 取自配置
-  - `alpha_gate = Conv1x1 -> BN -> ReLU -> Conv1x1`
-  - 末层卷积 `weight=0, bias=0`
-- `PrototypeRectifier.forward(proto_feat, proto_fg, proto_bg, input_size)`
-  - `proto_feat=[B,C,Hf,Wf]`
-  - `q = normalize(proto_feat.flatten(2).transpose(1,2), dim=-1)`，即 `[B,Hf*Wf,C]`
-  - `Sim_fg = q @ proto_fg.T`
-  - `Sim_bg = q @ proto_bg.T`
-  - `S_topk = topk(Sim, min(config.proto_topk, N), dim=-1)`
-  - `alpha_topk = softmax(S_topk / config.proto_sim_temperature, dim=-1)`
-  - `fu = sum(alpha_topk * S_topk, dim=-1, keepdim=True)`
-  - `fu_fg/fu_bg` reshape 为 `[B,1,Hf,Wf]`
-  - `alpha = sigmoid(alpha_gate(proto_feat))`
-  - `theta_img = kde_min_threshold((fu_fg - fu_bg).detach(), config.proto_kde_points)`
-  - `proto_logit = (alpha * fu_fg - (1-alpha) * fu_bg - theta_img) / config.proto_tau`
-  - `m_prob = sigmoid(proto_logit)`
-  - `proto_logit_full = bilinear(proto_logit, size=input_size, align_corners=True)`
-- `PrototypeBankManager`
-  - 维护：
-    - `active_bank`
-    - `next_bank`
-    - `epoch_buffers`
-  - `active_bank/next_bank` 固定结构：
-    - `{"fg": Tensor[N_fg,C], "bg": Tensor[N_bg,C], "ready": bool, "feature_name": str, "feature_shape": tuple}`
-  - `epoch_buffers` 固定结构：
-    - `{"fg": list, "bg": list}`
-- `enqueue_from_batch(proto_feat, gt)`
-  - 只在监督 batch 调用
-  - `gt` resize 到 `proto_feat.shape[-2:]`
-  - `fg_mask = (gt > 0.5).float()`
-  - `bg_mask = 1 - fg_mask`
-  - 每张图最多生成 1 个前景原型和 1 个背景原型
-  - 立即 `detach().cpu()` 存入 `epoch_buffers`
-  - 不缓存整张 feature map
-- `finalize_epoch(distributed=False)`
-  - 本 rank 先把 buffer 堆成 CPU tensor
-  - DDP 时 `all_gather_object`
-  - 每个 rank 得到一致的 `next_bank`
-  - 将 bank 移回当前 device，并再次 `normalize`
-- `activate_next_epoch()`
-  - 若 `next_bank` 存在，则替换 `active_bank`
-  - 清空 `next_bank`
-- `serialize_prototype_bank(bank)`
-  - 保存到 checkpoint 前，把 `fg/bg` 搬到 CPU
-  - 连同 `feature_name / feature_shape / ready` 一并写入
-- `deserialize_prototype_bank(bank_state, device)`
-  - 从 checkpoint 恢复 bank
-  - 迁移回当前 device
+### 3. 从 `fu_fg/fu_bg` 到 `H(x)`
+- 用 `p3` 经过轻量 MLP/1×1 conv 生成动态权重：
+  \[
+  \alpha(x)=\sigma(MLP(p3)),\quad \beta(x)=1-\alpha(x)
+  \]
+- 基于稳定边界的 `M(x)`：
+  \[
+  \theta_{img}=KDE\_Min((fu_{fg}-fu_{bg}).detach())
+  \]
+  \[
+  M(x)=\sigma\left(\frac{\alpha(x)fu_{fg}-(1-\alpha(x))fu_{bg}-\theta_{img}}{\tau}\right)
+  \]
+- 上采样到原图得到：
+  \[
+  H(x)=Upsample(M(x))
+  \]
 
-## Dynamic Feature Selection
-- `TalNet` 初始化时，用一次 `torch.no_grad()` dummy forward 推断 `raw_feat_specs`
-- `raw_feat_specs` 固定至少保存：
-  - `channels`
-  - `height`
-  - `width`
-  - `stride_h`
-  - `stride_w`
-- 原型分支统一取：
-  - `proto_feat = raw_feats[self.config.proto_feature_name]`
-- 因此：
-  - 默认实验仍可用 `f3`
-  - 但实现上支持任意指定层
-  - `PrototypeRectifier` 和 `PrototypeBankManager` 都从 `proto_feat` 动态取 `C/H/W`
+### 4. CRLN式融合与监督
+- 引入单个全局可学习标量 `μ ∈ [0,1]`
+- `μ` 只通过 labeled 数据的纠正预测损失更新，不由 unlabeled loss 更新
+- 有标签：
+  \[
+  \hat y_r = \hat y + (1-\mu)\cdot H(x)
+  \]
+- 无标签：
+  \[
+  \bar y_r = \bar y + (1-\mu)\cdot H(x)
+  \]
+- 其中：
+  - `\hat y` 是 student 主输出概率图
+  - `\bar y` 是 teacher 伪标签概率图
+- 为保持概率合法，融合后统一：
+  \[
+  y_r = clamp(y_r, 0, 1)
+  \]
 
-## Training Timeline
-- `reset_trainer()` 中新增：
-  - `self.prototype_bank_manager = PrototypeBankManager(...)`
-  - `self.prototype_bank = self.prototype_bank_manager.get_active_bank()`
-- `launch_train()` 每个 epoch 的固定顺序：
-  1. `activate_next_epoch()`
-  2. `self.prototype_bank = self.prototype_bank_manager.get_active_bank()`
-  3. `reset_epoch_buffers()`
-  4. `train_epoch()`
-  5. `finalize_epoch(distributed=config.distributed_train)`
-  6. 保存 checkpoint 时，把用于该 epoch 推理的 bank 一并写入
-  7. 进行 online evaluation 时，直接使用同一份 checkpoint bank
-- 因为你要求 warm-up 和半监督阶段每个 epoch 都要建库，所以：
-  - `epoch 1~tot_epochs` 每轮都执行 `reset -> collect -> finalize`
-  - 没有任何 epoch 跳过建库
-- `active_bank` 的语义固定为：
-  - `epoch t` 训练中使用的是 `epoch t-1` 构建出的 bank
-- `eval/checkpoint` 使用的 bank 固定为：
-  - `epoch t` 训练结束后刚刚 `finalize_epoch()` 得到的 `next_bank`
-  - 也就是和当前 epoch 训练后模型参数同周期的 bank
-  - 配置名固定为 `proto_checkpoint_bank_policy = "next_bank"`
+## 关键代码骨架
+### 1. 配置
+`BaseLine/config/base/prototype.py`
+```python
+prototype_enable = True
+prototype_feature_level = "p3"
+prototype_source_branch = "student"
 
-## Supervised And Unsupervised Flow
-- 训练器拆成：
-  - `_train_supervised_batch(batch, epoch)`
-  - `_train_unsupervised_batch(batch, epoch)`
-- `_train_supervised_batch(batch, epoch)` 固定顺序：
-  1. `proto_flag = (epoch > sup_only_train_epoch and self.prototype_bank["ready"])`
-  2. 调 student：
-     - `out = self.model(images, ema=False, return_aux=True, proto_enable=proto_flag, proto_bank=self.prototype_bank, proto_gamma=config.proto_gamma)`
-  3. 若 `out["gdt"]` 存在，按旧逻辑算 `loss_gdt`
-  4. `proto_feat = out["raw_feats"][config.proto_feature_name]`
-  5. `enqueue_from_batch(proto_feat, gt)`
-  6. `loss_sup_base = PixLoss(out["scaled_preds"], gt)`
-  7. 若 `proto_flag=True`
-     - `loss_sup_m = PixLoss([out["proto"]["proto_logit_full"]], gt)`
-     - `loss_sup_rect = PixLoss([out["rectified_logit"]], gt)`
-     - `loss_sup = loss_sup_base + config.proto_sup_m_weight * loss_sup_m + config.proto_sup_rect_weight * loss_sup_rect`
-  8. 若 `proto_flag=False`
-     - `loss_sup = loss_sup_base`
-  9. 若 `loss_gdt` 存在，再加上去
-  10. 反向与优化
-- `_train_unsupervised_batch(batch, epoch)` 固定顺序：
-  1. teacher 分支：
-     - `with torch.no_grad(): teacher_out = self.model(inputs, ema=True, return_aux=True, proto_enable=True, proto_bank=self.prototype_bank, proto_gamma=config.proto_gamma)`
-  2. `pseudo_rect = sigmoid(teacher_out["rectified_logit"]).detach()`
-  3. student 分支：
-     - `student_scaled_preds = self.model(inputs, ema=False)`
-  4. `loss_unsup = PixLoss(student_scaled_preds, pseudo_rect) * config.proto_unsup_weight`
-  5. 反向与优化
-- warm-up 阶段：
-  - `epoch 1~sup_only_train_epoch`
-  - 只做 baseline 监督训练和原型收集
-  - 不启用原型检索
-  - 不计算 `loss_sup_m`
-  - 不计算 `loss_sup_rect`
-  - 不做纠偏伪标签
-- 半监督阶段：
-  - `epoch > sup_only_train_epoch`
-  - 监督分支启用 rectified supervision
-  - 无监督分支启用 rectified pseudo label
-  - 仍然继续在线建库
+prototype_bank_policy = "per_image_masked_pool_dynamic"
+prototype_bank_clear_each_epoch = True
+prototype_bank_rebuild_interval = 1
+prototype_min_pixels = 16
 
-## Checkpoint And Inference
-- 保存 checkpoint 时新增字段：
-  - `prototype_bank`
-  - `prototype_meta`
-- `prototype_bank` 固定保存：
-  - 当前 epoch 训练结束后刚构建出的 `next_bank`
-  - 而不是训练期间正在使用的 `active_bank`
-- 原因：
-  - evaluator / 离线推理应该使用“与当前 epoch 模型参数同周期”的 bank
-  - 这份 bank 是该 epoch 训练完成后，用当前 student 特征收集得到的
-- [build_model.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\models\build_model.py) 的 `build_model_eval` 固定改为：
-  - `load_state_dict(..., strict=False)`
-  - 同时读取 checkpoint 中的 `prototype_bank`
-  - 把恢复后的 bank 附加到 model 上，例如：
-    - `model.eval_prototype_bank = deserialize_prototype_bank(...)`
-    - `model.eval_prototype_ready = True/False`
-- 若 checkpoint 没有 `prototype_bank`
-  - 且 `config.proto_eval_use_bank=True`
-  - evaluator 打 warning
-  - 自动回退到 baseline 输出
-- 这样旧 checkpoint 仍能评估，不会直接崩
+prototype_topk = 16
+prototype_sim_temperature = 0.05
+prototype_tau = 0.07
+prototype_theta_method = "kde_min"
+prototype_theta_fallback = 0.0
 
-## Evaluator And Offline Inference
-- [evaluator.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\engine\evaluator.py) 固定改为支持 bank 推理
-- `Evaluator.__init__` / `from_exists`
-  - 新增 `prototype_bank=None`
-  - 若未显式传入，则优先从 `model.eval_prototype_bank` 获取
-- `inference_on_dataset()` 固定推理逻辑：
-  - 若 `config.proto_infer_enabled=True` 且 `prototype_bank.ready=True`
-    - 调：
-      - `out = self.model(inputs, ema=ema, return_aux=True, proto_enable=True, proto_bank=self.prototype_bank, proto_gamma=config.proto_gamma)`
-    - 根据 `config.proto_infer_output` 选择输出：
-      - `"rectified"`：`pred = sigmoid(out["rectified_logit"])`
-      - `"baseline"`：`pred = sigmoid(out["scaled_preds"][-1])`
-      - `"m_prob"`：`pred = interpolate(out["proto"]["m_prob"], input_size)`
-  - 否则：
-    - 保持旧逻辑 `self.model(inputs, ema=ema)[-1].sigmoid()`
-- online evaluation during training
-  - `evaluate_online(epoch)` 不再只传 model
-  - 还要传本 epoch checkpoint 对应的 eval bank
-  - 即训练结束后 `finalize_epoch()` 产生的 `next_bank`
-- [evaluate.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\scripts\evaluate.py)
-  - 不再只关心 model
-  - 要允许 evaluator 自动使用 checkpoint 中恢复出的 `prototype_bank`
-- [tool.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\scripts\tool.py)
-  - `extract_pseudo_labels()` 也属于离线推理路径
-  - 固定与 evaluator 保持一致：
-    - 若 checkpoint 中有 bank 且 `config.proto_infer_enabled=True`
-    - 则用 `rectified_logit` 生成伪标签
-    - 否则回退 baseline
+prototype_alpha_hidden_ratio = 4
 
-## Logging And Metrics
-- 训练期新增记录：
-  - `loss_sup_base`
-  - `loss_sup_m`
-  - `loss_sup_rect`
-  - `loss_unsup`
-  - `bank_fg_size`
-  - `bank_bg_size`
-  - `theta_mean`
-  - `theta_std`
-  - `M_mean`
-  - `pseudo_rect_mean`
-- 推理期建议额外记录：
-  - `proto_eval_bank_fg_size`
-  - `proto_eval_bank_bg_size`
-  - `proto_infer_output_mode`
-  - `proto_eval_bank_ready`
-- 评测指标本身不变：
-  - `MAE`
-  - `maxFm`
-  - `wFmeasure`
-  - `Smeasure`
-  - `meanEm`
-  - `meanFm`
+prototype_mu_init = 0.5
+prototype_mu_min = 0.0
+prototype_mu_max = 1.0
+prototype_mu_lr = 1e-3
+prototype_mu_weight_decay = 0.0
 
-## Files To Change
-- [BaseLine/config/mkcfg.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\config\mkcfg.py)
-  - 增加 `prototype.py` 合并入口
-- [BaseLine/config/base/prototype.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\config\base\prototype.py)
-  - 新增文件
-  - 放原型分支训练/推理/eval 配置
-- [BaseLine/Paired_Background_Guidance/__init__.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\Paired_Background_Guidance\__init__.py)
-  - 实现 bank、rectifier、KDE、checkpoint bank 序列化
-- [BaseLine/models/talnet.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\models\talnet.py)
-  - 动态推断 raw feat specs
-  - 暴露 raw feats
-  - 接入 rectifier
-  - 统一 aux/proto/final_logit 接口
-- [BaseLine/engine/solver.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\engine\solver.py)
-  - 拆分监督/无监督 batch
-  - 每 epoch 建库
-  - 保存 checkpoint bank
-  - online evaluation 使用 eval bank
-- [BaseLine/models/build_model.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\models\build_model.py)
-  - `build_model_eval` 加载 checkpoint bank
-  - `strict=False`
-- [BaseLine/engine/evaluator.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\engine\evaluator.py)
-  - 支持带原型库推理
-  - 支持选择 rectified/baseline/m_prob 输出
-- [BaseLine/scripts/evaluate.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\scripts\evaluate.py)
-  - 保证离线评估能自动读取并使用 checkpoint bank
-- [BaseLine/scripts/tool.py](c:\IT\AI\CV\COD\SCOD\Prototype_model_use\BaseLine\scripts\tool.py)
-  - 伪标签导出路径与 evaluator 一致接入 bank
+prototype_loss_weight_h = 0.3
 
-## Test Plan
-- 接口兼容性：
-  - `self.model(inputs)` 返回与 baseline 一致
-  - `self.model(inputs, return_aux=True)` 返回新字典
-- 动态特征检查：
-  - `proto_feat = raw_feats[config.proto_feature_name]`
-  - 代码层面不允许假设固定 `C/H/W`
-  - 只要求满足 `proto_feat.shape == [B,C,Hf,Wf]`
-- 训练时序检查：
-  - warm-up 和半监督阶段每个 epoch 都执行建库
-  - 当前 epoch 只写 `epoch_buffers` 和 `next_bank`
-  - 下一 epoch 才激活为 `active_bank`
-- checkpoint 检查：
-  - 每个保存的 checkpoint 都带 `prototype_bank`
-  - `build_model_eval` 能恢复 bank
-  - 旧 checkpoint 无 bank 时能自动回退 baseline
-- evaluator 检查：
-  - `proto_infer_enabled=True` 且 bank 可用时，输出来自 `rectified_logit`
-  - bank 不可用时自动回退 baseline
-- DDP 检查：
-  - 所有 rank 的 `next_bank` 行数一致
-  - 所有 rank 的 bank 内容一致
-- 梯度检查：
-  - `enqueue_from_batch` 中存入 buffer 的原型不带梯度
-  - `theta_img.requires_grad == False`
-  - `pseudo_rect.requires_grad == False`
-- 实验设置：
-  - 数据：`TR-COD10K + TR-CAMO`
-  - 标注比例：`5%`
-  - 无标签比例：`95%`
-  - 测试集：`CHAMELEON / TE-COD10K / TE-CAMO / NC4K`
-  - 总 epoch：`30`
-  - warm-up：`1~15`
-  - semi-supervised：`16~30`
-- 必做消融：
-  - `Baseline`
-  - `Baseline + 每 epoch 在线建库`
-  - `+ rectified supervision`
-  - `+ rectified pseudo label`
-  - `+ inference/evaluator 使用 prototype bank`
+prototype_checkpoint_policy = "save_and_load"
+prototype_eval_policy = "checkpoint_then_rebuild"
+```
 
-## Assumptions
-- 默认实验层仍是 `f3`，但实现必须支持通过 `config.proto_feature_name` 动态切换。
-- 原型库保留的是“图像级 pooled prototype”的全集，不是像素级全集。
-- 原型模块首版全部集中在 `Paired_Background_Guidance/__init__.py`，后续拆目录只做重构，不改外部接口。
-- 推理和 evaluator 现在默认引入原型库，并默认使用 `rectified_logit`，但保留配置回退到 baseline 的能力。
+`BaseLine/config/mkcfg.py`
+```python
+COMMON_CONFIG_DIR = 'config/base/common.py'
+MODEL_CONFIG_DIR = 'config/base/model.py'
+PROTOTYPE_CONFIG_DIR = 'config/base/prototype.py'
+
+class Config:
+    def __init__(self, run_cfg: str):
+        logger.key_info("Initialize config...")
+        self.merge_from_file(COMMON_CONFIG_DIR)
+        self.merge_from_file(MODEL_CONFIG_DIR)
+        self.merge_from_file(PROTOTYPE_CONFIG_DIR)
+        self.merge_from_file(run_cfg)
+        logger.success_info("Config merged from {}.".format(run_cfg))
+```
+
+### 2. 动态原型库
+`BaseLine/Paired_Background_Guidance/prototype_bank.py`
+```python
+import torch
+import torch.nn.functional as F
+
+class DynamicPrototypeBank:
+    def __init__(self, min_pixels=16):
+        self.min_pixels = min_pixels
+        self.proto_fg = None
+        self.proto_bg = None
+
+    def begin_epoch(self):
+        self.proto_fg = None
+        self.proto_bg = None
+
+    @staticmethod
+    def _masked_avg_pool(feat, mask, min_pixels):
+        # feat: [C, h, w], mask: [1, h, w]
+        valid = mask.sum()
+        if valid.item() < min_pixels:
+            return None
+        vec = (feat * mask).sum(dim=(1, 2)) / (valid + 1e-6)
+        return F.normalize(vec, dim=0)
+
+    def append_from_labeled_batch(self, p3, gt):
+        # p3: [B, C, h, w], gt: [B, 1, H, W]
+        gt_small = F.interpolate(gt.float(), size=p3.shape[-2:], mode="nearest")
+        fg_list, bg_list = [], []
+
+        for i in range(p3.shape[0]):
+            feat_i = p3[i]
+            fg_mask = (gt_small[i] > 0.5).float()
+            bg_mask = 1.0 - fg_mask
+
+            fg_proto = self._masked_avg_pool(feat_i, fg_mask, self.min_pixels)
+            bg_proto = self._masked_avg_pool(feat_i, bg_mask, self.min_pixels)
+
+            if fg_proto is not None:
+                fg_list.append(fg_proto)
+            if bg_proto is not None:
+                bg_list.append(bg_proto)
+
+        if fg_list:
+            fg_new = torch.stack(fg_list, dim=0)
+            self.proto_fg = fg_new if self.proto_fg is None else torch.cat([self.proto_fg, fg_new], dim=0)
+
+        if bg_list:
+            bg_new = torch.stack(bg_list, dim=0)
+            self.proto_bg = bg_new if self.proto_bg is None else torch.cat([self.proto_bg, bg_new], dim=0)
+
+    def retrieve(self, p3, topk=16, temperature=0.05):
+        # p3: [B, C, h, w]
+        B, C, h, w = p3.shape
+        q = F.normalize(p3.flatten(2).transpose(1, 2), dim=-1)  # [B, HW, C]
+
+        def _sim_to_fu(query, proto):
+            if proto is None or proto.numel() == 0:
+                sim = query.new_zeros(B, h * w, 1)
+                fu = query.new_zeros(B, 1, h, w)
+                return sim, fu
+
+            proto = F.normalize(proto, dim=-1)                  # [N, C]
+            sim = torch.matmul(query, proto.t())                # [B, HW, N]
+            k = min(topk, proto.shape[0])
+            top_vals = torch.topk(sim, k=k, dim=-1).values      # [B, HW, k]
+            attn = torch.softmax(top_vals / temperature, dim=-1)
+            fu = (attn * top_vals).sum(dim=-1, keepdim=True)    # [B, HW, 1]
+            fu = fu.transpose(1, 2).reshape(B, 1, h, w)
+            return sim, fu
+
+        sim_bg, fu_bg = _sim_to_fu(q, self.proto_bg)
+        sim_fg, fu_fg = _sim_to_fu(q, self.proto_fg)
+
+        return {
+            "sim_bg": sim_bg,
+            "sim_fg": sim_fg,
+            "fu_bg": fu_bg,
+            "fu_fg": fu_fg,
+        }
+
+    def state_dict(self):
+        return {
+            "proto_fg": self.proto_fg,
+            "proto_bg": self.proto_bg,
+        }
+
+    def load_state_dict(self, state):
+        self.proto_fg = state.get("proto_fg", None)
+        self.proto_bg = state.get("proto_bg", None)
+```
+
+### 3. `M(x)` 与 `H(x)`
+`BaseLine/Paired_Background_Guidance/prototype_interaction.py`
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from scipy.stats import gaussian_kde
+from scipy.signal import find_peaks
+
+def kde_min_threshold(diff_map, fallback=0.0):
+    # diff_map: [B, 1, h, w], detached before call
+    theta_list = []
+    for i in range(diff_map.shape[0]):
+        arr = diff_map[i, 0].reshape(-1).detach().cpu().numpy()
+        if arr.size < 8 or float(arr.max() - arr.min()) < 1e-8:
+            theta_list.append(fallback)
+            continue
+        try:
+            kde = gaussian_kde(arr)
+            x_vals = np.linspace(arr.min(), arr.max(), 2048)
+            kde_vals = kde(x_vals)
+            minima, _ = find_peaks(-kde_vals)
+            theta = x_vals[minima[0]] if len(minima) > 0 else fallback
+        except Exception:
+            theta = fallback
+        theta_list.append(theta)
+    theta = torch.tensor(theta_list, device=diff_map.device, dtype=diff_map.dtype)
+    return theta.view(-1, 1, 1, 1)
+
+class DynamicPrototypeInteraction(nn.Module):
+    def __init__(self, in_channels, hidden_ratio=4, tau=0.07, theta_fallback=0.0):
+        super().__init__()
+        hidden = max(in_channels // hidden_ratio, 16)
+        self.alpha_head = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 1),
+            nn.BatchNorm2d(hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 1, 1)
+        )
+        self.tau = tau
+        self.theta_fallback = theta_fallback
+
+    def forward(self, p3, fu_fg, fu_bg, image_hw):
+        alpha = torch.sigmoid(self.alpha_head(p3))
+        base_diff = (fu_fg - fu_bg).detach()
+        theta = kde_min_threshold(base_diff, fallback=self.theta_fallback)
+        m_low = torch.sigmoid((alpha * fu_fg - (1.0 - alpha) * fu_bg - theta) / self.tau)
+        h_map = F.interpolate(m_low, size=image_hw, mode="bilinear", align_corners=True)
+        return {
+            "alpha": alpha,
+            "theta": theta,
+            "m_low": m_low,
+            "H": h_map,
+        }
+```
+
+### 4. 可学习 `μ`
+`BaseLine/Paired_Background_Guidance/prototype_fusion.py`
+```python
+import math
+import torch
+import torch.nn as nn
+
+class LearnableMuFusion(nn.Module):
+    def __init__(self, mu_init=0.5, mu_min=0.0, mu_max=1.0):
+        super().__init__()
+        self.mu_min = mu_min
+        self.mu_max = mu_max
+        x = (mu_init - mu_min) / (mu_max - mu_min + 1e-8)
+        x = min(max(x, 1e-4), 1 - 1e-4)
+        self.raw_mu = nn.Parameter(torch.tensor(math.log(x / (1 - x)), dtype=torch.float32))
+
+    def mu(self):
+        return self.mu_min + (self.mu_max - self.mu_min) * torch.sigmoid(self.raw_mu)
+
+    def fuse_labeled(self, y_hat, H):
+        mu = self.mu()
+        return torch.clamp(y_hat + (1.0 - mu) * H, 0.0, 1.0)
+
+    def fuse_unlabeled(self, y_bar, H):
+        mu = self.mu().detach()
+        return torch.clamp(y_bar + (1.0 - mu) * H, 0.0, 1.0)
+```
+
+### 5. 模型输出 `p3`
+`BaseLine/models/talnet.py`
+```python
+# ModelEMA
+def forward(self, x, ema=False, return_features=False):
+    net = self.teacher if ema else self.student
+    return net(x, return_features=return_features)
+
+# TalNet
+def forward_ori(self, x, return_features=False):
+    (x1, x2, x3, x4) = self.forward_enc(x)
+    if self.config.squeeze_block:
+        x4 = self.squeeze_module(x4)
+    features = [x, x1, x2, x3, x4]
+    if self.training and self.config.out_ref:
+        features.append(laplacian(torch.mean(x, dim=1).unsqueeze(1), kernel_size=5))
+    return self.decoder(features, return_features=return_features)
+
+def forward(self, x, return_features=False):
+    return self.forward_ori(x, return_features=return_features)
+```
+
+`Decoder.forward`
+```python
+def forward(self, features, return_features=False):
+    ...
+    p3 = self.decoder_block3(_p3)
+    ...
+    p1_out = self.conv_out1(_p1)
+
+    outs = []
+    if self.config.ms_supervision:
+        outs.extend([m4, m3, m2])
+    outs.append(p1_out)
+
+    feature_dict = {
+        "p3": p3,
+        "main_logit": p1_out,
+        "image_hw": x.shape[-2:],
+    }
+
+    if self.config.out_ref and self.training:
+        base_ret = ([outs_gdt_pred, outs_gdt_label], outs)
+    else:
+        base_ret = outs
+
+    if return_features:
+        return base_ret, feature_dict
+    return base_ret
+```
+
+### 6. 训练整合
+在 `SemiSupervisedTrainer` 中新增：
+```python
+from Paired_Background_Guidance.prototype_bank import DynamicPrototypeBank
+from Paired_Background_Guidance.prototype_interaction import DynamicPrototypeInteraction
+from Paired_Background_Guidance.prototype_fusion import LearnableMuFusion
+```
+
+初始化：
+```python
+self.prototype_bank = DynamicPrototypeBank(min_pixels=config.prototype_min_pixels)
+self.prototype_interaction = None   # lazy init by p3 channels
+self.mu_fusion = LearnableMuFusion(
+    mu_init=config.prototype_mu_init,
+    mu_min=config.prototype_mu_min,
+    mu_max=config.prototype_mu_max,
+).to(self.device)
+self.mu_optimizer = torch.optim.Adam(
+    self.mu_fusion.parameters(),
+    lr=config.prototype_mu_lr,
+    weight_decay=config.prototype_mu_weight_decay,
+)
+```
+
+懒初始化交互头：
+```python
+def _ensure_proto_modules(self, p3):
+    if self.prototype_interaction is None:
+        self.prototype_interaction = DynamicPrototypeInteraction(
+            in_channels=p3.shape[1],
+            hidden_ratio=self.config.prototype_alpha_hidden_ratio,
+            tau=self.config.prototype_tau,
+            theta_fallback=self.config.prototype_theta_fallback,
+        ).to(self.device)
+```
+
+epoch 开始：
+```python
+self.prototype_bank.begin_epoch()
+```
+
+labeled batch 主流程：
+```python
+(sup_outs, sup_feat) = self.model(inputs_sup, return_features=True)
+p3_sup = sup_feat["p3"]
+main_logit_sup = sup_feat["main_logit"]
+self._ensure_proto_modules(p3_sup)
+
+# 1. 先用 labeled p3 + gt 建库
+self.prototype_bank.append_from_labeled_batch(p3_sup.detach(), gts_sup.detach())
+
+# 2. 再检索并生成 H
+ret_sup = self.prototype_bank.retrieve(
+    p3_sup,
+    topk=self.config.prototype_topk,
+    temperature=self.config.prototype_sim_temperature,
+)
+proto_sup = self.prototype_interaction(
+    p3_sup, ret_sup["fu_fg"], ret_sup["fu_bg"], image_hw=gts_sup.shape[-2:]
+)
+H_sup = proto_sup["H"]
+
+# 3. 主模型损失：baseline 主输出 + H(x)
+student_prob_sup = main_logit_sup.sigmoid()
+loss_sup_main = self.pix_loss([main_logit_sup], gts_sup)
+loss_sup_h = self.prob_loss(H_sup, gts_sup) * self.config.prototype_loss_weight_h
+loss_model = loss_sup_main + loss_sup_h
+```
+
+`μ` 单独监督：
+```python
+# 注意：只更新 mu，不更新 student / prototype interaction
+self.mu_optimizer.zero_grad()
+
+with torch.no_grad():
+    y_hat = student_prob_sup.detach()
+    H_detach = H_sup.detach()
+
+y_hat_r = self.mu_fusion.fuse_labeled(y_hat, H_detach)
+loss_mu = self.prob_loss(y_hat_r, gts_sup)
+
+loss_mu.backward()
+self.mu_optimizer.step()
+```
+
+无标签 batch：
+```python
+with torch.no_grad():
+    tea_outs, tea_feat = self.model(inputs_unsup, ema=True, return_features=True)
+    y_bar = tea_feat["main_logit"].sigmoid()
+
+(stu_outs_u, stu_feat_u) = self.model(inputs_unsup, return_features=True)
+p3_u = stu_feat_u["p3"]
+main_logit_u = stu_feat_u["main_logit"]
+
+ret_u = self.prototype_bank.retrieve(
+    p3_u,
+    topk=self.config.prototype_topk,
+    temperature=self.config.prototype_sim_temperature,
+)
+proto_u = self.prototype_interaction(
+    p3_u, ret_u["fu_fg"], ret_u["fu_bg"], image_hw=inputs_unsup.shape[-2:]
+)
+H_u = proto_u["H"]
+
+y_bar_r = self.mu_fusion.fuse_unlabeled(y_bar, H_u)
+
+student_prob_u = main_logit_u.sigmoid()
+loss_unsup = self.prob_loss(student_prob_u, y_bar_r) * 0.1
+```
+
+总损失：
+```python
+self.model_optimizer.zero_grad()
+loss = loss_model + loss_unsup
+loss.backward()
+self.model_optimizer.step()
+```
+
+### 7. 概率损失
+`BaseLine/engine/loss.py`
+```python
+class ProbLoss(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.lambdas = config.lambdas_pix_last
+        self.criterions = {
+            "bce": nn.BCELoss(),
+            "iou": IoULoss(),
+            "ssim": SSIMLoss(),
+        }
+
+    def forward(self, probs, gt):
+        loss = 0.0
+        for name, criterion in self.criterions.items():
+            if self.lambdas.get(name, 0) > 0:
+                loss = loss + criterion(probs, gt) * self.lambdas[name]
+        return loss
+```
+
+### 8. checkpoint / 推理 / evaluator
+保存：
+```python
+model_dict = {
+    "model": self.model.module.state_dict() if self.config.distributed_train else self.model.state_dict(),
+    "optimizer": self.model_optimizer.state_dict(),
+    "lr_scheduler": self.model_lr_scheduler.state_dict(),
+    "epoch": epoch,
+    "prototype_bank": self.prototype_bank.state_dict(),
+    "mu_fusion": self.mu_fusion.state_dict(),
+}
+```
+
+恢复：
+```python
+if "prototype_bank" in checkpoint:
+    self.prototype_bank.load_state_dict(checkpoint["prototype_bank"])
+if "mu_fusion" in checkpoint:
+    self.mu_fusion.load_state_dict(checkpoint["mu_fusion"])
+```
+
+推理/evaluator 最终输出：
+```python
+with torch.no_grad():
+    outs, feat = self.model(inputs, ema=ema, return_features=True)
+    p3 = feat["p3"]
+    main_prob = feat["main_logit"].sigmoid()
+
+    ret = self.prototype_bank.retrieve(
+        p3,
+        topk=self.config.prototype_topk,
+        temperature=self.config.prototype_sim_temperature,
+    )
+    proto = self.prototype_interaction(
+        p3, ret["fu_fg"], ret["fu_bg"], image_hw=main_prob.shape[-2:]
+    )
+    pred_final = self.mu_fusion.fuse_labeled(main_prob, proto["H"])
+```
+
+如果 checkpoint 没有原型库：
+- 用当前 `split=5%` 的 labeled indices 创建 labeled loader
+- 用 checkpoint 模型前向一次 labeled 集
+- 按训练同样的 `append_from_labeled_batch()` 逻辑在线重建库
+- 再开始测试
+
+## 实验设置
+### 训练阶段
+- Warm-up：
+  - 仍然每个 epoch 建库
+  - 不启用原型检索监督，不更新 `μ`
+  - 只跑 baseline 的 supervised 分支
+- Semi-supervised：
+  - labeled 分支：`loss_sup_main + loss_sup_h`
+  - `μ`：仅由 `loss_mu` 更新
+  - unlabeled 分支：teacher 生成 `\bar y`，student `p3` 生成 `H(x)`，融合得到 `\bar y_r`
+
+### 推荐超参数
+- `prototype_topk = 16`
+- `prototype_sim_temperature = 0.05`
+- `prototype_tau = 0.07`
+- `prototype_min_pixels = 16`
+- `prototype_mu_init = 0.5`
+- `prototype_mu_lr = 1e-3`
+- `prototype_loss_weight_h = 0.3`
+
+### 评价指标
+沿用当前 `BaseLine` evaluator：
+- `MAE`
+- `maxFm`
+- `wFmeasure`
+- `Smeasure`
+- `meanEm`
+- `meanFm`
+
+建议额外记录：
+- `μ` 的 epoch 变化曲线
+- 每个 epoch 的 `|P_fg| / |P_bg|`
+- `H(x)` 与 `gt` 的单独监督损失
+- `\hat y_r` 相比 `\hat y` 的增益
+
+## 消融实验
+- Baseline Mean-Teacher
+- Baseline + 动态原型库，不加 `H` 监督
+- Baseline + `H` 监督，不加 `μ`
+- Baseline + `μ` 融合，但 `μ` 固定为 0.5
+- Baseline + 完整方案（动态库 + `H` + 可学习 `μ`）
+- 去掉 `KDE_min`，改成 `theta=0`
+- 前景库 only / 背景库 only / 前背景双库
+
+## 测试计划
+- 形状测试：不同 backbone 下 `p3` 通道变化时，原型模块工作正常
+- 空库测试：epoch 初始时无原型，`H(x)` 应退化为零图，不报错
+- 动态规模测试：库长度随 labeled 图数增长，不固定，不跨 epoch 继承
+- 反向传播测试：
+  - `μ` 只在 `loss_mu.backward()` 后有梯度
+  - unlabeled loss 不更新 `μ`
+- 推理一致性测试：训练期在线 evaluator 与离线 evaluator 的最终输出路径一致
+- 分布式测试：多卡原型拼接后所有 rank 库一致
+
+## 假设与默认决策
+- 原型库动态规模采用“每张 labeled 图每类 1 个原型”的最稳版本，不走像素级大库
+- `μ` 是单个全局标量，不做 per-image 或 per-class 版本
+- `\hat y_r` 和 `\bar y_r` 都在概率空间融合，不在 logit 空间融合
+- `μ` 监督完全独立于主模型更新，严格对齐你要求的“仅通过 labeled data 单独更新 `μ`”
+- 推理和 evaluator 使用纠正后的最终输出，而不是仅用 student/teacher 主输出

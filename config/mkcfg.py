@@ -2,6 +2,7 @@ import os
 
 COMMON_CONFIG_DIR='config/base/common.py'
 MODEL_CONFIG_DIR='config/base/model.py'
+PROTOTYPE_CONFIG_DIR='config/base/prototype.py'
 
 from utils import Logger
 logger = Logger(name='Config', path='/tmp/talnet_preload.log')
@@ -11,6 +12,7 @@ class Config:
         logger.key_info("Initialize config...")
         self.merge_from_file(COMMON_CONFIG_DIR)
         self.merge_from_file(MODEL_CONFIG_DIR)
+        self.merge_from_file(PROTOTYPE_CONFIG_DIR)
         self.merge_from_file(run_cfg)
         logger.success_info("Config merged from {}.".format(run_cfg))
         for attr, value in vars(self).items():
