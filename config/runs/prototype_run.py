@@ -1,21 +1,21 @@
 import os
 
-# prototype-guided semi-supervised COD experiment
+# training settings
 
-ckpt_dir = "/home/zhangqing/YJD/SCOD/LFGM/works/pbg_proto_swin_v1_b_bs6"
+ckpt_dir = "/home/zhangqing/YJD/SCOD/xxx/works/test"
+
 
 tot_epochs = 30
-sup_only_train_epoch = 15
 
-distributed_train = True
+sup_only_train_epoch = 15
+distributed_train = False
 device_map = {
     'model': '*'
 }  # Only available for non distributed training
-
 rand_seed = 7
 lr = 1e-4
 
-# late-stage loss adjustment
+# 后期关闭 BCE，转向结构型损失（SSIM 为主，IoU 逐步减弱）。
 IoU_finetune_last_epochs = [0, -6][1]
 
 # model settings
@@ -44,40 +44,30 @@ cxt = lateral_channels_in_collection[1:][::-1][-cxt_num:] if cxt_num else []
 # data settings
 load_all = False
 batch_size = 6
-data_split = [0.05]
+data_split = [0.05]  # [0.01, 0.05, 0.1]
 
-# random labeled split file
+# ⚠️ 重要：使用随机生成的索引文件
+# 需要先运行 scripts/generate_random_indices.py 生成随机索引
 data_split_indices_file_format = "data/cache/labeled_indices/split{}_labeled_indices_random.pt"
+# data_split_indices_file_format = "data/cache/labeled_indices/split{}_labeled_indices.pt"
 
 task = "COD"
 training_set = "TR-COD10K+TR-CAMO"
+# testing_sets = "TE-COD10K"
 testing_sets = "CHAMELEON+TE-COD10K+TE-CAMO+NC4K"
 
-# evaluation settings
+# evaluate settings
 pred_save_root = os.path.join(ckpt_dir, 'training_preds')
+
+# eval
 eval_epoch = 20
 eval_step = 1
+# save model_checkpoint
 save_step = 1
 
-# prototype experiment switches and key knobs
-prototype_enable = True
-prototype_feature_level = "p3"
-prototype_bank_policy = "per_image_masked_pool_dynamic"
-prototype_topk = 16
-prototype_sim_temperature = 0.05
-prototype_tau = 0.07
-prototype_mu_init = 0.5
-prototype_loss_weight_h = 0.3
-
 # wandb
-ModelName = 'BPGNet-Proto'
+ModelName = 'PrototypeNet'
 others = {
     'sup_epoch': sup_only_train_epoch,
     'total_epoch': tot_epochs,
-    'prototype_feature_level': prototype_feature_level,
-    'prototype_bank_policy': prototype_bank_policy,
-    'prototype_topk': prototype_topk,
-    'prototype_sim_temperature': prototype_sim_temperature,
-    'prototype_tau': prototype_tau,
-    'prototype_mu_init': prototype_mu_init,
 }
