@@ -9,12 +9,13 @@ def preproc(image, label, preproc_methods=['flip']):
         image, label = cv_random_flip(image, label)
     # if 'crop' in preproc_methods:
     #     image, label = random_crop(image, label)
-    # if 'rotate' in preproc_methods:
-    #     image, label = random_rotate(image, label)
+    if 'rotate' in preproc_methods:
+        image, label = random_rotate(image, label)
     # if 'enhance' in preproc_methods:
     #     image = color_enhance(image)
     # if 'pepper' in preproc_methods:
-    #     label = random_pepper(label)
+    #     image = random_pepper(image)
+
     return image, label
 
 

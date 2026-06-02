@@ -36,7 +36,8 @@ sys_home_dir = "/home/zhangqing/YJD/SCOD/LFGM/SCOUT-main_NO_TFM"
 data_root_dir = os.path.join(sys_home_dir, 'dataset')
 task = "COD"
 training_set = "TR-COD10K+TR-CAMO"
-preproc_methods = ['flip', 'enhance', 'rotate', 'pepper', 'crop'][:4]
+# preproc_methods = ['flip', 'enhance', 'rotate', 'pepper', 'crop'][:4]
+preproc_methods = ['flip', 'crop', 'rotate', 'enhance', 'gaussian', 'pepper']
 
 num_workers = 5
 optimizer = ['Adam', 'AdamW'][0]
