@@ -128,7 +128,6 @@ default_cfgs = {
         num_classes=21843),
     'vit_huge_patch14_224_in21k': _cfg(
         url='https://storage.googleapis.com/vit_models/imagenet21k/ViT-H_14.npz',
-        hf_hub='timm/vit_huge_patch14_224_in21k',
         num_classes=21843),
 
     # deit models (FB weights)
