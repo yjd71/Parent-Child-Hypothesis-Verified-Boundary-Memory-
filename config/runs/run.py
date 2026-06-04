@@ -65,6 +65,37 @@ eval_step = 1
 # save model_checkpoint
 save_step = 1
 
+
+# CBM-PFI
+cbm_pfi_enable = True
+
+# stage schedule: epoch 从 0 开始时，stage_epoch = epoch + 1
+cbm_stage_epoch_offset = 1
+cbm_stage1_end = 5          # stage 1: baseline warmup, 不用 memory
+cbm_stage2_end = 15         # stage 2: labeled CBM
+cbm_unlabeled_start_epoch = 16  # stage 3: labeled + unlabeled CBM
+
+# memory/retrieval
+cbm_memory_dim = 128
+cbm_value_dim = 8
+cbm_top_img_k = 8
+cbm_topk_token = 16
+
+# correction strength
+cbm_lambda_feat = 0.1
+cbm_lambda_logit = 0.5
+
+# CBM losses
+cbm_lambda_mem = 0.2
+cbm_lambda_bd = 0.2
+cbm_lambda_ctx = 0.05
+cbm_lambda_aff = 0.05
+cbm_lambda_gate_sparse = 0.01
+cbm_lambda_gate_boundary = 0.05
+
+# checkpoint / eval
+cbm_checkpoint_memory = True
+
 # wandb
 ModelName = 'PrototypeNet'
 others = {

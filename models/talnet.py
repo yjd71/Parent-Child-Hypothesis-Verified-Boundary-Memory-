@@ -18,13 +18,24 @@ class ModelEMA(nn.Module):
         self.alpha = alpha
         self.student = TalNet(config=config, bb_pretrained=bb_pretrained)
         self.teacher = TalNet(config=config, bb_pretrained=bb_pretrained, ema=True)
+        self.cbm = None
         self._init_teacher_params()
 
-    def forward(self, x, ema=False):
+    def set_cbm(self, cbm):
+        self.cbm = cbm
+        return self
+
+    def extract_cbm_memory_features(self, x, ema=True):
         if ema:
-            return self.teacher(x)
+            return self.teacher.extract_cbm_memory_features(x)
+        return self.student.extract_cbm_memory_features(x)
+
+    def forward(self, x, ema=False, use_memory=None, cbm=None, return_aux=False):
+        active_cbm = self.cbm if cbm is None else cbm
+        if ema:
+            return self.teacher(x, use_memory=use_memory, cbm=active_cbm, return_aux=return_aux)
         else:
-            return self.student(x)
+            return self.student(x, use_memory=use_memory, cbm=active_cbm, return_aux=return_aux)
         
     def ema_update(self, global_step, alpha=None):
         with torch.no_grad():
@@ -61,6 +72,7 @@ class TalNet(nn.Module):
         self.config = config
         self.epoch = 1
         self.ema = ema
+        self.cbm = None
         self.bb = build_backbone(self.config.backbone, config=config, pretrained=bb_pretrained)
         channels = self.config.lateral_channels_in_collection
         if self.config.squeeze_block:
@@ -78,6 +90,10 @@ class TalNet(nn.Module):
     def freeze(self):
         for _, param in self.named_parameters():
             param.requires_grad = False
+
+    def set_cbm(self, cbm):
+        self.cbm = cbm
+        return self
 
     def forward_enc(self, x):
         if self.config.backbone in ['vgg16', 'vgg16bn', 'resnet50']:
@@ -105,20 +121,144 @@ class TalNet(nn.Module):
             )
         return (x1, x2, x3, x4)
 
-    def forward_ori(self, x):
+    def _build_decoder_features(self, x):
         ########## Encoder ##########
-        (x1, x2, x3, x4) = self.forward_enc(x)
+        x1, x2, x3, x4 = self.forward_enc(x)
         if self.config.squeeze_block:
             x4 = self.squeeze_module(x4)
         ########## Decoder ##########
         features = [x, x1, x2, x3, x4]
         if self.training and self.config.out_ref:
             features.append(laplacian(torch.mean(x, dim=1).unsqueeze(1), kernel_size=5))
-        scaled_preds = self.decoder(features)
+        return x1, x2, x3, x4, features
+
+    def forward_ori(self, x):
+        *_, features = self._build_decoder_features(x)
+        return self.decoder(features)
+
+    def extract_cbm_memory_features(self, x):
+        was_training = self.training
+        self.eval()
+        try:
+            x1, x2, x3, x4, features = self._build_decoder_features(x)
+            del x1, x2, x4
+            _, p3, _ = self.decoder.forward_to_p3(features)
+            return {"x3": x3.detach(), "p3": p3.detach()}
+        finally:
+            if was_training:
+                self.train()
+
+    def forward_cbm_pfi(self, x, cbm=None, return_aux=False):
+        active_cbm = self.cbm if cbm is None else cbm
+        reason = self._cbm_fallback_reason(active_cbm)
+        if reason is not None:
+            return self._return_with_optional_aux(self.forward_ori(x), reason, return_aux)
+
+        x1, x2, x3, x4, features = self._build_decoder_features(x)
+        del x1, x2, x4
+        state, p3, m3 = self.decoder.forward_to_p3(features)
+        if m3 is None:
+            scaled_preds = self.decoder.forward_from_p3(state, p3)
+            return self._return_with_optional_aux(scaled_preds, "m3_none", return_aux, p3=p3)
+
+        p3_corr, aux = active_cbm.apply_p3_hook(x=x, x3=x3, p3=p3, m3=m3, training=self.training)
+        if not aux or not aux.get("cbm_used", False):
+            scaled_preds = self.decoder.forward_from_p3(state, p3)
+            reason = "cbm_hook_fallback" if not aux else aux.get("fallback_reason", "cbm_hook_fallback")
+            return self._return_scaled_preds(scaled_preds, aux or self._make_fallback_aux(reason, p3=p3), return_aux)
+
+        scaled_preds = self.decoder.forward_from_p3(state, p3_corr)
+        scaled_preds = self._apply_cbm_final_fusion(scaled_preds, active_cbm, aux)
+        return self._return_scaled_preds(scaled_preds, aux, return_aux)
+
+    def forward(self, x, use_memory=None, cbm=None, return_aux=False):
+        active_cbm = self.cbm if cbm is None else cbm
+        if not self._should_use_cbm(use_memory, active_cbm):
+            return self._return_with_optional_aux(
+                self.forward_ori(x),
+                self._disabled_forward_reason(use_memory, active_cbm),
+                return_aux,
+            )
+        return self.forward_cbm_pfi(x, cbm=active_cbm, return_aux=return_aux)
+
+    def _should_use_cbm(self, use_memory, cbm):
+        if use_memory is False:
+            return False
+        if cbm is None:
+            return False
+        if use_memory is True:
+            return True
+        return (not self.training) and self._cbm_is_enabled(cbm)
+
+    def _cbm_fallback_reason(self, cbm):
+        if cbm is None:
+            return "cbm_none"
+        if not self._cbm_memory_ready(cbm):
+            return "memory_not_ready"
+        if not self._cbm_is_enabled(cbm):
+            return "cbm_disabled"
+        return None
+
+    def _disabled_forward_reason(self, use_memory, cbm):
+        if use_memory is False:
+            return "use_memory_false"
+        if cbm is None:
+            return "cbm_none"
+        if self.training and use_memory is None:
+            return "train_default_baseline"
+        return self._cbm_fallback_reason(cbm) or "cbm_not_requested"
+
+    def _cbm_memory_ready(self, cbm):
+        memory = getattr(cbm, "memory", None)
+        return bool(memory is not None and memory.is_ready())
+
+    def _cbm_is_enabled(self, cbm):
+        enabled_for_epoch = getattr(cbm, "enabled_for_epoch", None)
+        if enabled_for_epoch is None:
+            return self._cbm_memory_ready(cbm)
+        return bool(enabled_for_epoch())
+
+    def _apply_cbm_final_fusion(self, scaled_preds, cbm, aux):
+        if self.config.out_ref and self.training:
+            gdt_outputs, outs = scaled_preds
+            outs = list(outs)
+            outs[-1] = cbm.apply_final_fusion(outs[-1], aux)
+            return gdt_outputs, outs
+        outs = list(scaled_preds)
+        outs[-1] = cbm.apply_final_fusion(outs[-1], aux)
+        return outs
+
+    def _return_with_optional_aux(self, scaled_preds, reason, return_aux, p3=None):
+        return self._return_scaled_preds(scaled_preds, self._make_fallback_aux(reason, p3=p3), return_aux)
+
+    def _return_scaled_preds(self, scaled_preds, aux, return_aux):
+        if return_aux:
+            return scaled_preds, aux
         return scaled_preds
 
-    def forward(self, x):
-        return self.forward_ori(x)
+    def _make_fallback_aux(self, reason, p3=None):
+        aux = {
+            "cbm_used": False,
+            "fallback_reason": reason,
+            "top_img_ids": [],
+            "img_scores": None,
+            "num_memory_tokens": 0,
+            "num_valid_boundary_tokens": 0,
+            "valid_ratio": 0.0,
+            "B3_mean": 0.0,
+            "gate_mean": 0.0,
+            "cons_mean": 0.0,
+            "u_mean": 0.0,
+            "p_final": None,
+            "p_main": None,
+            "B_query": None,
+            "boundary_mask": None,
+            "z_mem3": None,
+            "gate3": None,
+        }
+        if p3 is not None:
+            aux["p3_shape"] = tuple(p3.shape)
+        return aux
 
 
 class Decoder(nn.Module):
@@ -183,12 +323,15 @@ class Decoder(nn.Module):
             patches_batch.append(patch_sample)
         return torch.cat(patches_batch, dim=0)
 
-    def forward(self, features):
+    def forward_to_p3(self, features):
         if self.training and self.config.out_ref:
             outs_gdt_pred = []
             outs_gdt_label = []
             x, x1, x2, x3, x4, gdt_gt = features
         else:
+            outs_gdt_pred = []
+            outs_gdt_label = []
+            gdt_gt = None
             x, x1, x2, x3, x4 = features
         outs = []
         p4 = self.decoder_block4(x4)
@@ -219,6 +362,34 @@ class Decoder(nn.Module):
             # >> Finally:
             # p3 = p3 * A_3^G
             p3 = p3 * gdt_attn_3
+
+        state = {
+            "x": x,
+            "x1": x1,
+            "x2": x2,
+            "x3": x3,
+            "x4": x4,
+            "gdt_gt": gdt_gt,
+            "outs": outs,
+            "outs_gdt_pred": outs_gdt_pred,
+            "outs_gdt_label": outs_gdt_label,
+            "m4": m4,
+            "m3": m3,
+        }
+        return state, p3, m3
+
+    def forward_from_p3(self, state, p3_override):
+        x = state["x"]
+        x1 = state["x1"]
+        x2 = state["x2"]
+        gdt_gt = state["gdt_gt"]
+        outs = list(state["outs"])
+        outs_gdt_pred = list(state["outs_gdt_pred"])
+        outs_gdt_label = list(state["outs_gdt_label"])
+        m4 = state["m4"]
+        m3 = state["m3"]
+
+        p3 = p3_override
         _p3 = F.interpolate(p3, size=x2.shape[2:], mode='bilinear', align_corners=True)
         _p2 = _p3 + self.lateral_block3(x2)
         if self.config.dec_ipt:
@@ -258,7 +429,12 @@ class Decoder(nn.Module):
             outs.append(m3)
             outs.append(m2)
         outs.append(p1_out)
-        return outs if not (self.config.out_ref and self.training) else ([outs_gdt_pred, outs_gdt_label], outs)
+        scaled_preds = outs if not (self.config.out_ref and self.training) else ([outs_gdt_pred, outs_gdt_label], outs)
+        return scaled_preds
+
+    def forward(self, features):
+        state, p3, _ = self.forward_to_p3(features)
+        return self.forward_from_p3(state, p3)
 
 
 class SimpleConvs(nn.Module):

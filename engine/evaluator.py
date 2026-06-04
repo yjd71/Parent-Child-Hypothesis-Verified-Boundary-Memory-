@@ -1,17 +1,14 @@
 import os
 import cv2
-import argparse
 import torch
 import torch.nn as nn
 import torch.utils.data as data
 import prettytable as pt
 
-from glob import glob
 from tqdm import tqdm
 
 from config import Config
 from utils import Logger, save_tensor_img
-from data import init_testloaders
 from models import build_model_eval
 
 from .metrics import calculate
@@ -31,9 +28,6 @@ class Evaluator:
         return cls(config, logger, resume, device, model)
     
     def inference_on_dataset(self, dataloader: data.DataLoader, testset_name: str, ema=False, epoch: int=None) -> None:
-        model_training_state = self.model.training
-        # if model_training_state:
-        #     self.model.eval()
         current_save_dir = os.path.join(self.config.pred_save_root, testset_name)
         if epoch is not None:
             current_save_dir = os.path.join(current_save_dir, f'epoch_{epoch}')

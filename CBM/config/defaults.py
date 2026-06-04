@@ -1,0 +1,58 @@
+from __future__ import annotations
+
+from collections.abc import MutableMapping
+from typing import Any
+
+
+CBM_DEFAULTS = {
+    "cbm_pfi_enable": False,
+    "cbm_start_epoch": 0,
+    "cbm_memory_dim": 128,
+    "cbm_value_dim": 8,
+    "cbm_top_img_k": 8,
+    "cbm_topk_token": 16,
+    "cbm_lambda_feat": 0.1,
+    "cbm_lambda_logit": 0.5,
+    "cbm_boundary_kernel": 3,
+    "cbm_boundary_alpha_unc": 0.5,
+    "cbm_boundary_alpha_grad": 0.5,
+    "cbm_boundary_theta": 0.2,
+    "cbm_context_kernel_size": 3,
+    "cbm_context_tau_feat": 0.1,
+    "cbm_context_tau_prob": 0.2,
+    "cbm_context_tau_evi": 0.2,
+    "cbm_print_diagnostics": True,
+    "cbm_lambda_mem": 0.2,
+    "cbm_lambda_bd": 0.2,
+    "cbm_lambda_ctx": 0.05,
+    "cbm_lambda_aff": 0.05,
+    "cbm_lambda_gate_sparse": 0.01,
+    "cbm_lambda_gate_boundary": 0.05,
+    "cbm_boundary_margin": 0.2,
+    "cbm_affinity_kernel_size": 3,
+    "cbm_loss_eps": 1e-6,
+    "cbm_stage_epoch_offset": 1,
+    "cbm_stage1_end": 5,
+    "cbm_stage2_end": 15,
+    "cbm_unlabeled_start_epoch": 16,
+    "cbm_unsup_loss_alpha": 0.1,
+    "cbm_checkpoint_memory": True,
+    "cbm_vis_enable": False,
+    "cbm_vis_interval": 200,
+    "cbm_vis_max_images": 2,
+    "cbm_vis_dir": None,
+    "cbm_vis_labeled_only": True,
+}
+
+
+def apply_cbm_defaults(config: Any) -> Any:
+    """Fill missing CBM config fields without overwriting user-provided values."""
+    if isinstance(config, MutableMapping):
+        for key, value in CBM_DEFAULTS.items():
+            config.setdefault(key, value)
+        return config
+
+    for key, value in CBM_DEFAULTS.items():
+        if not hasattr(config, key):
+            setattr(config, key, value)
+    return config
