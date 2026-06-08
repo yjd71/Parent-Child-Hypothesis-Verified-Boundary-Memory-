@@ -6,7 +6,7 @@ import torch.nn as nn
 import wandb
 from torch.distributed import get_rank
 
-from data import prepare_dataloader
+from data import prepare_dataloader, prepare_labeled_memory_dataloader
 from utils import AverageMeter, retry_if_cuda_oom
 from CBM.config.schedule import cbm_should_rebuild_memory, cbm_stage_epoch, cbm_stage_id, cbm_stage_name, cbm_unlabeled_enabled
 from CBM.diagnostics.visualization import save_pfi_binary_visualizations_v42
@@ -194,7 +194,7 @@ class SemiSupervisedTrainer:
         stage_epoch = cbm_stage_epoch(self.config, epoch)
         stage_name = cbm_stage_name(self.config, epoch)
         if cbm_should_rebuild_memory(self.config, epoch):
-            self.cbm.prepare_epoch(self.model, self.labeled_dataloader, epoch)
+            self.cbm.prepare_epoch(self.model, self.memory_labeled_dataloader, epoch)
         else:
             self.cbm.state.epoch = int(epoch)
             self.cbm.state.stage_epoch = stage_epoch
@@ -290,6 +290,12 @@ class SemiSupervisedTrainer:
             labeled_indices=self.current_labeled_indices,
             is_unsup=True,
         )
+        self.memory_labeled_dataloader = None
+        if self.cbm is not None:
+            self.memory_labeled_dataloader = prepare_labeled_memory_dataloader(
+                config=self.config,
+                labeled_indices=self.current_labeled_indices,
+            )
         assert len(self.labeled_dataloader) == len(self.unlabeled_dataloader), (
             "The lenth between labeled_dataloader and unlabeled_dataloader is not equal!"
         )

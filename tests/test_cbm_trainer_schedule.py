@@ -107,6 +107,7 @@ def _load_solver_with_stubs(monkeypatch):
 
     data = types.ModuleType("data")
     data.prepare_dataloader = lambda *args, **kwargs: None
+    data.prepare_labeled_memory_dataloader = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "data", data)
 
     utils = types.ModuleType("utils")
@@ -219,6 +220,30 @@ class FakeCBM:
 
     def enabled_for_epoch(self, epoch=None):
         return self.memory.is_ready()
+
+
+def test_trainer_rebuilds_cbm_from_memory_labeled_loader(monkeypatch):
+    solver = _load_solver_with_stubs(monkeypatch)
+    trainer = solver.SemiSupervisedTrainer((None, {}), TrainerConfig(), torch.device("cpu"), logger=None)
+    trainer.model = object()
+    trainer.labeled_dataloader = object()
+    trainer.memory_labeled_dataloader = object()
+
+    calls = []
+
+    class PreparingCBM(FakeCBM):
+        def prepare_epoch(self, model, loader, epoch):
+            calls.append((model, loader, epoch))
+
+    trainer.cbm = PreparingCBM(ready=True)
+    monkeypatch.setattr(solver, "cbm_should_rebuild_memory", lambda config, epoch: True)
+    monkeypatch.setattr(solver, "cbm_stage_id", lambda config, epoch: 2)
+    monkeypatch.setattr(solver, "cbm_stage_epoch", lambda config, epoch: epoch)
+    monkeypatch.setattr(solver, "cbm_stage_name", lambda config, epoch: "memory")
+
+    trainer._prepare_cbm_epoch(5)
+
+    assert calls == [(trainer.model, trainer.memory_labeled_dataloader, 5)]
 
 
 def test_trainer_train_batch_merges_cbm_loss_and_diagnostics(monkeypatch):

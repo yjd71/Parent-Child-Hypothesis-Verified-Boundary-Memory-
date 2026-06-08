@@ -1,4 +1,5 @@
 import os
+import cv2
 import torch
 import random
 import numpy as np
@@ -17,13 +18,23 @@ Image.MAX_IMAGE_PIXELS = None       # remove DecompressionBombWarning
 logger = Logger(name='Dataset', path='./data/logs/dataset.txt')
 
 class MyData(data.Dataset):
-    def __init__(self, config, datasets, image_size, is_train=True):
+    def __init__(
+        self,
+        config,
+        datasets,
+        image_size,
+        is_train=True,
+        apply_augmentation=None,
+        label_resize_interpolation=cv2.INTER_LINEAR,
+    ):
         self.config = config
         self.size_train = image_size
         self.size_test = image_size
         self.keep_size = not config.img_size
         self.data_size = (config.img_size, config.img_size)
         self.is_train = is_train
+        self.apply_augmentation = is_train if apply_augmentation is None else bool(apply_augmentation)
+        self.label_resize_interpolation = label_resize_interpolation
         self.load_all = config.load_all
         # self.device = config.device
         self.transform_image = transforms.Compose([
@@ -32,7 +43,14 @@ class MyData(data.Dataset):
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ][self.load_all or self.keep_size:])
         self.transform_label = transforms.Compose([
-            transforms.Resize(self.data_size),
+            transforms.Resize(
+                self.data_size,
+                interpolation=(
+                    transforms.InterpolationMode.NEAREST
+                    if label_resize_interpolation == cv2.INTER_NEAREST
+                    else transforms.InterpolationMode.BILINEAR
+                ),
+            ),
             transforms.ToTensor(),
         ][self.load_all or self.keep_size:])
         dataset_root = os.path.join(config.data_root_dir, config.task)
@@ -50,6 +68,10 @@ class MyData(data.Dataset):
                     self.label_paths.append(p_gt)
                     break
         self.image_to_idx = {os.path.basename(image_path).split('.')[0]: idx for idx, image_path in enumerate(self.image_paths)}
+        self.image_id_to_indices = {}
+        for idx, image_path in enumerate(self.image_paths):
+            image_id = os.path.splitext(os.path.basename(image_path))[0]
+            self.image_id_to_indices.setdefault(image_id, []).append(idx)
         self.unlabeled_indices = []
 
         if self.load_all:
@@ -57,7 +79,12 @@ class MyData(data.Dataset):
             # for image_path, label_path in zip(self.image_paths, self.label_paths):
             for image_path, label_path in tqdm(zip(self.image_paths, self.label_paths), total=len(self.image_paths)):
                 _image = path_to_image(image_path, size=(config.img_size, config.img_size), color_type='rgb')
-                _label = path_to_image(label_path, size=(config.img_size, config.img_size), color_type='gray')
+                _label = path_to_image(
+                    label_path,
+                    size=(config.img_size, config.img_size),
+                    color_type='gray',
+                    interpolation=self.label_resize_interpolation,
+                )
                 self.images_loaded.append(_image)
                 self.labels_loaded.append(_label)
 
@@ -70,9 +97,14 @@ class MyData(data.Dataset):
             label = self.labels_loaded[index]
         else:
             image = path_to_image(self.image_paths[index], size=(self.config.img_size, self.config.img_size), color_type='rgb')
-            label = path_to_image(self.label_paths[index], size=(self.config.img_size, self.config.img_size), color_type='gray')
+            label = path_to_image(
+                self.label_paths[index],
+                size=(self.config.img_size, self.config.img_size),
+                color_type='gray',
+                interpolation=self.label_resize_interpolation,
+            )
         # loading image and label
-        if self.is_train:
+        if self.is_train and self.apply_augmentation:
             image, label = preproc(image, label, preproc_methods=self.config.preproc_methods)
 
         image, label = self.transform_image(image), self.transform_label(label)
@@ -81,7 +113,7 @@ class MyData(data.Dataset):
         # if index in self.unlabeled_indices:
         #     label = 0
         
-        hash_label_path = self.label_paths[index].split('/')[-1].split('.')[0]
+        hash_label_path = os.path.splitext(os.path.basename(self.label_paths[index]))[0]
         
         if self.is_train:
             return image, label, hash_label_path, index
@@ -132,6 +164,59 @@ def prepare_dataloader(dataset: data.Dataset, batch_size: int, num_workers: int,
             dataset = dataset, batch_size = batch_size, num_workers=min(num_workers, batch_size, 0), pin_memory=True,
             sampler = sampler, drop_last=True
         )
+
+
+def prepare_labeled_memory_dataloader(config, labeled_indices) -> data.DataLoader:
+    dataset = MyData(
+        config=config,
+        datasets=config.training_set,
+        image_size=config.img_size,
+        is_train=True,
+        apply_augmentation=False,
+        label_resize_interpolation=cv2.INTER_NEAREST,
+    )
+
+    unique_labeled_ids = []
+    seen_ids = set()
+    for raw_id in labeled_indices:
+        image_id = str(raw_id)
+        if image_id not in seen_ids:
+            seen_ids.add(image_id)
+            unique_labeled_ids.append(image_id)
+
+    missing_ids = [image_id for image_id in unique_labeled_ids if image_id not in dataset.image_to_idx]
+    if missing_ids:
+        raise KeyError("Labeled image IDs are missing from the training dataset: {}".format(missing_ids[:10]))
+
+    duplicate_dataset_ids = [
+        image_id
+        for image_id in unique_labeled_ids
+        if len(dataset.image_id_to_indices.get(image_id, [])) > 1
+    ]
+    if duplicate_dataset_ids:
+        raise ValueError(
+            "Duplicate image IDs found in the memory dataset: {}".format(duplicate_dataset_ids[:10])
+        )
+
+    indices = [dataset.image_to_idx[image_id] for image_id in unique_labeled_ids]
+    memory_dataset = data.Subset(dataset, indices)
+    memory_loader = data.DataLoader(
+        dataset=memory_dataset,
+        batch_size=config.batch_size,
+        num_workers=min(config.num_workers, config.batch_size),
+        pin_memory=True,
+        shuffle=False,
+        drop_last=False,
+    )
+    logger.success_info(
+        "[CBM] Memory labeled dataloader created: samples={}, batches={}, unique_image_ids={}.".format(
+            len(memory_dataset),
+            len(memory_loader),
+            len(unique_labeled_ids),
+        )
+    )
+    return memory_loader
+
 
 def init_trainloader(config):
     train_loader = prepare_dataloader(

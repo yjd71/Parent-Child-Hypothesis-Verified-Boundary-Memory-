@@ -75,7 +75,12 @@ def save_feat_img(feat, path):
     heatmap_color = np.uint8(magma_color_mapped * 255)
     cv2.imwrite(path, heatmap_color)
 
-def path_to_image(path: str, size=(1024, 1024), color_type=['rgb', 'gray'][0]):
+def path_to_image(
+    path: str,
+    size=(1024, 1024),
+    color_type=['rgb', 'gray'][0],
+    interpolation=cv2.INTER_LINEAR,
+):
     if color_type.lower() == 'rgb':
         image = cv2.imread(path)
     elif color_type.lower() == 'gray':
@@ -84,7 +89,7 @@ def path_to_image(path: str, size=(1024, 1024), color_type=['rgb', 'gray'][0]):
         print('Select the color_type to return, either to RGB or gray image.')
         return
     if size:
-        image = cv2.resize(image, size, interpolation=cv2.INTER_LINEAR)
+        image = cv2.resize(image, size, interpolation=interpolation)
     if color_type.lower() == 'rgb':
         image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).convert('RGB')
     else:
