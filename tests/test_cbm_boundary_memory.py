@@ -216,3 +216,55 @@ def test_cbm_api_defaults_and_engine_smoke():
     z_final = cbm.apply_final_fusion(p1_out, aux)
     assert z_final.shape == p1_out.shape
     assert aux["p_final"].shape == p1_out.shape
+
+
+def test_build_pred_boundary_backward_from_sigmoid_source():
+    source = torch.randn(2, 1, 16, 16, requires_grad=True)
+    prob = torch.sigmoid(source)
+
+    b_query, boundary_mask = build_pred_boundary(prob)
+
+    assert boundary_mask.dtype == torch.bool
+    loss = b_query.mean()
+    loss.backward()
+
+    assert source.grad is not None
+    assert torch.isfinite(source.grad).all()
+
+
+def test_cbm_runtime_backward_smoke_without_inplace_autograd_errors():
+    class Config:
+        cbm_pfi_enable = True
+        cbm_print_diagnostics = False
+
+    config = apply_cbm_defaults(Config())
+    cbm = build_cbm_pfi(config, device=torch.device("cpu"), logger=None)
+    cbm.memory.append_batch(
+        x3=torch.randn(2, 8, 8, 8),
+        p3=torch.randn(2, 4, 8, 8),
+        gt=_square_gt(batch_size=2, height=32, width=32),
+        img_ids=["img-a", "img-b"],
+    )
+    cbm.memory.finalize(device=torch.device("cpu"), dtype=torch.float32)
+    cbm.prepare_epoch(model=None, labeled_loader=None, epoch=5)
+
+    x = torch.randn(2, 3, 32, 32)
+    x3 = torch.randn(2, 8, 8, 8)
+    p3 = torch.randn(2, 4, 8, 8, requires_grad=True)
+    m3 = torch.randn(2, 1, 8, 8, requires_grad=True)
+    p1_out = torch.randn(2, 1, 32, 32, requires_grad=True)
+
+    p3_corr, aux = cbm.apply_p3_hook(x=x, x3=x3, p3=p3, m3=m3, training=True)
+    assert aux["cbm_used"] is True
+
+    z_final = cbm.apply_final_fusion(p1_out, aux)
+    loss_cbm = cbm.compute_losses(aux, _square_gt(batch_size=2, height=32, width=32))
+    total = p3_corr.mean() + z_final.mean() + loss_cbm
+    total.backward()
+
+    assert p3.grad is not None
+    assert m3.grad is not None
+    assert p1_out.grad is not None
+    assert torch.isfinite(p3.grad).all()
+    assert torch.isfinite(m3.grad).all()
+    assert torch.isfinite(p1_out.grad).all()

@@ -118,7 +118,7 @@ def _normalize_to_unit(value: torch.Tensor) -> torch.Tensor:
     min_value = value.min()
     max_value = value.max()
     denom = (max_value - min_value).clamp_min(1e-6)
-    return ((value - min_value) / denom).clamp_(0.0, 1.0)
+    return ((value - min_value) / denom).clamp(0.0, 1.0)
 
 
 def _resize_to(value: torch.Tensor, target_size) -> torch.Tensor:

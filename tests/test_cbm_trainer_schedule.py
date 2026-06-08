@@ -266,3 +266,40 @@ def test_trainer_train_batch_saves_cbm_visualizations_without_breaking_backward(
     assert len(files) == 11
     assert any("epoch002_iter000000_Sup_vis-img_p_final.png" in str(path) for path in files)
     assert model.scale.grad is not None
+
+
+def test_trainer_unsup_log_hides_stale_cbm_loss_fields(monkeypatch):
+    solver = _load_solver_with_stubs(monkeypatch)
+    trainer = solver.SemiSupervisedTrainer((None, {}), TrainerConfig(), torch.device("cpu"), logger=None)
+    trainer.loss_dict = {
+        "loss_pix": 1.122,
+        "loss_gdt": 1.386,
+        "loss_cbm_mem": 1.125,
+        "loss_cbm_total": 1.292,
+        "raw_cbm_L_mem_ce": 5.627,
+        "cbm_stage": 3.0,
+        "memory_ready": 1.0,
+        "gate_mean": 0.062,
+        "valid_ratio": 0.138,
+        "retrieval_uncertainty_mean": 0.079,
+        "memory_tokens": 282.0,
+    }
+
+    sup_info = trainer._format_loss_info("Semi-Supervised Training Losses")
+    unsup_info = trainer._format_loss_info("Unsueprvised Training Losses", include_cbm_losses=False)
+
+    assert "loss_cbm_mem: 1.125" in sup_info
+    assert "loss_cbm_total: 1.292" in sup_info
+    assert "raw_cbm_L_mem_ce: 5.627" in sup_info
+
+    assert "loss_cbm_mem" not in unsup_info
+    assert "loss_cbm_total" not in unsup_info
+    assert "raw_cbm_L_mem_ce" not in unsup_info
+    assert "loss_pix: 1.122" in unsup_info
+    assert "loss_gdt: 1.386" in unsup_info
+    assert "cbm_stage: 3.000" in unsup_info
+    assert "memory_ready: 1.000" in unsup_info
+    assert "gate_mean: 0.062" in unsup_info
+    assert "valid_ratio: 0.138" in unsup_info
+    assert "retrieval_uncertainty_mean: 0.079" in unsup_info
+    assert "memory_tokens: 282.000" in unsup_info

@@ -58,10 +58,10 @@ class BoundaryCorrectionHead(nn.Module):
         Y_ctx = self._prepare_context_map(Y_ctx, "Y_ctx", p3, self.value_dim)
         R_ctx = self._prepare_context_map(R_ctx, "R_ctx", p3, self.memory_dim)
 
-        prob3 = torch.sigmoid(self._prepare_single_channel(m3, "m3", p3, mode="bilinear")).clamp_(0.0, 1.0)
-        B_query = self._prepare_single_channel(B_query, "B_query", p3, mode="bilinear").clamp_(0.0, 1.0)
-        U_map = self._prepare_single_channel(U_map, "U_map", p3, mode="bilinear").clamp_(0.0, 1.0)
-        cons_map = self._prepare_single_channel(cons_map, "cons_map", p3, mode="bilinear").clamp_(0.0, 1.0)
+        prob3 = torch.sigmoid(self._prepare_single_channel(m3, "m3", p3, mode="bilinear")).clamp(0.0, 1.0)
+        B_query = self._prepare_single_channel(B_query, "B_query", p3, mode="bilinear").clamp(0.0, 1.0)
+        U_map = self._prepare_single_channel(U_map, "U_map", p3, mode="bilinear").clamp(0.0, 1.0)
+        cons_map = self._prepare_single_channel(cons_map, "cons_map", p3, mode="bilinear").clamp(0.0, 1.0)
         valid_map = self._prepare_single_channel(valid_map, "valid_map", p3, mode="nearest") > 0.5
         valid_float = valid_map.to(dtype=p3.dtype)
 

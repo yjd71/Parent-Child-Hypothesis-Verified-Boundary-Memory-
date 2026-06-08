@@ -17,7 +17,7 @@ def entropy_uncertainty(evidence: torch.Tensor, eps: float = 1e-6) -> torch.Tens
     probs = normalize_distribution(evidence, dim=1, eps=eps)
     entropy = -(probs * probs.log()).sum(dim=1)
     denom = torch.log(torch.tensor(float(evidence.size(1)), device=evidence.device, dtype=evidence.dtype))
-    return (entropy / denom.clamp_min(eps)).clamp_(0.0, 1.0)
+    return (entropy / denom.clamp_min(eps)).clamp(0.0, 1.0)
 
 
 def js_divergence(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:

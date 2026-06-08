@@ -64,6 +64,7 @@ eval_epoch = 20
 eval_step = 1
 # save model_checkpoint
 save_step = 1
+save_last = 7
 
 
 # CBM-PFI

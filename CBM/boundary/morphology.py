@@ -28,7 +28,7 @@ def dilate(mask: torch.Tensor, kernel: int = 3, iterations: int = 1) -> torch.Te
     out = mask
     for _ in range(iterations):
         out = F.max_pool2d(out, kernel_size=kernel, stride=1, padding=pad)
-    return out.clamp_(0.0, 1.0)
+    return out.clamp(0.0, 1.0)
 
 
 def erode(mask: torch.Tensor, kernel: int = 3, iterations: int = 1) -> torch.Tensor:
@@ -40,7 +40,7 @@ def erode(mask: torch.Tensor, kernel: int = 3, iterations: int = 1) -> torch.Ten
     out = mask
     for _ in range(iterations):
         out = 1.0 - dilate(1.0 - out, kernel=kernel, iterations=1)
-    return out.clamp_(0.0, 1.0)
+    return out.clamp(0.0, 1.0)
 
 
 def gradient_magnitude(prob: torch.Tensor) -> torch.Tensor:
@@ -48,4 +48,4 @@ def gradient_magnitude(prob: torch.Tensor) -> torch.Tensor:
     grad_y = F.pad((prob[:, :, 1:, :] - prob[:, :, :-1, :]).abs(), (0, 0, 0, 1))
     grad = grad_x + grad_y
     denom = grad.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
-    return (grad / denom).clamp_(0.0, 1.0)
+    return (grad / denom).clamp(0.0, 1.0)

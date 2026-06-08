@@ -23,12 +23,12 @@ def build_gt_regions(gt: torch.Tensor, target_size: Tuple[int, int], kernel: int
 
     fg_dilate = dilate(fg, kernel=kernel)
     fg_erode = erode(fg, kernel=kernel)
-    boundary = (fg_dilate - fg_erode).clamp_(0.0, 1.0)
+    boundary = (fg_dilate - fg_erode).clamp(0.0, 1.0)
 
-    fg_boundary = (fg * boundary).clamp_(0.0, 1.0)
-    fg_core = (fg * (1.0 - boundary)).clamp_(0.0, 1.0)
-    bg_near = (bg * fg_dilate).clamp_(0.0, 1.0)
-    bg_far = (bg * (1.0 - fg_dilate)).clamp_(0.0, 1.0)
+    fg_boundary = (fg * boundary).clamp(0.0, 1.0)
+    fg_core = (fg * (1.0 - boundary)).clamp(0.0, 1.0)
+    bg_near = (bg * fg_dilate).clamp(0.0, 1.0)
+    bg_far = (bg * (1.0 - fg_dilate)).clamp(0.0, 1.0)
 
     region_label = torch.full_like(fg[:, 0], fill_value=3, dtype=torch.long)
     region_label[bg_near[:, 0].bool()] = 2
@@ -36,7 +36,7 @@ def build_gt_regions(gt: torch.Tensor, target_size: Tuple[int, int], kernel: int
     region_label[fg_core[:, 0].bool()] = 0
 
     sdf_approx = fg_core * 1.0 + fg_boundary * 0.3 - bg_near * 0.3 - bg_far * 1.0
-    sdf_approx = sdf_approx.clamp_(-1.0, 1.0)
+    sdf_approx = sdf_approx.clamp(-1.0, 1.0)
 
     return {
         "fg_core": fg_core,

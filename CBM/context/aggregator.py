@@ -43,7 +43,7 @@ class ContextualBoundaryAggregator(nn.Module):
         self._validate_context_map(Y_map, "Y_map", bsz, height, width)
         self._validate_context_map(R_map, "R_map", bsz, height, width)
 
-        prob3 = self._prepare_single_channel(prob3, "prob3", p3, mode="bilinear").clamp_(0.0, 1.0)
+        prob3 = self._prepare_single_channel(prob3, "prob3", p3, mode="bilinear").clamp(0.0, 1.0)
         valid_map = self._prepare_single_channel(valid_map, "valid_map", p3, mode="nearest").bool()
         valid_float = valid_map.to(dtype=p3.dtype)
 
@@ -82,7 +82,7 @@ class ContextualBoundaryAggregator(nn.Module):
         r_ctx = self._flat_to_map(r_ctx_flat, height, width)
 
         cons_flat = 1.0 - js_divergence(y_center, y_ctx_flat[:, :4], eps=self.eps)
-        cons_flat = cons_flat.clamp_(0.0, 1.0) * valid_center[:, 0]
+        cons_flat = cons_flat.clamp(0.0, 1.0) * valid_center[:, 0]
         cons_map = cons_flat.reshape(bsz, 1, height, width)
         return y_ctx, r_ctx, cons_map
 

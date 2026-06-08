@@ -20,4 +20,4 @@ def prepare_reliability(
     reliability = reliability.to(device=p3.device, dtype=dtype)
     if tuple(reliability.shape[-2:]) != tuple(p3.shape[-2:]):
         reliability = F.interpolate(reliability, size=p3.shape[-2:], mode="nearest")
-    return reliability.clamp_(0.0, 1.0)
+    return reliability.clamp(0.0, 1.0)

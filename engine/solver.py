@@ -139,9 +139,7 @@ class SemiSupervisedTrainer:
                 info_progress = 'Epoch[{0}/{1}] Iter[{2}/{3}].'.format(
                     epoch, total_epochs, batch_idx, len(self.labeled_dataloader)
                 )
-                info_loss = 'Semi-Supervised Training Losses'
-                for loss_name, loss_value in self.loss_dict.items():
-                    info_loss += ', {}: {:.3f}'.format(loss_name, loss_value)
+                info_loss = self._format_loss_info('Semi-Supervised Training Losses')
                 if (not self.config.distributed_train) or (self.config.distributed_train and get_rank() == 0):
                     wandb.log({"Sup-" + k: v for k, v in self.loss_dict.items()}, step=self.global_step)
                 self.logger.info(' '.join((info_progress, info_loss)))
@@ -169,9 +167,7 @@ class SemiSupervisedTrainer:
                     info_progress = 'Unsueprvised Training Epoch[{0}/{1}] Iter[{2}/{3}].'.format(
                         epoch, total_epochs, batch_idx, len(self.unlabeled_dataloader)
                     )
-                    info_loss = 'Unsueprvised Training Losses'
-                    for loss_name, loss_value in self.loss_dict.items():
-                        info_loss += ', {}: {:.3f}'.format(loss_name, loss_value)
+                    info_loss = self._format_loss_info('Unsueprvised Training Losses', include_cbm_losses=False)
                     self.logger.info(' '.join((info_progress, info_loss)))
                     if (not self.config.distributed_train) or (self.config.distributed_train and get_rank() == 0):
                         wandb.log({"Unsup-loss": self.loss_dict['loss_pix']}, step=self.global_step)
@@ -232,6 +228,14 @@ class SemiSupervisedTrainer:
     def _get_model_cbm(self):
         model = self.model.module if hasattr(getattr(self, "model", None), "module") else getattr(self, "model", None)
         return getattr(model, "cbm", None)
+
+    def _format_loss_info(self, title, include_cbm_losses=True):
+        info_loss = title
+        for loss_name, loss_value in self.loss_dict.items():
+            if not include_cbm_losses and (loss_name.startswith('loss_cbm_') or loss_name.startswith('raw_cbm_')):
+                continue
+            info_loss += ', {}: {:.3f}'.format(loss_name, loss_value)
+        return info_loss
 
     def _record_cbm_aux(self, aux, branch_name):
         if self.cbm is not None:

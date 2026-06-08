@@ -21,8 +21,8 @@ class BoundaryLogitFusion(nn.Module):
     ) -> torch.Tensor:
         z_main = self._validate_main_logit(z_main)
         z_mem_up = self._prepare_single_channel(z_mem3, "z_mem3", z_main).to(dtype=z_main.dtype)
-        B_up = self._prepare_single_channel(B_query, "B_query", z_main).clamp_(0.0, 1.0)
-        gate_up = self._prepare_single_channel(gate3, "gate3", z_main).clamp_(0.0, 1.0)
+        B_up = self._prepare_single_channel(B_query, "B_query", z_main).clamp(0.0, 1.0)
+        gate_up = self._prepare_single_channel(gate3, "gate3", z_main).clamp(0.0, 1.0)
         return z_main + self.lambda_logit * B_up * gate_up * (z_mem_up - z_main)
 
     def _validate_main_logit(self, x: torch.Tensor) -> torch.Tensor:
