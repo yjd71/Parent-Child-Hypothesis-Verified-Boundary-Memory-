@@ -2,7 +2,7 @@ import os
 
 # training settings
 
-ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI/works/CBM_topk_64_logit_0.1"
+ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI/works/CBM_prot_labled_split_topk_64"
 
 
 tot_epochs = 30
@@ -97,11 +97,11 @@ cbm_lambda_gate_sparse = 0.01
 cbm_lambda_gate_boundary = 0.05
 
 # CBM visualization
-cbm_vis_enable: True
-cbm_vis_interval: 200
-cbm_vis_max_images: 5
-cbm_vis_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI/works/CBM_topk_64_logit_0.1/cbm_vis_debug"
-cbm_vis_labeled_only: True
+cbm_vis_enable = True
+cbm_vis_interval = 200
+cbm_vis_max_images = 5
+cbm_vis_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI/works/CBM_prot_labled_split_topk_64/cbm_vis_debug"
+cbm_vis_labeled_only = True
 
 
 # CBM checkpoint / eval
