@@ -155,6 +155,8 @@ class TrainerConfig:
     out_ref = False
     distributed_train = False
     sup_only_train_epoch = 15
+    eval_epoch = 20
+    eval_step = 1
     cbm_pfi_enable = True
     cbm_unsup_loss_alpha = 0.1
     cbm_vis_enable = False
@@ -220,6 +222,23 @@ class FakeCBM:
 
     def enabled_for_epoch(self, epoch=None):
         return self.memory.is_ready()
+
+
+def test_trainer_evaluation_starts_at_eval_epoch_and_respects_step(monkeypatch):
+    solver = _load_solver_with_stubs(monkeypatch)
+
+    class EvalConfig(TrainerConfig):
+        eval_epoch = 20
+        eval_step = 3
+
+    trainer = solver.SemiSupervisedTrainer((None, {}), EvalConfig(), torch.device("cpu"), logger=None)
+
+    assert not trainer._should_evaluate_epoch(18)
+    assert not trainer._should_evaluate_epoch(19)
+    assert trainer._should_evaluate_epoch(20)
+    assert not trainer._should_evaluate_epoch(21)
+    assert not trainer._should_evaluate_epoch(22)
+    assert trainer._should_evaluate_epoch(23)
 
 
 def test_trainer_rebuilds_cbm_from_memory_labeled_loader(monkeypatch):

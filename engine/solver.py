@@ -271,6 +271,12 @@ class SemiSupervisedTrainer:
         if log_fn is not None:
             log_fn(message)
 
+    def _should_evaluate_epoch(self, epoch):
+        eval_start = int(getattr(self.config, "eval_epoch", 0))
+        eval_step = int(getattr(self.config, "eval_step", 1))
+        epoch = int(epoch)
+        return eval_step > 0 and epoch >= eval_start and (epoch - eval_start) % eval_step == 0
+
     def launch_train(self, split, total_epochs: int):
         self.labeled_dataloader = prepare_dataloader(
             dataset=self.train_loader.dataset,
@@ -328,7 +334,7 @@ class SemiSupervisedTrainer:
 
             if self.config.distributed_train:
                 torch.distributed.barrier()
-            if epoch % self.config.eval_step == 0:
+            if self._should_evaluate_epoch(epoch):
                 if (self.config.distributed_train and get_rank() == 0) or (not self.config.distributed_train):
                     self.evaluate_online(epoch, is_last=(epoch == total_epochs))
 

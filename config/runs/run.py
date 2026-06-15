@@ -2,7 +2,7 @@ import os
 
 # training settings
 
-ckpt_dir = "/home/zhangqing/YJD/SCOD/xxx/works/test"
+ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI/works/CBM_topk_64_logit_0.1"
 
 
 tot_epochs = 30
@@ -42,47 +42,49 @@ cxt_num = [0, 3][1]
 cxt = lateral_channels_in_collection[1:][::-1][-cxt_num:] if cxt_num else []
 
 # data settings
-load_all = False
+load_all = True
 batch_size = 6
 data_split = [0.05]  # [0.01, 0.05, 0.1]
 
 # ⚠️ 重要：使用随机生成的索引文件
 # 需要先运行 scripts/generate_random_indices.py 生成随机索引
+
+# data_split_indices_file_format = "data/cache/labeled_indices/split{}_labeled_indices_stratified.pt"
 data_split_indices_file_format = "data/cache/labeled_indices/split{}_labeled_indices_random.pt"
 # data_split_indices_file_format = "data/cache/labeled_indices/split{}_labeled_indices.pt"
 
 task = "COD"
 training_set = "TR-COD10K+TR-CAMO"
 # testing_sets = "TE-COD10K"
-testing_sets = "CHAMELEON+TE-COD10K+TE-CAMO+NC4K"
+testing_sets = "TE-COD10K+TE-CAMO"
 
 # evaluate settings
 pred_save_root = os.path.join(ckpt_dir, 'training_preds')
 
 # eval
-eval_epoch = 20
+eval_epoch = 24
 eval_step = 1
 # save model_checkpoint
 save_step = 1
-save_last = 7
+save_last = 8
 
 
 # CBM-PFI
 cbm_pfi_enable = True
 
-# stage schedule: epoch 从 0 开始时，stage_epoch = epoch + 1
+# CBM stage schedule: epoch 从 0 开始时，stage_epoch = epoch + 1
 cbm_stage_epoch_offset = 1
 cbm_stage1_end = 5          # stage 1: baseline warmup, 不用 memory
 cbm_stage2_end = 15         # stage 2: labeled CBM
 cbm_unlabeled_start_epoch = 16  # stage 3: labeled + unlabeled CBM
 
-# memory/retrieval
-cbm_memory_dim = 128
+# CBM memory/retrieval
+cbm_memory_dim = 512
 cbm_value_dim = 8
-cbm_top_img_k = 8
-cbm_topk_token = 16
+cbm_top_img_k = 32
+cbm_topk_token = 64
 
-# correction strength
+# CBM correction strength
 cbm_lambda_feat = 0.1
 cbm_lambda_logit = 0.5
 
@@ -94,7 +96,15 @@ cbm_lambda_aff = 0.05
 cbm_lambda_gate_sparse = 0.01
 cbm_lambda_gate_boundary = 0.05
 
-# checkpoint / eval
+# CBM visualization
+cbm_vis_enable: True
+cbm_vis_interval: 200
+cbm_vis_max_images: 5
+cbm_vis_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI/works/CBM_topk_64_logit_0.1/cbm_vis_debug"
+cbm_vis_labeled_only: True
+
+
+# CBM checkpoint / eval
 cbm_checkpoint_memory = True
 
 # wandb
@@ -103,3 +113,5 @@ others = {
     'sup_epoch': sup_only_train_epoch,
     'total_epoch': tot_epochs,
 }
+
+# python -m scripts.train --config config/runs/run.py
