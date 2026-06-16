@@ -2,21 +2,21 @@ import os
 
 # training settings
 
-ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI/works/CBM_topk_64_2"
+ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI/works/CBM_finetune_from27_topk64"
 
 
-tot_epochs = 30
+tot_epochs = 11
 
-sup_only_train_epoch = 15
+sup_only_train_epoch = 5
 distributed_train = False
 device_map = {
     'model': '*'
 }  # Only available for non distributed training
 rand_seed = 7
-lr = 1e-4
+lr = 2e-5
 
 # 后期关闭 BCE，转向结构型损失（SSIM 为主，IoU 逐步减弱）。
-IoU_finetune_last_epochs = [0, -6][1]
+IoU_finetune_last_epochs = [0, -6][0]
 
 # model settings
 compile_model = False
@@ -62,7 +62,7 @@ testing_sets = "TE-COD10K+TE-CAMO"
 pred_save_root = os.path.join(ckpt_dir, 'training_preds')
 
 # eval
-eval_epoch = 23
+eval_epoch = 4
 eval_step = 1
 # save model_checkpoint
 save_step = 1
@@ -74,9 +74,9 @@ cbm_pfi_enable = True
 
 # CBM stage schedule: epoch 从 0 开始时，stage_epoch = epoch + 1
 cbm_stage_epoch_offset = 1
-cbm_stage1_end = 5          # stage 1: baseline warmup, 不用 memory
-cbm_stage2_end = 15         # stage 2: labeled CBM
-cbm_unlabeled_start_epoch = 16  # stage 3: labeled + unlabeled CBM
+cbm_stage1_end = 2          # stage 1: baseline warmup, 不用 memory
+cbm_stage2_end = 5         # stage 2: labeled CBM
+cbm_unlabeled_start_epoch = 6  # stage 3: labeled + unlabeled CBM
 
 # CBM memory/retrieval
 cbm_memory_dim = 512
