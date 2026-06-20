@@ -3,7 +3,9 @@ import torch
 from CBM import apply_cbm_defaults, build_cbm_pfi
 from CBM.boundary.query import build_pred_boundary
 from CBM.boundary.regions import build_gt_regions
+from CBM.config.defaults import CBM_DEFAULTS
 from CBM.memory.bank import DenseBoundaryMemory
+from config import Config as ProjectConfig
 
 
 def _square_gt(batch_size=2, height=16, width=16):
@@ -216,6 +218,19 @@ def test_cbm_api_defaults_and_engine_smoke():
     z_final = cbm.apply_final_fusion(p1_out, aux)
     assert z_final.shape == p1_out.shape
     assert aux["p_final"].shape == p1_out.shape
+
+
+def test_project_config_loads_cbm_base_defaults_and_run_overrides(capsys):
+    config = ProjectConfig(run_cfg="config/runs/run.py")
+    capsys.readouterr()
+
+    missing = [key for key in CBM_DEFAULTS if not hasattr(config, key)]
+    assert missing == []
+    assert config.cbm_boundary_kernel == CBM_DEFAULTS["cbm_boundary_kernel"]
+    assert config.cbm_memory_dim == 512
+    assert config.cbm_top_img_k == 32
+    assert config.cbm_topk_token == 64
+    assert config.cbm_vis_interval == 20
 
 
 def test_build_pred_boundary_backward_from_sigmoid_source():
