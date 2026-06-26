@@ -1,11 +1,8 @@
-# SAM pseudo-label refinement settings. Disabled by default to keep baseline
-# training behavior unchanged unless a run config explicitly enables it.
-use_sam_pseudo_refine = False
+# SAM backend settings reused by SVB-PLR.
 sam_pseudo_backend = "sam1"  # sam1 | sam2
 sam_pseudo_checkpoint = "SAM/sam_hq_vit_h.pth"
 sam_pseudo_model_type = "vit_h"
 sam_pseudo_threshold = 0.5
-sam_pseudo_fusion_alpha = 0.5
 sam_pseudo_iters = 1
 sam_pseudo_use_point = True
 sam_pseudo_use_box = True
@@ -14,8 +11,6 @@ sam_pseudo_add_neg = True
 sam_pseudo_margin = 0.0
 sam_pseudo_gamma = 4.0
 sam_pseudo_strength = 30
-sam_pseudo_log_enable = False
-sam_pseudo_log_interval = 300
 
 sam2_checkpoint = "SAM/sam2.1_hiera_large.pt"
 sam2_model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
@@ -30,8 +25,6 @@ svb_ablation_mode = "full"  # off | teacher_sam_full | boundary_only | cbm_point
 sam_start_epoch = 16
 sam_refine_interval = 1
 
-# Backend reuse
-svb_reuse_existing_sam_backend = True
 
 # Prompt generation
 sam_use_box_prompt = True

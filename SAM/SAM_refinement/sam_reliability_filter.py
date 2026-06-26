@@ -166,15 +166,30 @@ class SAMCBMReliabilityFilter(nn.Module):
         return conformal.clamp(0.0, 1.0), True
 
     def _lambda_epoch(self, epoch) -> float:
-        if not self._cfg_bool("sam_lambda_decay") or epoch is None:
-            return 1.0
         start = self._cfg_float("sam_lambda_start")
         end = self._cfg_float("sam_lambda_end")
-        horizon = max(1.0, self._cfg_float("sam_start_epoch"))
+        if not self._cfg_bool("sam_lambda_decay") or epoch is None:
+            return start
+
         try:
-            progress = max(0.0, min(1.0, float(epoch) / horizon))
+            epoch_value = float(epoch)
         except (TypeError, ValueError):
-            return 1.0
+            return start
+
+        sam_start_epoch = self._cfg_float("sam_start_epoch")
+        if epoch_value < sam_start_epoch:
+            return start
+
+        # Hold the start value until SVB-PLR becomes active, then decay over the
+        # remaining training epochs so the ramp is anchored at sam_start_epoch.
+        total_epochs = getattr(self.cfg, "tot_epochs", None)
+        try:
+            total_epochs = float(total_epochs)
+        except (TypeError, ValueError):
+            total_epochs = sam_start_epoch
+        decay_span = max(1.0, total_epochs - sam_start_epoch)
+        progress = max(0.0, min(1.0, (epoch_value - sam_start_epoch) / decay_span))
+
         if start >= end:
             return max(end, start - progress * (start - end))
         return min(end, start + progress * (end - start))

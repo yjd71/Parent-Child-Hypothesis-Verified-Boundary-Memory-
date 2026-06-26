@@ -598,6 +598,9 @@ class SemiSupervisedTrainer:
             self.train_epoch(epoch, total_epochs)
             self.logger.success_info("[*] Epoch {} done.".format(epoch))
             self.logger.key_info("[*] Training Loss: {:.3f}".format(self.loss_log.avg))
+            self.model_lr_scheduler.step()
+            current_lr = self.model_optimizer.param_groups[0]["lr"]
+            self.logger.key_info("[*] Current LR: {:.3e}".format(current_lr))
 
             if (
                 epoch >= total_epochs - self.config.save_last

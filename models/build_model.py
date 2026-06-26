@@ -83,6 +83,56 @@ def _load_cbm_memory_from_checkpoint(cbm, checkpoint, config: Config, device: to
         _log(logger, ("warn_info", "warning", "info"), f"[!] Failed to restore CBM memory: {exc}. Fallback to baseline.")
 
 
+def _build_lr_scheduler(config: Config, optimizer: optim.Optimizer):
+    scheduler_type = str(getattr(config, "scheduler_type", "multistep")).strip().lower()
+    if scheduler_type in ("cosine", "cosineannealing", "cosine_annealing"):
+        total_epochs = int(getattr(config, "scheduler_t_max", getattr(config, "tot_epochs", 1)))
+        warmup_epochs = max(0, int(getattr(config, "scheduler_warmup_epochs", 0)))
+        eta_min = float(getattr(config, "scheduler_eta_min", 0.0))
+        if warmup_epochs > 0:
+            start_factor = float(getattr(config, "scheduler_warmup_start_factor", 0.2))
+            start_factor = min(max(start_factor, 1e-8), 1.0)
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=start_factor,
+                end_factor=1.0,
+                total_iters=warmup_epochs,
+            )
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(1, total_epochs - warmup_epochs),
+                eta_min=eta_min,
+            )
+            return torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs],
+            )
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, total_epochs),
+            eta_min=eta_min,
+        )
+
+    if scheduler_type in ("multistep", "multi_step", "step"):
+        decay_epochs = getattr(config, "lr_decay_epochs", [1e4])
+        if not isinstance(decay_epochs, (list, tuple)):
+            decay_epochs = [decay_epochs]
+        total_epochs = int(getattr(config, "tot_epochs", 1))
+        milestones = sorted(
+            int(lde) if int(lde) > 0 else total_epochs + int(lde) + 1
+            for lde in decay_epochs
+        )
+        gamma = float(getattr(config, "lr_decay_rate", 0.5))
+        return torch.optim.lr_scheduler.MultiStepLR(
+            optimizer,
+            milestones=milestones,
+            gamma=gamma,
+        )
+
+    raise NotImplementedError(f"Unsupported scheduler_type: {scheduler_type}")
+
+
 def build_model_optimizers(config: Config, logger: Logger, device: torch.device, resume: str = None) -> any:
     model = build_model(config)
     cbm = _attach_cbm_if_enabled(config, logger, device, model)
@@ -117,11 +167,8 @@ def build_model_optimizers(config: Config, logger: Logger, device: torch.device,
     else:
         raise NotImplementedError(f"Unsupported optimizer: {config.optimizer}")
 
-    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer,
-        milestones=[lde if lde > 0 else config.tot_epochs + lde + 1 for lde in config.lr_decay_epochs],
-        gamma=config.lr_decay_rate,
-    )
+    lr_scheduler = _build_lr_scheduler(config, optimizer)
+    logger.freeze_info("Scheduler type: {}".format(str(getattr(config, "scheduler_type", "multistep"))))
 
     if checkpoint is not None:
         if 'optimizer' in checkpoint:

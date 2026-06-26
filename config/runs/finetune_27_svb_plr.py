@@ -1,35 +1,44 @@
 import os
 
 # Reuse the epoch-27 fine-tune config, then override the settings for a
-# weights-only restart + SVB-PLR run.
+# weights-only restart + aggressive SVB-PLR run.
 with open(os.path.join("config", "runs", "finetune_27.py"), "r", encoding="utf-8") as _base_cfg:
     exec(_base_cfg.read())
 del _base_cfg
 
 
 # experiment settings
-ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI/works/CBM_finetune_from27_svb_plr"
+ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI/works/CBM_finetune_from27_svb_plr_aggressive"
 pred_save_root = os.path.join(ckpt_dir, "training_preds")
 
 
 # training settings
-# weights-only checkpoint restarts from epoch_st=0; tot_epochs=30 means
-# the loop will run epochs 0..30. If you want exactly 30 optimizer passes,
-# set this to 29.
+# weights-only checkpoint restarts from epoch_st=0; this keeps the existing
+# save/eval boundaries while letting the optimizer start fresh.
 tot_epochs = 30
 eval_epoch = 23
 eval_step = 1
 save_step = 1
 save_last = 7
 
-# Keep the fine-tune loss schedule from finetune_27, but switch the tail to
-# structure-heavy optimization.
-IoU_finetune_last_epochs = [0, -6][1]
+# Re-state the inherited supervised warmup threshold so static analyzers see it.
+sup_only_train_epoch = 5
+
+optimizer = "AdamW"
+lr = 5e-5
+
+# Keep the fine-tune loss schedule from finetune_27, but shift the tail to
+# structure-heavy optimization sooner.
+IoU_finetune_last_epochs = -8
 
 # learning-rate schedule
-# NOTE: the current trainer does not call lr_scheduler.step() explicitly.
-# Keep these values here for completeness / future scheduler activation.
-lr_decay_epochs = [-6]
+# Cosine is the aggressive default; multistep remains as a fallback if needed.
+scheduler_type = "cosine"
+scheduler_warmup_epochs = 1
+scheduler_warmup_start_factor = 0.2
+scheduler_t_max = tot_epochs + 1
+scheduler_eta_min = 1e-6
+lr_decay_epochs = [8, 16, 24]
 lr_decay_rate = 0.5
 
 
@@ -37,7 +46,7 @@ lr_decay_rate = 0.5
 use_svb_plr = True
 use_sam_refine_unlabeled = True
 svb_ablation_mode = "full"
-sam_start_epoch = 10
+sam_start_epoch = 8
 sam_refine_interval = 1
 
 
@@ -120,7 +129,7 @@ sam_prompt_select_tau = 0.1
 
 # Cache
 use_sam_cache = True
-sam_cache_dir = "./cache/sam_refined_pseudo/finetune_27_svb_plr"
+sam_cache_dir = "./cache/sam_refined_pseudo/finetune_27_svb_plr_aggressive"
 cache_refined_masks = True
 cache_prompt_debug = False
 
@@ -138,10 +147,17 @@ sam_boundary_loss_boost = 0.5
 
 
 # wandb metadata
-ModelName = "PrototypeNet_Finetune27_SVB_PLR"
+ModelName = "PrototypeNet_Finetune27_SVB_PLR_Aggressive"
 others = {
-    "sup_epoch": sup_only_train_epoch,
     "total_epoch": tot_epochs,
+    "sup_epoch": sup_only_train_epoch,
+    "optimizer": optimizer,
+    "lr": lr,
+    "scheduler_type": scheduler_type,
+    "scheduler_t_max": scheduler_t_max,
+    "scheduler_warmup_epochs": scheduler_warmup_epochs,
+    "scheduler_warmup_start_factor": scheduler_warmup_start_factor,
+    "scheduler_eta_min": scheduler_eta_min,
     "use_svb_plr": use_svb_plr,
     "svb_ablation_mode": svb_ablation_mode,
     "sam_backend": sam_pseudo_backend,
