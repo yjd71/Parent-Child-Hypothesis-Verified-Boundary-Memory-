@@ -3,6 +3,7 @@ import os
 COMMON_CONFIG_DIR='config/base/common.py'
 MODEL_CONFIG_DIR='config/base/model.py'
 CBM_CONFIG_DIR='config/base/cbm.py'
+SAM_CONFIG_DIR='config/base/sam.py'
 
 from utils import Logger
 logger = Logger(name='Config', path='/tmp/talnet_preload.log')
@@ -13,6 +14,7 @@ class Config:
         self.merge_from_file(COMMON_CONFIG_DIR)
         self.merge_from_file(MODEL_CONFIG_DIR)
         self.merge_from_file(CBM_CONFIG_DIR)
+        self.merge_from_file(SAM_CONFIG_DIR)
         self.merge_from_file(run_cfg)
         logger.success_info("Config merged from {}.".format(run_cfg))
         for attr, value in vars(self).items():

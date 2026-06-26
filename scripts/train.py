@@ -20,6 +20,7 @@ parser = get_train_parser()
 args = parser.parse_args()
 
 config = Config(run_cfg = args.config)
+config.resume = args.resume
 os.makedirs(config.ckpt_dir, exist_ok=True)
 logger = Logger(name='TalNet Train Script', path=os.path.join(config.ckpt_dir, "log.txt"))
 
@@ -85,4 +86,3 @@ def main():
 if __name__ == '__main__':
     main()
     
-
