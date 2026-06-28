@@ -148,7 +148,6 @@ class ExistingSAMBackendAdapter(nn.Module):
         point_labels,
         mask_inputs,
     ) -> Dict[str, Any]:
-        from SAM.protoSAMprompt.sam_refiner import prepare_image
         try:
             from SAM.segment_anything.utils.transforms import ResizeLongestSide
         except ImportError:
@@ -161,6 +160,8 @@ class ExistingSAMBackendAdapter(nn.Module):
         sample_scores: List[torch.Tensor] = []
         sample_logits: List[Optional[torch.Tensor]] = []
         failed: List[Tuple[int, str]] = []
+        embedding_cache_hits = 0
+        embedding_cache_misses = 0
 
         for idx, image_np in enumerate(image_np_list):
             try:
@@ -177,8 +178,20 @@ class ExistingSAMBackendAdapter(nn.Module):
                 if not any(key in prompt_dict for key in ("boxes", "point_coords", "mask_inputs")):
                     raise ValueError("empty_external_prompt")
 
-                input_image = torch.stack([sam.preprocess(prompt_dict["image"])], dim=0)
-                image_embeddings = sam.image_encoder(input_image)
+                embedding_cache = getattr(self.refiner, "embedding_cache", None)
+                if embedding_cache is not None:
+                    image_embeddings, cache_hit = embedding_cache.get_or_compute(
+                        image_np,
+                        lambda: sam.image_encoder(torch.stack([sam.preprocess(prompt_dict["image"])], dim=0)),
+                        device=sam.device,
+                    )
+                    if cache_hit:
+                        embedding_cache_hits += 1
+                    else:
+                        embedding_cache_misses += 1
+                else:
+                    input_image = torch.stack([sam.preprocess(prompt_dict["image"])], dim=0)
+                    image_embeddings = sam.image_encoder(input_image)
                 sam_output = sam.forward_with_image_embeddings(
                     image_embeddings,
                     [prompt_dict],
@@ -208,6 +221,8 @@ class ExistingSAMBackendAdapter(nn.Module):
                 "used_fallback": bool(failed),
                 "fallback_samples": failed,
                 "path": "sam1_external_prompt",
+                "embedding_cache_hits": embedding_cache_hits,
+                "embedding_cache_misses": embedding_cache_misses,
             },
         }
 

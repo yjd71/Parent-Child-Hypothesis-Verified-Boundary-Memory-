@@ -305,7 +305,12 @@ class SamRefineVisualizer:
     def _safe_name(value: Any) -> str:
         return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value))
 
+    def _log_enabled(self) -> bool:
+        return bool(getattr(self.cfg, "svb_plr_log_enable", True))
+
     def _warn(self, message: str) -> None:
+        if not self._log_enabled():
+            return
         if self.logger is not None:
             method = getattr(self.logger, "warn_info", None) or getattr(self.logger, "warning", None) or getattr(self.logger, "info", None)
             if callable(method):

@@ -8,8 +8,10 @@ del _base_cfg
 
 
 # experiment settings
-ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI/works/CBM_finetune_from27_svb_plr_aggressive"
+ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI-SAM/CBM-PFI/works/test"
 pred_save_root = os.path.join(ckpt_dir, "training_preds")
+
+load_all = True
 
 
 # training settings
@@ -50,17 +52,11 @@ sam_start_epoch = 8
 sam_refine_interval = 1
 
 
-# Keep the old SAM pseudo-refine path disabled; SVB-PLR uses its own backend.
-use_sam_pseudo_refine = False
-
-
-# SAM backend reuse
-svb_reuse_existing_sam_backend = True
+# SAM backend selector
 sam_pseudo_backend = "sam1"  # sam1 | sam2
-sam_pseudo_checkpoint = "SAM/sam_hq_vit_h.pth"
+sam_pseudo_checkpoint = "/home/zhangqing/YJD/SCOD/Prototype_Feature_Interaction/SAM/sam_vit_h_4b8939.pth"
 sam_pseudo_model_type = "vit_h"
 sam_pseudo_threshold = 0.5
-sam_pseudo_fusion_alpha = 0.5
 sam_pseudo_iters = 1
 sam_pseudo_use_point = True
 sam_pseudo_use_box = True
@@ -69,8 +65,6 @@ sam_pseudo_add_neg = True
 sam_pseudo_margin = 0.0
 sam_pseudo_gamma = 4.0
 sam_pseudo_strength = 30
-sam_pseudo_log_enable = False
-sam_pseudo_log_interval = 300
 
 # SAM2 backend parameters. These are kept here so the backend can be switched
 # by changing only sam_pseudo_backend = "sam2".
@@ -109,26 +103,26 @@ sam_use_stability = True
 sam_use_conformal = True
 sam_min_reliability = 0.3
 sam_teacher_agree_weight = 0.25
-sam_cbm_agree_weight = 0.45
-sam_stability_weight = 0.20
+sam_cbm_agree_weight = 0.20
+sam_stability_weight = 0.45
 sam_conformal_weight = 0.10
 
 
 # Soft pseudo-label fusion
-sam_beta_max = 0.75
+sam_beta_max = 1
 sam_lambda_start = 1.0
 sam_lambda_end = 0.3
-sam_lambda_decay = True
+sam_lambda_decay = False
 
 
 # Prompt expert selector
-use_prompt_expert = True
+use_prompt_expert = False
 sam_prompt_experts = ["box", "box_point", "mask", "boundary"]
 sam_prompt_select_tau = 0.1
 
 
 # Cache
-use_sam_cache = True
+use_sam_cache = False
 sam_cache_dir = "./cache/sam_refined_pseudo/finetune_27_svb_plr_aggressive"
 cache_refined_masks = True
 cache_prompt_debug = False
@@ -137,7 +131,7 @@ cache_prompt_debug = False
 # Visualization
 vis_sam_refinement = False
 vis_sam_refine_interval = 200
-vis_sam_refine_max_samples = 2
+vis_sam_refine_max_samples = 10
 sam_refine_vis_dir = ckpt_dir.rstrip("/\\") + "/svb_plr_visualization"
 
 

@@ -16,7 +16,7 @@ rand_seed = 7
 lr = 1e-4
 
 # 后期关闭 BCE，转向结构型损失（SSIM 为主，IoU 逐步减弱）。
-IoU_finetune_last_epochs = [0, -6][1]
+IoU_finetune_last_epochs = [0, -3][1]
 
 # model settings
 compile_model = False

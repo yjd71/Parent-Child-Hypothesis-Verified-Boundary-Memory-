@@ -52,7 +52,8 @@ def sam_refiner(image,
                 use_samhq=False,
                 ddp=False,
                 is_train=False,
-                coarse_threshold=0.5):
+                coarse_threshold=0.5,
+                embedding_cache=None):
     """
     SAMRefiner refines coarse masks from an image by generating noise-tolerant prompts for SAM.
 
@@ -97,20 +98,31 @@ def sam_refiner(image,
     image = [prepare_image(image, resize_transform, sam.device)]
 
     with torch.no_grad():
-        if ddp:
-            input_images = torch.stack([sam.module.preprocess(x) for x in image], dim=0)
-            if not use_samhq:
-                image_embeddings = sam.module.image_encoder(input_images) # torch.Size([1, 256, 64, 64])
-            else:
-                image_embeddings, interm_embeddings = sam.module.image_encoder(input_images)
-                interm_embeddings = interm_embeddings[0] # early layer
+        interm_embeddings = None
+        if embedding_cache is not None and not use_samhq:
+            def _compute_image_embeddings():
+                if ddp:
+                    input_images = torch.stack([sam.module.preprocess(x) for x in image], dim=0)
+                    return sam.module.image_encoder(input_images)  # torch.Size([1, 256, 64, 64])
+                input_images = torch.stack([sam.preprocess(x) for x in image], dim=0)
+                return sam.image_encoder(input_images)  # torch.Size([1, 256, 64, 64])
+
+            image_embeddings, _ = embedding_cache.get_or_compute(image[0], _compute_image_embeddings, device=sam.device)
         else:
-            input_images = torch.stack([sam.preprocess(x) for x in image], dim=0)
-            if not use_samhq:
-                image_embeddings = sam.image_encoder(input_images) # torch.Size([1, 256, 64, 64])
+            if ddp:
+                input_images = torch.stack([sam.module.preprocess(x) for x in image], dim=0)
+                if not use_samhq:
+                    image_embeddings = sam.module.image_encoder(input_images)  # torch.Size([1, 256, 64, 64])
+                else:
+                    image_embeddings, interm_embeddings = sam.module.image_encoder(input_images)
+                    interm_embeddings = interm_embeddings[0]  # early layer
             else:
-                image_embeddings, interm_embeddings = sam.image_encoder(input_images)
-                interm_embeddings = interm_embeddings[0] # early layer
+                input_images = torch.stack([sam.preprocess(x) for x in image], dim=0)
+                if not use_samhq:
+                    image_embeddings = sam.image_encoder(input_images)  # torch.Size([1, 256, 64, 64])
+                else:
+                    image_embeddings, interm_embeddings = sam.image_encoder(input_images)
+                    interm_embeddings = interm_embeddings[0]  # early layer
 
     pred_mask_list = coarse_masks.to(torch.uint8)
 

@@ -80,7 +80,7 @@ def record_cbm_aux(loss_dict: Dict[str, Any], cbm, cbm_stage: int, aux, branch_n
         log_info(logger, "[CBM] {} fallback={}".format(branch_name, aux.get("fallback_reason")))
 
 
-def record_svb_aux(loss_dict: Dict[str, Any], sam_aux, p_t, p_ref, conf_ref, logger=None) -> None:
+def record_svb_aux(loss_dict: Dict[str, Any], sam_aux, p_t, p_ref, conf_ref, logger=None, log_enabled: bool = True) -> None:
     sam_aux = sam_aux or {}
     batch_size = int(p_ref.size(0)) if torch.is_tensor(p_ref) and p_ref.dim() > 0 else 1
     loss_dict["svb_used_sam"] = 1.0 if sam_aux.get("used_sam", False) else 0.0
@@ -118,11 +118,13 @@ def record_svb_aux(loss_dict: Dict[str, Any], sam_aux, p_t, p_ref, conf_ref, log
         loss_dict["svb_best_expert_{}".format(expert_name)] = ratio
 
     _record_svb_maps(loss_dict, sam_aux, p_t, p_ref)
-    if sam_aux.get("fallback_reason"):
+    if log_enabled and sam_aux.get("fallback_reason"):
         log_info(logger, "[SVB-PLR] fallback={}".format(sam_aux.get("fallback_reason")))
 
 
-def log_svb_calibrator_state(logger, svb_plr, prefix: str) -> None:
+def log_svb_calibrator_state(logger, svb_plr, prefix: str, log_enabled: bool = True) -> None:
+    if not log_enabled:
+        return
     calibrator = getattr(svb_plr, "calibrator", None) if svb_plr is not None else None
     if calibrator is None:
         log_info(logger, "{}: unavailable.".format(prefix))

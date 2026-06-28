@@ -22,6 +22,8 @@ sam2_use_bfloat16 = True
 use_svb_plr = False
 use_sam_refine_unlabeled = False
 svb_ablation_mode = "full"  # off | teacher_sam_full | boundary_only | cbm_points | reliability | prompt_expert | conformal | full
+svb_plr_log_enable = True
+svb_plr_log_interval = 200
 sam_start_epoch = 16
 sam_refine_interval = 1
 

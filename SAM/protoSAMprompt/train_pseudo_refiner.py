@@ -4,6 +4,11 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+try:
+    from ..SAM_refinement.sam_image_cache import SAMImageEmbeddingCache
+except ImportError:
+    from SAM.SAM_refinement.sam_image_cache import SAMImageEmbeddingCache
+
 from utils.sam_pseudo_logging import SamPseudoRefineLogger
 
 
@@ -32,6 +37,11 @@ class _BaseSamPseudoLabelRefiner:
         self.margin = float(getattr(config, "sam_pseudo_margin", 0.0))
         self.gamma = float(getattr(config, "sam_pseudo_gamma", 4.0))
         self.strength = float(getattr(config, "sam_pseudo_strength", 30))
+        self.embedding_cache = SAMImageEmbeddingCache(
+            config,
+            backend_tag=backend,
+            model_tag=self.log_model_type,
+        )
         self.refine_logger = SamPseudoRefineLogger(
             logger=logger,
             enabled=getattr(config, "sam_pseudo_log_enable", True),
@@ -233,6 +243,7 @@ class Sam1PseudoLabelRefiner(_BaseSamPseudoLabelRefiner):
             ddp=False,
             is_train=False,
             coarse_threshold=self.threshold,
+            embedding_cache=self.embedding_cache,
         )
         return torch.from_numpy(refined_masks[0]).float()
 

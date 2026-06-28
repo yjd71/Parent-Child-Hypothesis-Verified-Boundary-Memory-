@@ -8,7 +8,7 @@ del _base_cfg
 
 
 # experiment settings
-ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI/works/CBM_topk_64_2_svb_plr_full"
+ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI-SAM/CBM-PFI/works/test"
 pred_save_root = ckpt_dir.rstrip("/\\") + "/training_preds"
 
 
@@ -21,6 +21,8 @@ sam_refine_interval = 1
 
 # SAM backend selector
 sam_pseudo_backend = "sam1"  # sam1 | sam2
+# sam_pseudo_checkpoint = "/home/zhangqing/YJD/SCOD/Prototype_Feature_Interaction/SAM/sam_hq_vit_h.pth"
+sam_pseudo_checkpoint = "/home/zhangqing/YJD/SCOD/Prototype_Feature_Interaction/SAM/sam_vit_h_4b8939.pth"
 
 
 # Prompt generation
@@ -65,13 +67,13 @@ sam_lambda_decay = False
 
 
 # Prompt expert selector
-use_prompt_expert = True
+use_prompt_expert = False
 sam_prompt_experts = ["box", "box_point", "mask", "boundary"]
 sam_prompt_select_tau = 0.1
 
 
 # Cache
-use_sam_cache = True
+use_sam_cache = False
 sam_cache_dir = "./cache/sam_refined_pseudo/svb_plr_full"
 cache_refined_masks = True
 cache_prompt_debug = True

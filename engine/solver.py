@@ -79,13 +79,13 @@ class SemiSupervisedTrainer:
         if not bool(getattr(self.config, "use_svb_plr", False)) or svb_mode == "off":
             self.svb_plr = None
             if bool(getattr(self.config, "use_svb_plr", False)) and not self._svb_mode_logged:
-                self._log_info("[SVB-PLR] ablation_mode=off; using baseline pseudo labels.")
+                self._log_svb_info("[SVB-PLR] ablation_mode=off; using baseline pseudo labels.")
                 self._svb_mode_logged = True
             return
         if SAMVerifiedBoundaryPseudoLabelRefinement is None:
             self.svb_plr = None
             if not self._svb_plr_import_error_logged:
-                self._log_info("[SVB-PLR] modules unavailable; training will use baseline pseudo labels.")
+                self._log_svb_info("[SVB-PLR] modules unavailable; training will use baseline pseudo labels.")
                 self._svb_plr_import_error_logged = True
             return
         if self.svb_plr is not None:
@@ -100,7 +100,7 @@ class SemiSupervisedTrainer:
             param.requires_grad = False
         self._restore_svb_conformal_state()
         if not self._svb_mode_logged:
-            self._log_info("[SVB-PLR] ablation_mode={}".format(getattr(self.svb_plr, "ablation_mode", svb_mode)))
+            self._log_svb_info("[SVB-PLR] ablation_mode={}".format(getattr(self.svb_plr, "ablation_mode", svb_mode)))
             self._svb_mode_logged = True
 
     def _restore_svb_conformal_state(self):
@@ -114,23 +114,23 @@ class SemiSupervisedTrainer:
         if not resume:
             return
         if not os.path.isfile(resume):
-            self._log_info("[SVB-PLR] conformal state restore skipped: resume checkpoint not found at '{}'.".format(resume))
+            self._log_svb_info("[SVB-PLR] conformal state restore skipped: resume checkpoint not found at '{}'.".format(resume))
             self._svb_conformal_state_loaded = True
             return
         try:
             checkpoint = torch.load(resume, map_location="cpu")
             state = checkpoint.get("svb_conformal_calibrator") if isinstance(checkpoint, dict) else None
             if not state:
-                self._log_info("[SVB-PLR] conformal state restore skipped: checkpoint has no svb_conformal_calibrator.")
+                self._log_svb_info("[SVB-PLR] conformal state restore skipped: checkpoint has no svb_conformal_calibrator.")
                 self._svb_conformal_state_loaded = True
                 return
             calibrator.load_calibrator_state(state, device=self.device)
             self._svb_conformal_fitted = bool(calibrator.is_fitted())
             self._svb_conformal_state_loaded = True
-            log_svb_calibrator_state(self.logger, self.svb_plr, "[SVB-PLR] conformal state restored")
+            log_svb_calibrator_state(self.logger, self.svb_plr, "[SVB-PLR] conformal state restored", log_enabled=self._svb_should_log())
         except Exception as exc:
             self._svb_conformal_state_loaded = True
-            self._log_info("[SVB-PLR] conformal state restore failed: {}".format(exc))
+            self._log_svb_info("[SVB-PLR] conformal state restore failed: {}".format(exc))
 
     def _svb_conformal_state_dict(self):
         if self.svb_plr is None:
@@ -142,7 +142,7 @@ class SemiSupervisedTrainer:
         try:
             return to_state_dict()
         except Exception as exc:
-            self._log_info("[SVB-PLR] conformal state save skipped: {}".format(exc))
+            self._log_svb_info("[SVB-PLR] conformal state save skipped: {}".format(exc))
             return None
 
     @retry_if_cuda_oom
@@ -358,7 +358,15 @@ class SemiSupervisedTrainer:
                     branch_name="Unsup",
                 )
                 if self.svb_plr is not None:
-                    record_svb_aux(self.loss_dict, sam_aux, p_t, p_ref, conf_ref, logger=self.logger)
+                    record_svb_aux(
+                        self.loss_dict,
+                        sam_aux,
+                        p_t,
+                        p_ref,
+                        conf_ref,
+                        logger=self.logger,
+                        log_enabled=self._svb_should_log(),
+                    )
 
                 if batch_idx % 20 == 0:
                     log_training_progress(
@@ -431,11 +439,11 @@ class SemiSupervisedTrainer:
         calibrator = getattr(self.svb_plr, "calibrator", None)
         sam_backend = getattr(self.svb_plr, "sam_backend", None)
         if calibrator is None or sam_backend is None:
-            self._log_info("[SVB-PLR] conformal calibrator fit skipped: calibrator_or_backend_missing.")
+            self._log_svb_info("[SVB-PLR] conformal calibrator fit skipped: calibrator_or_backend_missing.")
             return
         labeled_loader = getattr(self, "memory_labeled_dataloader", None) or getattr(self, "labeled_dataloader", None)
         if labeled_loader is None:
-            self._log_info("[SVB-PLR] conformal calibrator fit skipped: labeled_loader_missing.")
+            self._log_svb_info("[SVB-PLR] conformal calibrator fit skipped: labeled_loader_missing.")
             return
         try:
             calibrator.fit(
@@ -446,10 +454,15 @@ class SemiSupervisedTrainer:
                 device=self.device,
             )
             self._svb_conformal_fitted = True
-            self._log_info("[SVB-PLR] conformal calibrator fitted at epoch {}.".format(epoch))
-            log_svb_calibrator_state(self.logger, self.svb_plr, "[SVB-PLR] conformal calibrator state")
+            self._log_svb_info("[SVB-PLR] conformal calibrator fitted at epoch {}.".format(epoch))
+            log_svb_calibrator_state(
+                self.logger,
+                self.svb_plr,
+                "[SVB-PLR] conformal calibrator state",
+                log_enabled=self._svb_should_log(),
+            )
         except Exception as exc:
-            self._log_info("[SVB-PLR] conformal calibrator fit skipped: {}".format(exc))
+            self._log_svb_info("[SVB-PLR] conformal calibrator fit skipped: {}".format(exc))
 
     def _extract_unsup_views(self, unsup_batch):
         if isinstance(unsup_batch, dict):
@@ -493,7 +506,7 @@ class SemiSupervisedTrainer:
     def _align_weak_to_strong(self, p_ref, conf_ref, geom):
         if geom is None:
             if not self._svb_same_view_warned:
-                self._log_info("[SVB-PLR] same-view pseudo labels are used; weak-to-strong geometry is not enabled.")
+                self._log_svb_info("[SVB-PLR] same-view pseudo labels are used; weak-to-strong geometry is not enabled.")
                 self._svb_same_view_warned = True
             return p_ref.detach(), conf_ref.detach()
         try:
@@ -502,7 +515,7 @@ class SemiSupervisedTrainer:
             return pseudo_s, conf_s
         except Exception as exc:
             if not self._svb_same_view_warned:
-                self._log_info("[SVB-PLR] apply_geom failed ({}); falling back to same-view pseudo labels.".format(exc))
+                self._log_svb_info("[SVB-PLR] apply_geom failed ({}); falling back to same-view pseudo labels.".format(exc))
                 self._svb_same_view_warned = True
             return p_ref.detach(), conf_ref.detach()
 
@@ -555,6 +568,29 @@ class SemiSupervisedTrainer:
 
     def _log_info(self, message):
         log_info(self.logger, message)
+
+    def _svb_log_enabled(self):
+        return bool(getattr(self.config, "svb_plr_log_enable", True))
+
+    def _svb_log_interval(self):
+        try:
+            return max(1, int(getattr(self.config, "svb_plr_log_interval", 200)))
+        except (TypeError, ValueError):
+            return 200
+
+    def _svb_should_log(self, step=None):
+        if not self._svb_log_enabled():
+            return False
+        if step is None:
+            step = getattr(self, "global_step", None)
+        try:
+            return int(step) % self._svb_log_interval() == 0
+        except (TypeError, ValueError):
+            return True
+
+    def _log_svb_info(self, message):
+        if self._svb_should_log():
+            self._log_info(message)
 
     def _should_evaluate_epoch(self, epoch):
         eval_start = int(getattr(self.config, "eval_epoch", 0))

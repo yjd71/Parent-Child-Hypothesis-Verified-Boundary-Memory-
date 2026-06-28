@@ -67,6 +67,8 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
         "vis_sam_refine_max_samples": 2,
         "sam_refine_vis_dir": "outputs/svb_plr_visualization",
         "svb_ablation_mode": "full",
+        "svb_plr_log_enable": True,
+        "svb_plr_log_interval": 200,
         "sam_beta_max": 0.75,
     }
 
@@ -76,6 +78,7 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
         self.device = device
         self.logger = logger
         self._sam_backend_init_error: Optional[str] = None
+        self._current_step: Optional[int] = None
         self.ablation_policy = self._build_ablation_policy()
         self.ablation_mode = self.ablation_policy.mode
         self._conformal_enabled = bool(self.ablation_policy.use_conformal and self._cfg_bool("sam_use_conformal"))
@@ -104,6 +107,7 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
         student_pred=None,
     ):
         """Run full SVB-PLR refinement on unlabeled teacher probabilities."""
+        self._current_step = self._normalize_step(step)
         if teacher_prob is None:
             return None, None, {"used_sam": False, "fallback_reason": "teacher_prob_none"}
 
@@ -558,7 +562,32 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
     def _cfg_float(self, name: str) -> float:
         return float(self._cfg(name))
 
+    def _log_enabled(self) -> bool:
+        return self._cfg_bool("svb_plr_log_enable")
+
+    def _log_interval(self) -> int:
+        try:
+            return max(1, self._cfg_int("svb_plr_log_interval"))
+        except (TypeError, ValueError):
+            return 200
+
+    def _should_log(self) -> bool:
+        if not self._log_enabled():
+            return False
+        if self._current_step is None:
+            return True
+        return self._current_step % self._log_interval() == 0
+
+    @staticmethod
+    def _normalize_step(step) -> Optional[int]:
+        try:
+            return int(step)
+        except (TypeError, ValueError):
+            return None
+
     def _log_info(self, message: str) -> None:
+        if not self._should_log():
+            return
         if self.logger is not None:
             method = getattr(self.logger, "info", None) or getattr(self.logger, "key_info", None)
             if callable(method):
@@ -567,6 +596,8 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
         LOGGER.info(message)
 
     def _warn(self, message: str) -> None:
+        if not self._should_log():
+            return
         if self.logger is not None:
             for method_name in ("warn_info", "warning", "warn", "info"):
                 method = getattr(self.logger, method_name, None)
