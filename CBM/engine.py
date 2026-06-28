@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Optional
 
 import torch
@@ -46,6 +47,7 @@ class CBMPFIEngine(nn.Module):
 
         self.router: Optional[GlobalMemoryRouter] = None
         self.retriever: Optional[PointwiseBoundaryRetriever] = None
+        self.lagged_retriever: Optional[nn.Module] = None
         self.context: Optional[ContextualBoundaryAggregator] = None
         self.correction: Optional[BoundaryCorrectionHead] = None
         self.logit_fusion = BoundaryLogitFusion(lambda_logit=float(getattr(self.config, "cbm_lambda_logit", 0.5)))
@@ -70,10 +72,15 @@ class CBMPFIEngine(nn.Module):
         self.state.memory_ready = self.memory.is_ready()
         self._info(self.memory.diagnostic_string())
 
-    def enabled_for_epoch(self, epoch: Optional[int] = None) -> bool:
+    def enabled_for_epoch(self, epoch: Optional[int] = None, memory_t=None) -> bool:
         current_epoch = self.state.epoch if epoch is None else int(epoch)
-        self.state.memory_ready = self.memory.is_ready()
+        self.state.memory_ready = self.memory_ready(memory_t)
         return cbm_enabled_for_epoch(self.config, current_epoch, self.state.memory_ready)
+
+    def memory_ready(self, memory_t=None) -> bool:
+        labeled_memory, _ = self._resolve_forward_memories(memory_t)
+        ready = getattr(labeled_memory, "is_ready", None)
+        return bool(callable(ready) and ready())
 
     def initialize_modules(
         self,
@@ -104,13 +111,15 @@ class CBMPFIEngine(nn.Module):
         p3: torch.Tensor,
         m3: Optional[torch.Tensor],
         training: bool = False,
+        memory_t=None,
     ):
         del x, training
         if m3 is None:
             aux = build_fallback_aux("m3_none", p3=p3)
             self.state.last_aux = aux
             return p3, aux
-        if not self.enabled_for_epoch():
+        use_sv_ume = bool(getattr(self.config, "use_sv_ume", False))
+        if not self.enabled_for_epoch(memory_t=memory_t if use_sv_ume else None):
             aux = build_fallback_aux("cbm_disabled_or_memory_not_ready", p3=p3)
             self.state.last_aux = aux
             return p3, aux
@@ -125,19 +134,68 @@ class CBMPFIEngine(nn.Module):
             theta=float(getattr(self.config, "cbm_boundary_theta", 0.2)),
         )
 
-        top_img_ids, img_scores = self.router(
-            x3,
-            self.memory,
-            top_img_k=int(getattr(self.config, "cbm_top_img_k", 8)),
-        )
-        K_mem, V_mem, meta = self.memory.get_sub_memory(top_img_ids, device=p3.device, dtype=p3.dtype)
-        retrieval = self.retriever(
-            p3,
+        if not use_sv_ume:
+            top_img_ids, img_scores = self.router(
+                x3,
+                self.memory,
+                top_img_k=int(getattr(self.config, "cbm_top_img_k", 8)),
+            )
+            K_mem, V_mem, meta = self.memory.get_sub_memory(top_img_ids, device=p3.device, dtype=p3.dtype)
+            retrieval = self.retriever(
+                p3,
+                B_query=B_query,
+                boundary_mask=boundary_mask,
+                K_mem=K_mem,
+                V_mem=V_mem,
+                topk_token=int(getattr(self.config, "cbm_topk_token", 16)),
+            )
+            Y_ctx, R_ctx, cons_map = self.context(
+                p3,
+                prob3,
+                retrieval["Y_map"],
+                retrieval["R_map"],
+                retrieval["valid_map"],
+            )
+            p3_corr, z_mem3, gate3 = self.correction(
+                p3,
+                m3,
+                B_query,
+                retrieval["Y_map"],
+                Y_ctx,
+                R_ctx,
+                retrieval["U_map"],
+                cons_map,
+                retrieval["valid_map"],
+            )
+            aux = build_used_aux(
+                top_img_ids=top_img_ids,
+                img_scores=img_scores,
+                K_mem=K_mem,
+                B_query=B_query,
+                boundary_mask=boundary_mask,
+                gate3=gate3,
+                z_mem3=z_mem3,
+                Y_map=retrieval["Y_map"],
+                Y_ctx=Y_ctx,
+                R_map=retrieval["R_map"],
+                R_ctx=R_ctx,
+                cons_map=cons_map,
+                U_map=retrieval["U_map"],
+                valid_map=retrieval["valid_map"],
+                prob3=prob3,
+                meta=meta,
+            )
+            self.state.last_aux = aux
+            return p3_corr, aux
+
+        labeled_memory, unlabeled_memory = self._resolve_forward_memories(memory_t)
+        retrieval = self.lagged_retriever(
+            p3=p3,
             B_query=B_query,
             boundary_mask=boundary_mask,
-            K_mem=K_mem,
-            V_mem=V_mem,
-            topk_token=int(getattr(self.config, "cbm_topk_token", 16)),
+            x3=x3,
+            labeled_memory=labeled_memory,
+            unlabeled_memory=unlabeled_memory,
         )
         Y_ctx, R_ctx, cons_map = self.context(
             p3,
@@ -157,10 +215,20 @@ class CBMPFIEngine(nn.Module):
             cons_map,
             retrieval["valid_map"],
         )
+        ret_l = retrieval["ret_l"]
+        ret_u = retrieval.get("ret_u")
+        top_img_ids = ret_l["top_img_ids"]
+        img_scores = ret_l["img_scores"]
+        meta = ret_l.get("memory_meta")
+        num_labeled_tokens = int(ret_l.get("routed_token_count", 0))
+        num_unlabeled_tokens = (
+            0 if ret_u is None else int(ret_u.get("routed_token_count", 0))
+        )
         aux = build_used_aux(
             top_img_ids=top_img_ids,
             img_scores=img_scores,
-            K_mem=K_mem,
+            K_mem=None,
+            num_memory_tokens=num_labeled_tokens + num_unlabeled_tokens,
             B_query=B_query,
             boundary_mask=boundary_mask,
             gate3=gate3,
@@ -175,6 +243,46 @@ class CBMPFIEngine(nn.Module):
             prob3=prob3,
             meta=meta,
         )
+        source_fields = {
+            "B3": B_query,
+            "ret_l": ret_l,
+            "ret_u": ret_u,
+            "w_l": retrieval["w_l"],
+            "w_u": retrieval["w_u"],
+            "w_l_map": retrieval["w_l_map"],
+            "w_u_map": retrieval["w_u_map"],
+            "score_l": retrieval["score_l"],
+            "score_u": retrieval["score_u"],
+            "used_unlabeled_memory": bool(retrieval["used_unlabeled_memory"]),
+            "source_entropy": retrieval["source_entropy"],
+            "num_labeled_memory_tokens": num_labeled_tokens,
+            "num_unlabeled_memory_tokens": num_unlabeled_tokens,
+        }
+        aux.update(source_fields)
+        aux["retrieval"] = {
+            "Y_map": retrieval["Y_map"],
+            "Y": retrieval["Y_map"],
+            "Y_ctx": Y_ctx,
+            "R_map": retrieval["R_map"],
+            "R": retrieval["R_map"],
+            "R_ctx": R_ctx,
+            "U_map": retrieval["U_map"],
+            "U": retrieval["U_map"],
+            "uncertainty": retrieval["U_map"],
+            "valid_map": retrieval["valid_map"],
+            "cons_map": cons_map,
+            "B3": B_query,
+            "B_query": B_query,
+            "boundary_mask": boundary_mask,
+            "gate3": gate3,
+            "z_mem3": z_mem3,
+            "prob3": prob3,
+            "top_img_ids": top_img_ids,
+            "img_scores": img_scores,
+            "p_main": None,
+            "p_final": None,
+            **source_fields,
+        }
         self.state.last_aux = aux
         return p3_corr, aux
 
@@ -189,6 +297,10 @@ class CBMPFIEngine(nn.Module):
         aux["p_main"] = torch.sigmoid(p1_out).detach()
         z_final = self.logit_fusion(p1_out, z_mem3, B_query, gate3)
         aux["p_final"] = torch.sigmoid(z_final).detach()
+        retrieval = aux.get("retrieval")
+        if isinstance(retrieval, dict):
+            retrieval["p_main"] = aux["p_main"]
+            retrieval["p_final"] = aux["p_final"]
         self.state.last_aux = aux
         return z_final
 
@@ -249,7 +361,57 @@ class CBMPFIEngine(nn.Module):
                 tau_prob=float(getattr(self.config, "cbm_context_tau_prob", 0.2)),
                 tau_evi=float(getattr(self.config, "cbm_context_tau_evi", 0.2)),
             )
+        if bool(getattr(self.config, "use_sv_ume", False)) and self.lagged_retriever is None:
+            from CBM.sv_ume.lagged_memory_retriever import (
+                LaggedLabeledUnlabeledRetriever,
+            )
+
+            self.lagged_retriever = LaggedLabeledUnlabeledRetriever(
+                self.config,
+                pointwise_retriever=self.retriever,
+                global_router=self.router,
+                register_backends=False,
+            )
         self.to(device=ref.device, dtype=ref.dtype)
+
+    def _resolve_forward_memories(self, memory_t=None):
+        if memory_t is None:
+            return self.memory, None
+        if not isinstance(memory_t, Mapping):
+            raise TypeError("memory_t must be a mapping or None")
+
+        labeled_memory = self._memory_entry(
+            memory_t,
+            canonical="labeled_memory",
+            alias="L_t",
+            default=self.memory,
+        )
+        unlabeled_memory = self._memory_entry(
+            memory_t,
+            canonical="unlabeled_memory",
+            alias="U_prev",
+            default=None,
+        )
+        if labeled_memory is None:
+            labeled_memory = self.memory
+        return labeled_memory, unlabeled_memory
+
+    @staticmethod
+    def _memory_entry(memory_t, *, canonical, alias, default):
+        has_canonical = canonical in memory_t
+        has_alias = alias in memory_t
+        if has_canonical and has_alias:
+            canonical_value = memory_t[canonical]
+            alias_value = memory_t[alias]
+            if canonical_value is not alias_value:
+                raise ValueError(
+                    f"memory_t contains conflicting {canonical!r} and {alias!r} values"
+                )
+        if has_canonical:
+            return memory_t[canonical]
+        if has_alias:
+            return memory_t[alias]
+        return default
 
     def _info(self, message: str) -> None:
         if self.logger is None:

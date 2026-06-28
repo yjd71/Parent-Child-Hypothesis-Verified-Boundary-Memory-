@@ -30,12 +30,24 @@ class ModelEMA(nn.Module):
             return self.teacher.extract_cbm_memory_features(x)
         return self.student.extract_cbm_memory_features(x)
 
-    def forward(self, x, ema=False, use_memory=None, cbm=None, return_aux=False):
+    def forward(self, x, ema=False, use_memory=None, cbm=None, return_aux=False, memory_t=None):
         active_cbm = self.cbm if cbm is None else cbm
         if ema:
-            return self.teacher(x, use_memory=use_memory, cbm=active_cbm, return_aux=return_aux)
+            return self.teacher(
+                x,
+                use_memory=use_memory,
+                cbm=active_cbm,
+                memory_t=memory_t,
+                return_aux=return_aux,
+            )
         else:
-            return self.student(x, use_memory=use_memory, cbm=active_cbm, return_aux=return_aux)
+            return self.student(
+                x,
+                use_memory=use_memory,
+                cbm=active_cbm,
+                memory_t=memory_t,
+                return_aux=return_aux,
+            )
         
     def ema_update(self, global_step, alpha=None):
         with torch.no_grad():
@@ -148,9 +160,9 @@ class TalNet(nn.Module):
             if was_training:
                 self.train()
 
-    def forward_cbm_pfi(self, x, cbm=None, return_aux=False):
+    def forward_cbm_pfi(self, x, cbm=None, return_aux=False, memory_t=None):
         active_cbm = self.cbm if cbm is None else cbm
-        reason = self._cbm_fallback_reason(active_cbm)
+        reason = self._cbm_fallback_reason(active_cbm, memory_t=memory_t)
         if reason is not None:
             return self._return_with_optional_aux(self.forward_ori(x), reason, return_aux)
 
@@ -161,7 +173,16 @@ class TalNet(nn.Module):
             scaled_preds = self.decoder.forward_from_p3(state, p3)
             return self._return_with_optional_aux(scaled_preds, "m3_none", return_aux, p3=p3)
 
-        p3_corr, aux = active_cbm.apply_p3_hook(x=x, x3=x3, p3=p3, m3=m3, training=self.training)
+        hook_kwargs = {
+            "x": x,
+            "x3": x3,
+            "p3": p3,
+            "m3": m3,
+            "training": self.training,
+        }
+        if memory_t is not None:
+            hook_kwargs["memory_t"] = memory_t
+        p3_corr, aux = active_cbm.apply_p3_hook(**hook_kwargs)
         if not aux or not aux.get("cbm_used", False):
             scaled_preds = self.decoder.forward_from_p3(state, p3)
             reason = "cbm_hook_fallback" if not aux else aux.get("fallback_reason", "cbm_hook_fallback")
@@ -171,15 +192,20 @@ class TalNet(nn.Module):
         scaled_preds = self._apply_cbm_final_fusion(scaled_preds, active_cbm, aux)
         return self._return_scaled_preds(scaled_preds, aux, return_aux)
 
-    def forward(self, x, use_memory=None, cbm=None, return_aux=False):
+    def forward(self, x, use_memory=None, cbm=None, return_aux=False, memory_t=None):
         active_cbm = self.cbm if cbm is None else cbm
         if not self._should_use_cbm(use_memory, active_cbm):
             return self._return_with_optional_aux(
                 self.forward_ori(x),
-                self._disabled_forward_reason(use_memory, active_cbm),
+                self._disabled_forward_reason(use_memory, active_cbm, memory_t=memory_t),
                 return_aux,
             )
-        return self.forward_cbm_pfi(x, cbm=active_cbm, return_aux=return_aux)
+        return self.forward_cbm_pfi(
+            x,
+            cbm=active_cbm,
+            memory_t=memory_t,
+            return_aux=return_aux,
+        )
 
     def _should_use_cbm(self, use_memory, cbm):
         if use_memory is False:
@@ -190,33 +216,45 @@ class TalNet(nn.Module):
             return True
         return (not self.training) and self._cbm_is_enabled(cbm)
 
-    def _cbm_fallback_reason(self, cbm):
+    def _cbm_fallback_reason(self, cbm, memory_t=None):
         if cbm is None:
             return "cbm_none"
-        if not self._cbm_memory_ready(cbm):
+        if not self._cbm_memory_ready(cbm, memory_t=memory_t):
             return "memory_not_ready"
-        if not self._cbm_is_enabled(cbm):
+        if not self._cbm_is_enabled(cbm, memory_t=memory_t):
             return "cbm_disabled"
         return None
 
-    def _disabled_forward_reason(self, use_memory, cbm):
+    def _disabled_forward_reason(self, use_memory, cbm, memory_t=None):
         if use_memory is False:
             return "use_memory_false"
         if cbm is None:
             return "cbm_none"
         if self.training and use_memory is None:
             return "train_default_baseline"
-        return self._cbm_fallback_reason(cbm) or "cbm_not_requested"
+        return self._cbm_fallback_reason(cbm, memory_t=memory_t) or "cbm_not_requested"
 
-    def _cbm_memory_ready(self, cbm):
+    def _cbm_memory_ready(self, cbm, memory_t=None):
+        memory_ready = getattr(cbm, "memory_ready", None)
+        if callable(memory_ready):
+            return bool(memory_ready(memory_t))
+        if memory_t is not None:
+            memory = memory_t.get(
+                "labeled_memory",
+                memory_t.get("L_t"),
+            )
+            if memory is not None:
+                return bool(memory.is_ready())
         memory = getattr(cbm, "memory", None)
         return bool(memory is not None and memory.is_ready())
 
-    def _cbm_is_enabled(self, cbm):
+    def _cbm_is_enabled(self, cbm, memory_t=None):
         enabled_for_epoch = getattr(cbm, "enabled_for_epoch", None)
         if enabled_for_epoch is None:
-            return self._cbm_memory_ready(cbm)
-        return bool(enabled_for_epoch())
+            return self._cbm_memory_ready(cbm, memory_t=memory_t)
+        if memory_t is None:
+            return bool(enabled_for_epoch())
+        return bool(enabled_for_epoch(memory_t=memory_t))
 
     def _apply_cbm_final_fusion(self, scaled_preds, cbm, aux):
         if self.config.out_ref and self.training:

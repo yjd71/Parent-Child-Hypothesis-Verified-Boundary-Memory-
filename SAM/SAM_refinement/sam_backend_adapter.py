@@ -162,6 +162,7 @@ class ExistingSAMBackendAdapter(nn.Module):
         failed: List[Tuple[int, str]] = []
         embedding_cache_hits = 0
         embedding_cache_misses = 0
+        embedding_cache = getattr(self.refiner, "embedding_cache", None)
 
         for idx, image_np in enumerate(image_np_list):
             try:
@@ -178,12 +179,13 @@ class ExistingSAMBackendAdapter(nn.Module):
                 if not any(key in prompt_dict for key in ("boxes", "point_coords", "mask_inputs")):
                     raise ValueError("empty_external_prompt")
 
-                embedding_cache = getattr(self.refiner, "embedding_cache", None)
                 if embedding_cache is not None:
                     image_embeddings, cache_hit = embedding_cache.get_or_compute(
                         image_np,
                         lambda: sam.image_encoder(torch.stack([sam.preprocess(prompt_dict["image"])], dim=0)),
                         device=sam.device,
+                        dtype=prompt_dict["image"].dtype,
+                        extra_tag="sam1_preprocess_v1",
                     )
                     if cache_hit:
                         embedding_cache_hits += 1
@@ -223,6 +225,7 @@ class ExistingSAMBackendAdapter(nn.Module):
                 "path": "sam1_external_prompt",
                 "embedding_cache_hits": embedding_cache_hits,
                 "embedding_cache_misses": embedding_cache_misses,
+                "embedding_cache_info": embedding_cache.cache_info() if embedding_cache is not None else None,
             },
         }
 

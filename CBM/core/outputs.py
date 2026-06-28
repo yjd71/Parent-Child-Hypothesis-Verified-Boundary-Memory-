@@ -42,7 +42,7 @@ def build_used_aux(
     *,
     top_img_ids,
     img_scores: torch.Tensor,
-    K_mem: torch.Tensor,
+    K_mem: Optional[torch.Tensor],
     B_query: torch.Tensor,
     boundary_mask: torch.Tensor,
     gate3: torch.Tensor,
@@ -56,16 +56,23 @@ def build_used_aux(
     valid_map: torch.Tensor,
     prob3: torch.Tensor,
     meta,
+    num_memory_tokens: Optional[int] = None,
     p_final: Optional[torch.Tensor] = None,
     p_main: Optional[torch.Tensor] = None,
 ) -> Dict[str, Any]:
     valid_float = valid_map.to(dtype=B_query.dtype)
+    if num_memory_tokens is None:
+        if K_mem is None:
+            raise ValueError("K_mem or num_memory_tokens must be provided")
+        num_memory_tokens = int(K_mem.size(0))
+    if int(num_memory_tokens) < 0:
+        raise ValueError("num_memory_tokens must be non-negative")
     return {
         "cbm_used": True,
         "fallback_reason": None,
         "top_img_ids": top_img_ids,
         "img_scores": img_scores.detach(),
-        "num_memory_tokens": int(K_mem.size(0)),
+        "num_memory_tokens": int(num_memory_tokens),
         "num_valid_boundary_tokens": int(valid_float.sum().detach().item()),
         "valid_ratio": float(valid_float.mean().detach().item()),
         "B3_mean": float(B_query.detach().mean().item()),

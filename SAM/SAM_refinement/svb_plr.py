@@ -58,7 +58,8 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
         "sam_refine_interval": 1,
         "use_prompt_expert": True,
         "sam_use_conformal": True,
-        "use_sam_cache": True,
+        "use_sam_cache": False,
+        "use_svb_output_cache": False,
         "sam_cache_dir": "./cache/sam_refined_pseudo",
         "cache_refined_masks": True,
         "cache_prompt_debug": True,
@@ -92,7 +93,7 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
         self.prompt_selector = PromptExpertSelector(selector_cfg) if self.ablation_policy.use_prompt_expert else None
         self.reliability_filter = SAMCBMReliabilityFilter(reliability_cfg)
         self.calibrator = ConformalSAMCalibrator(calibrator_cfg) if self._conformal_enabled else None
-        self.cache = SVBPLRCache(cfg, logger=logger) if self._cfg_bool("use_sam_cache") else None
+        self.cache = SVBPLRCache(cfg, logger=logger) if self._cfg_bool("use_svb_output_cache") else None
         self.visualizer = SamRefineVisualizer(cfg, logger=logger) if self._cfg_bool("vis_sam_refinement") else None
 
     @torch.no_grad()

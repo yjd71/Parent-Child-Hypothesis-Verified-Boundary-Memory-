@@ -27,7 +27,14 @@ class Evaluator:
         logger.freeze_info("[+] Evaluator will be initialize with existing model...")
         return cls(config, logger, resume, device, model)
     
-    def inference_on_dataset(self, dataloader: data.DataLoader, testset_name: str, ema=False, epoch: int=None) -> None:
+    def inference_on_dataset(
+        self,
+        dataloader: data.DataLoader,
+        testset_name: str,
+        ema=False,
+        epoch: int=None,
+        memory_t=None,
+    ) -> None:
         current_save_dir = os.path.join(self.config.pred_save_root, testset_name)
         if epoch is not None:
             current_save_dir = os.path.join(current_save_dir, f'epoch_{epoch}')
@@ -38,7 +45,24 @@ class Evaluator:
             label_paths = batch[-2]
 
             with torch.no_grad():
-                scaled_preds = self.model(inputs, ema=ema)[-1].sigmoid()
+                if memory_t is None:
+                    scaled_preds = self.model(inputs, ema=ema)[-1].sigmoid()
+                else:
+                    predictions, aux = self.model(
+                        inputs,
+                        ema=ema,
+                        use_memory=True,
+                        memory_t=memory_t,
+                        return_aux=True,
+                    )
+                    p_final = aux.get("p_final") if isinstance(aux, dict) else None
+                    if torch.is_tensor(p_final):
+                        scaled_preds = p_final
+                    else:
+                        outputs = predictions
+                        if isinstance(outputs, tuple) and len(outputs) == 2:
+                            outputs = outputs[1]
+                        scaled_preds = outputs[-1].sigmoid()
 
             for idx_sample in range(scaled_preds.shape[0]):
                 res = nn.functional.interpolate(

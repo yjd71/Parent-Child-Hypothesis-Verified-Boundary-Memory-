@@ -1,10 +1,12 @@
 import os
+from collections.abc import Mapping
 
 import torch
 import torch.distributed
 import torch.nn as nn
 import wandb
 from torch.distributed import get_rank
+from torch.utils.data import DataLoader, Subset
 
 from data import prepare_dataloader, prepare_labeled_memory_dataloader
 from utils import AverageMeter, retry_if_cuda_oom
@@ -34,6 +36,71 @@ except ImportError:
 from .evaluator import Evaluator
 
 
+class _SVUMEMemoryBuilder:
+    """Adapt the SV-UME sampler/memory APIs to the manager builder contract."""
+
+    def __init__(self, config, device=None, logger=None):
+        from CBM.sv_ume.ume_diversity_sampler import UMEDiversitySampler
+        from CBM.sv_ume.unlabeled_dense_memory import UnlabeledDenseBoundaryMemory
+
+        self.config = config
+        self.device = torch.device("cpu") if device is None else torch.device(device)
+        self.memory_cls = UnlabeledDenseBoundaryMemory
+        self.sampler = UMEDiversitySampler(config, logger=logger)
+        self.previous_memory = None
+        self.last_selection_stats = {}
+
+    def set_previous_memory(self, memory):
+        self.previous_memory = memory
+
+    def build_memory(self, *, candidate_pool, labeled_memory, region_capacities, epoch):
+        del epoch
+        selection = self.sampler.select(
+            candidate_pool=candidate_pool,
+            labeled_memory=labeled_memory,
+            prev_unlabeled_memory=self.previous_memory,
+        )
+        self.last_selection_stats = selection["stats"]
+        selected_tokens = {
+            region: list(tokens)[: int(region_capacities[region])]
+            for region, tokens in selection["selected_tokens"].items()
+        }
+        memory = self.memory_cls(self.config)
+        memory.build_from_candidates(
+            selected_tokens,
+            labeled_memory,
+            previous_memory=self.previous_memory,
+            device=self.device,
+        )
+        region_counts = memory.stats()["region_counts"]
+        for region, capacity in region_capacities.items():
+            if int(region_counts[region]) > int(capacity):
+                raise ValueError(
+                    "SV-UME {} count {} exceeds capacity {}".format(
+                        region,
+                        region_counts[region],
+                        capacity,
+                    )
+                )
+        return memory
+
+    @staticmethod
+    def freeze_memory(memory):
+        return memory.freeze()
+
+    @staticmethod
+    def memory_state_dict(memory):
+        return memory.state_dict()
+
+    def load_memory_state_dict(self, state, device=None, dtype=None):
+        target_device = self.device if device is None else device
+        return self.memory_cls(self.config).load_state_dict(
+            state,
+            device=target_device,
+            dtype=dtype,
+        )
+
+
 class SemiSupervisedTrainer:
     def __init__(self, data_loaders, config, device, logger=None, writer=None):
         self.train_loader, self.test_loaders = data_loaders
@@ -58,7 +125,14 @@ class SemiSupervisedTrainer:
         self._svb_conformal_fitted = False
         self._svb_conformal_state_loaded = False
         self._svb_mode_logged = False
+        self.sv_ume_manager = None
+        self.sv_ume_memory_builder = None
+        self.sv_ume_collection_dataloader = None
+        self.current_memory_t = None
+        self.current_u_prev = None
+        self.current_sv_ume_epoch = None
         self._init_svb_plr()
+        self._init_sv_ume_manager()
 
     def _destory_model(self):
         try:
@@ -73,6 +147,8 @@ class SemiSupervisedTrainer:
         self.current_labeled_indices = labeled_indices
         self.cbm = self._get_model_cbm()
         self._init_svb_plr()
+        self._init_sv_ume_manager()
+        self._restore_sv_ume_state()
 
     def _init_svb_plr(self):
         svb_mode = str(getattr(self.config, "svb_ablation_mode", "full")).strip().lower()
@@ -145,6 +221,88 @@ class SemiSupervisedTrainer:
             self._log_svb_info("[SVB-PLR] conformal state save skipped: {}".format(exc))
             return None
 
+    def _init_sv_ume_manager(self):
+        self.sv_ume_manager = None
+        self.sv_ume_memory_builder = None
+        self.sv_ume_collection_dataloader = None
+        self.current_memory_t = None
+        self.current_u_prev = None
+        self.current_sv_ume_epoch = None
+        if not bool(getattr(self.config, "use_sv_ume", False)):
+            return
+        if not bool(getattr(self.config, "use_svb_plr", False)):
+            raise ValueError("use_sv_ume=True requires use_svb_plr=True")
+        if not bool(getattr(self.config, "use_sam_refine_unlabeled", False)):
+            raise ValueError("use_sv_ume=True requires use_sam_refine_unlabeled=True")
+        if self.svb_plr is None:
+            raise RuntimeError("SV-UME requires an initialized SVB-PLR refiner")
+
+        from CBM.sv_ume.sam_refined_candidate_builder import SAMRefinedCandidateBuilder
+        from CBM.sv_ume.sv_ume_manager import SVUMEManager
+
+        manager_logger = self.logger if self._is_main_process() else None
+        candidate_builder = SAMRefinedCandidateBuilder(
+            self.config,
+            logger=manager_logger,
+        )
+        self.sv_ume_memory_builder = _SVUMEMemoryBuilder(
+            self.config,
+            device=self.device,
+            logger=manager_logger,
+        )
+        self.sv_ume_manager = SVUMEManager(
+            self.config,
+            candidate_builder=candidate_builder,
+            memory_builder=self.sv_ume_memory_builder,
+            logger=manager_logger,
+        )
+
+    def _restore_sv_ume_state(self):
+        if self.sv_ume_manager is None:
+            return
+        payload = None
+        if self._is_main_process():
+            resume = getattr(self.config, "resume", None)
+            if not resume or not os.path.isfile(resume):
+                payload = {"ok": True, "state": None, "found": False}
+            else:
+                try:
+                    checkpoint = torch.load(resume, map_location="cpu")
+                    state = None
+                    if isinstance(checkpoint, Mapping):
+                        state = checkpoint.get("sv_ume_state")
+                        if state is None:
+                            state = checkpoint.get("sv_ume_manager")
+                        if isinstance(state, Mapping):
+                            state = dict(state)
+                            state.setdefault("_checkpoint_epoch", checkpoint.get("epoch"))
+                    payload = {
+                        "ok": True,
+                        "state": state,
+                        "found": state is not None,
+                    }
+                except Exception as exc:
+                    payload = {"ok": False, "error": str(exc)}
+        payload = self._broadcast_sv_ume_payload(payload)
+        if not payload.get("ok", False):
+            raise RuntimeError(
+                "failed to restore SV-UME checkpoint state: {}".format(
+                    payload.get("error", "unknown error")
+                )
+            )
+        state = payload.get("state")
+        self.sv_ume_manager.load_state_dict(state, device=self.device)
+        if state is not None:
+            self._log_sv_ume(
+                "[SV-UME] restored U_prev_epoch={}".format(
+                    self.sv_ume_manager.u_prev_epoch
+                )
+            )
+        else:
+            self._log_sv_ume(
+                "[SV-UME] checkpoint has no manager state; starting labeled-only."
+            )
+
     @retry_if_cuda_oom
     def _train_batch(
         self,
@@ -154,6 +312,7 @@ class SemiSupervisedTrainer:
         gt_replace_aux=None,
         loss_alpha=1.0,
         use_memory=False,
+        memory_t=None,
         enable_cbm_loss=False,
         branch_name="Sup",
     ):
@@ -162,7 +321,10 @@ class SemiSupervisedTrainer:
 
         cbm_aux = None
         if use_memory:
-            scaled_preds, cbm_aux = self.model(inputs, use_memory=True, return_aux=True)
+            model_kwargs = {"use_memory": True, "return_aux": True}
+            if memory_t is not None:
+                model_kwargs["memory_t"] = memory_t
+            scaled_preds, cbm_aux = self.model(inputs, **model_kwargs)
         else:
             scaled_preds = self.model(inputs)
 
@@ -208,6 +370,18 @@ class SemiSupervisedTrainer:
             loss = loss + loss_cbm
             for loss_name, loss_value in self.cbm.state.loss_dict.items():
                 self.loss_dict[loss_name] = loss_value
+        if branch_name == "Unsup" and bool(getattr(self.config, "use_sv_ume", False)):
+            from CBM.sv_ume.ume_losses import compute_total_sv_ume_loss
+
+            sv_ume_losses = compute_total_sv_ume_loss(
+                aux_s=cbm_aux,
+                memory_t=memory_t,
+                cfg=self.config,
+            )
+            loss_sv_ume = sv_ume_losses["loss_sv_ume"].to(device=loss.device)
+            loss = loss + loss_sv_ume
+            for loss_name, loss_value in sv_ume_losses.items():
+                self.loss_dict[loss_name] = float(loss_value.detach().item())
         record_cbm_aux(self.loss_dict, self.cbm, self.cbm_stage, cbm_aux, branch_name, logger=self.logger)
         self._maybe_save_cbm_visualizations(cbm_aux, batch, branch_name)
 
@@ -271,8 +445,15 @@ class SemiSupervisedTrainer:
         self._prepare_svb_epoch(epoch)
         self.model.train()
         use_memory = self._cbm_use_memory(epoch)
+        logical_epoch = self._sv_ume_logical_epoch(epoch)
+        memory_t = self._prepare_sv_ume_epoch(logical_epoch, use_memory)
         enable_labeled_cbm_loss = use_memory
         enable_unsup = self._unlabeled_enabled(epoch)
+        use_svb_plr = self.svb_plr is not None
+        if self.sv_ume_manager is not None:
+            use_svb_plr = use_svb_plr and logical_epoch >= int(
+                getattr(self.config, "svb_plr_start_epoch", 16)
+            )
 
         if epoch > total_epochs + self.config.IoU_finetune_last_epochs:
             self.pix_loss.lambdas_pix_last['bce'] *= 0
@@ -293,6 +474,7 @@ class SemiSupervisedTrainer:
             self._train_batch(
                 sup_batch,
                 use_memory=use_memory,
+                memory_t=memory_t,
                 enable_cbm_loss=enable_labeled_cbm_loss,
                 branch_name="Sup",
             )
@@ -318,20 +500,28 @@ class SemiSupervisedTrainer:
 
                 img_u_w, student_unsup_batch, geom, image_ids = self._extract_unsup_views(unsup_batch)
                 img_u_w = img_u_w.to(self.device)
-                if self.svb_plr is None:
+                if not use_svb_plr:
                     with torch.no_grad():
-                        teacher_preds = self.model(img_u_w, ema=True, use_memory=use_memory)
+                        teacher_kwargs = {
+                            "ema": True,
+                            "use_memory": use_memory,
+                        }
+                        if memory_t is not None:
+                            teacher_kwargs["memory_t"] = memory_t
+                        teacher_preds = self.model(img_u_w, **teacher_kwargs)
                         pseudo_s = teacher_preds[-1].sigmoid()
                     conf_s = None
                     sam_aux = {"used_sam": False}
                 else:
                     with torch.no_grad():
-                        teacher_preds, aux_t = self.model(
-                            img_u_w,
-                            ema=True,
-                            use_memory=use_memory,
-                            return_aux=True,
-                        )
+                        teacher_kwargs = {
+                            "ema": True,
+                            "use_memory": use_memory,
+                            "return_aux": True,
+                        }
+                        if memory_t is not None:
+                            teacher_kwargs["memory_t"] = memory_t
+                        teacher_preds, aux_t = self.model(img_u_w, **teacher_kwargs)
                         p_t = self._teacher_prob_from_aux(teacher_preds, aux_t)
                         retrieval_aux = (
                             build_retrieval_aux_from_cbm_aux(aux_t)
@@ -343,7 +533,7 @@ class SemiSupervisedTrainer:
                             teacher_prob=p_t,
                             retrieval_aux=retrieval_aux,
                             image_ids=image_ids,
-                            epoch=epoch,
+                            epoch=logical_epoch,
                             step=self.global_step,
                         )
                         pseudo_s, conf_s = self._align_weak_to_strong(p_ref, conf_ref, geom)
@@ -354,10 +544,11 @@ class SemiSupervisedTrainer:
                     gt_replace_aux=sam_aux,
                     loss_alpha=float(getattr(self.config, "cbm_unsup_loss_alpha", 0.1)),
                     use_memory=use_memory,
+                    memory_t=memory_t,
                     enable_cbm_loss=False,
                     branch_name="Unsup",
                 )
-                if self.svb_plr is not None:
+                if use_svb_plr:
                     record_svb_aux(
                         self.loss_dict,
                         sam_aux,
@@ -397,6 +588,7 @@ class SemiSupervisedTrainer:
                 else:
                     self.model.ema_update(self.global_step)
 
+        self._finalize_sv_ume_epoch(logical_epoch)
         return self.loss_log.avg
 
     def _prepare_cbm_epoch(self, epoch):
@@ -423,6 +615,185 @@ class SemiSupervisedTrainer:
         if error:
             info += f", fallback_reason={error}"
         self._log_info(info)
+
+    def _sv_ume_logical_epoch(self, epoch):
+        if self.sv_ume_manager is None:
+            return int(epoch)
+        logical_epoch = cbm_stage_epoch(self.config, epoch)
+        if logical_epoch is None:
+            raise ValueError("SV-UME requires a concrete epoch")
+        return int(logical_epoch)
+
+    def _prepare_sv_ume_epoch(self, logical_epoch, use_memory):
+        self.current_sv_ume_epoch = None
+        self.current_memory_t = None
+        self.current_u_prev = None
+        if self.sv_ume_manager is None:
+            return None
+
+        self.current_sv_ume_epoch = int(logical_epoch)
+        u_prev = self.sv_ume_manager.get_unlabeled_memory_for_epoch(logical_epoch)
+        self.current_u_prev = u_prev
+        if use_memory and self.cbm is not None and self.cbm.memory.is_ready():
+            self.current_memory_t = {
+                "labeled_memory": self.cbm.memory,
+                "unlabeled_memory": u_prev,
+            }
+        used_unlabeled = self.current_memory_t is not None and u_prev is not None
+        self.loss_dict["sv_ume_used_unlabeled_memory"] = float(used_unlabeled)
+        self.loss_dict["sv_ume_u_prev_epoch"] = float(
+            self.sv_ume_manager.u_prev_epoch
+            if used_unlabeled
+            else -1
+        )
+        self._log_sv_ume(
+            "[SV-UME] epoch={} used_unlabeled_memory={} U_prev_epoch={}".format(
+                logical_epoch,
+                bool(used_unlabeled),
+                self.sv_ume_manager.u_prev_epoch if used_unlabeled else None,
+            )
+        )
+        return self.current_memory_t
+
+    def _finalize_sv_ume_epoch(self, logical_epoch):
+        if self.sv_ume_manager is None:
+            return
+        if int(logical_epoch) < int(getattr(self.config, "sv_ume_start_epoch", 21)):
+            return
+
+        payload = None
+        if self._is_main_process():
+            try:
+                labeled_ready = bool(
+                    self.cbm is not None
+                    and self.cbm.memory.is_ready()
+                    and self.current_memory_t is not None
+                )
+                if labeled_ready:
+                    if self.sv_ume_collection_dataloader is None:
+                        raise RuntimeError("rank0 SV-UME collection loader is not initialized")
+                    self.sv_ume_memory_builder.set_previous_memory(
+                        self.current_u_prev
+                    )
+                    self.sv_ume_manager.collect_candidates_after_epoch(
+                        teacher=self._unwrapped_model(),
+                        sam_refiner=self.svb_plr,
+                        unlabeled_loader=self.sv_ume_collection_dataloader,
+                        labeled_memory=self.cbm.memory,
+                        memory_for_retrieval=self.current_memory_t,
+                        epoch=int(logical_epoch),
+                        device=self.device,
+                    )
+                    self.sv_ume_manager.build_next_memory(
+                        self.cbm.memory,
+                        int(logical_epoch),
+                    )
+                promoted = self.sv_ume_manager.step_epoch()
+                built = bool(
+                    promoted is not None
+                    and self.sv_ume_manager.u_prev_epoch == int(logical_epoch)
+                )
+                payload = {
+                    "ok": True,
+                    "state": self.sv_ume_manager.state_dict(),
+                    "built": built,
+                    "u_prev_epoch": self.sv_ume_manager.u_prev_epoch,
+                }
+            except Exception as exc:
+                payload = {"ok": False, "error": str(exc)}
+
+        payload = self._broadcast_sv_ume_payload(payload)
+        if not payload.get("ok", False):
+            raise RuntimeError(
+                "SV-UME epoch-end build failed at epoch {}: {}".format(
+                    logical_epoch,
+                    payload.get("error", "unknown error"),
+                )
+            )
+        if not self._is_main_process():
+            self.sv_ume_manager.load_state_dict(
+                payload["state"],
+                device=self.device,
+            )
+        self.loss_dict["sv_ume_built_memory"] = float(payload["built"])
+        self._log_sv_ume(
+            "[SV-UME] epoch={} built U_{}={} next_U_prev_epoch={}".format(
+                logical_epoch,
+                logical_epoch,
+                bool(payload["built"]),
+                payload.get("u_prev_epoch"),
+            )
+        )
+
+    def _build_sv_ume_collection_dataloader(self):
+        self.sv_ume_collection_dataloader = None
+        if self.sv_ume_manager is None or not self._is_main_process():
+            return
+        dataset = self.train_loader.dataset
+        image_to_idx = getattr(dataset, "image_to_idx", None)
+        if not isinstance(image_to_idx, Mapping):
+            raise TypeError(
+                "SV-UME collection requires a dataset exposing image_to_idx"
+            )
+
+        labeled_ids = {str(image_id) for image_id in self.current_labeled_indices}
+        missing = sorted(image_id for image_id in labeled_ids if image_id not in image_to_idx)
+        if missing:
+            raise KeyError(
+                "SV-UME labeled IDs are missing from the training dataset: {}".format(
+                    missing[:10]
+                )
+            )
+        labeled_positions = {int(image_to_idx[image_id]) for image_id in labeled_ids}
+        unlabeled_positions = [
+            index for index in range(len(dataset)) if index not in labeled_positions
+        ]
+        collection_dataset = Subset(dataset, unlabeled_positions)
+        self.sv_ume_collection_dataloader = DataLoader(
+            collection_dataset,
+            batch_size=int(self.config.batch_size),
+            num_workers=min(
+                int(self.config.num_workers),
+                int(self.config.batch_size),
+            ),
+            pin_memory=True,
+            shuffle=False,
+            drop_last=False,
+        )
+        self._log_sv_ume(
+            "[SV-UME] rank0 collection loader samples={} batches={}".format(
+                len(collection_dataset),
+                len(self.sv_ume_collection_dataloader),
+            )
+        )
+
+    def _unwrapped_model(self):
+        return self.model.module if hasattr(self.model, "module") else self.model
+
+    def _distributed_ready(self):
+        return bool(
+            getattr(self.config, "distributed_train", False)
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        )
+
+    def _is_main_process(self):
+        return not self._distributed_ready() or torch.distributed.get_rank() == 0
+
+    def _broadcast_sv_ume_payload(self, payload):
+        if not self._distributed_ready():
+            if payload is None:
+                raise RuntimeError("SV-UME payload is missing on the main process")
+            return payload
+        objects = [payload if self._is_main_process() else None]
+        torch.distributed.broadcast_object_list(objects, src=0)
+        if not isinstance(objects[0], Mapping):
+            raise RuntimeError("invalid SV-UME broadcast payload")
+        return objects[0]
+
+    def _log_sv_ume(self, message):
+        if self._is_main_process():
+            self._log_info(message)
 
     def _prepare_svb_epoch(self, epoch):
         if self.svb_plr is None:
@@ -623,6 +994,7 @@ class SemiSupervisedTrainer:
                 config=self.config,
                 labeled_indices=self.current_labeled_indices,
             )
+        self._build_sv_ume_collection_dataloader()
         assert len(self.labeled_dataloader) == len(self.unlabeled_dataloader), (
             "The lenth between labeled_dataloader and unlabeled_dataloader is not equal!"
         )
@@ -655,6 +1027,11 @@ class SemiSupervisedTrainer:
                 svb_conformal_state = self._svb_conformal_state_dict()
                 if svb_conformal_state is not None:
                     model_dict['svb_conformal_calibrator'] = svb_conformal_state
+                if (
+                    self.sv_ume_manager is not None
+                    and bool(getattr(self.config, "sv_ume_save_memory_state", True))
+                ):
+                    model_dict['sv_ume_state'] = self.sv_ume_manager.state_dict()
                 self.logger.freeze_info("[*] Saving model...")
                 torch.save(model_dict, os.path.join(self.config.ckpt_dir, 'split{}_model_{}.pth'.format(split, epoch)))
                 self.logger.success_info("[*] Model saved.")
@@ -677,7 +1054,16 @@ class SemiSupervisedTrainer:
             model=self.model if not self.config.distributed_train else self.model.module,
         )
         for testset_name, testloader in self.test_loaders.items():
-            evaluator.inference_on_dataset(testloader, testset_name, epoch=epoch)
+            evaluator.inference_on_dataset(
+                testloader,
+                testset_name,
+                epoch=epoch,
+                memory_t=(
+                    self.current_memory_t
+                    if self.sv_ume_manager is not None
+                    else None
+                ),
+            )
             result = evaluator.evaluate_inference_result(testloader, testset_name, epoch=epoch)
             wandb.log(
                 {

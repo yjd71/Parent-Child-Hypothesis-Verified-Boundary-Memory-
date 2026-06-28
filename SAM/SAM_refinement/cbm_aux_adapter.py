@@ -20,6 +20,21 @@ RETRIEVAL_AUX_KEYS = (
     "prob3",
     "p_main",
     "p_final",
+    "B_query",
+    "boundary_mask",
+    "z_mem3",
+    "top_img_ids",
+    "img_scores",
+    "ret_l",
+    "ret_u",
+    "w_l",
+    "w_u",
+    "w_l_map",
+    "w_u_map",
+    "score_l",
+    "score_u",
+    "used_unlabeled_memory",
+    "source_entropy",
 )
 
 REQUIRED_CBM_EVIDENCE_KEYS = (
@@ -60,6 +75,24 @@ def build_retrieval_aux_from_cbm_aux(aux_t: Any) -> Dict[str, Any]:
         "p_main": _pick_value(retrieval, aux, "p_main"),
         "p_final": _pick_p_final(retrieval, aux),
     }
+    for key in (
+        "B_query",
+        "boundary_mask",
+        "z_mem3",
+        "top_img_ids",
+        "img_scores",
+        "ret_l",
+        "ret_u",
+        "w_l",
+        "w_u",
+        "w_l_map",
+        "w_u_map",
+        "score_l",
+        "score_u",
+        "used_unlabeled_memory",
+        "source_entropy",
+    ):
+        retrieval_aux[key] = _pick_value(retrieval, aux, key)
     validate_retrieval_aux(retrieval_aux)
     return retrieval_aux
 

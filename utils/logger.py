@@ -19,19 +19,19 @@ class ColoredFormatter(logging.Formatter):
         return super().format(record)
 
 class Logger():
-    def __init__(self, name="TalNet", path="log.txt", multi_gpu=False):
+    def __init__(self, name="TalNet", path="log.txt", multi_gpu=False, stdout_level=logging.INFO):
         self.logger = logging.getLogger(name)
         # self.process_rank = "RANK0" if not multi_gpu else "RANK{}".format(get_rank())
         self.file_handler = logging.FileHandler(path, "w")
         self.stdout_handler = logging.StreamHandler()
-        self.stdout_handler.setLevel(logging.INFO)
+        self.stdout_handler.setLevel(stdout_level)
         self.stdout_handler.setFormatter(ColoredFormatter())
         self.file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s', datefmt='%m-%d %H:%M:%S'))
         self.logger.addHandler(self.file_handler)
         self.logger.addHandler(self.stdout_handler)
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False
-        
+
 
     def info(self, txt):
         self.logger.info(txt)

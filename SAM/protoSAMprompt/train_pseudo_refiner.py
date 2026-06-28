@@ -40,7 +40,7 @@ class _BaseSamPseudoLabelRefiner:
         self.embedding_cache = SAMImageEmbeddingCache(
             config,
             backend_tag=backend,
-            model_tag=self.log_model_type,
+            model_tag=self._embedding_model_tag(),
         )
         self.refine_logger = SamPseudoRefineLogger(
             logger=logger,
@@ -50,6 +50,15 @@ class _BaseSamPseudoLabelRefiner:
 
         self.total_refined = 0
         self.total_skipped = 0
+
+    def _embedding_model_tag(self):
+        """Invalidate embeddings when the checkpoint file changes."""
+        try:
+            stat = self.checkpoint.stat()
+            checkpoint_tag = "{}:{}:{}".format(self.checkpoint, stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            checkpoint_tag = str(self.checkpoint)
+        return "{}:{}".format(self.log_model_type, checkpoint_tag)
 
     @staticmethod
     def _normalize_device(device):

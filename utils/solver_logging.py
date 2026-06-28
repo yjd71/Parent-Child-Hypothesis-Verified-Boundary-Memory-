@@ -104,6 +104,13 @@ def record_svb_aux(loss_dict: Dict[str, Any], sam_aux, p_t, p_ref, conf_ref, log
         backend_fallback_ratio = max(backend_fallback_ratio, 1.0)
     loss_dict["svb_backend_fallback"] = backend_fallback
     loss_dict["svb_backend_fallback_ratio"] = backend_fallback_ratio
+    embedding_hits, embedding_misses = _embedding_cache_stats(sam_aux.get("backend_aux"))
+    embedding_total = embedding_hits + embedding_misses
+    loss_dict["svb_embedding_cache_hits"] = float(embedding_hits)
+    loss_dict["svb_embedding_cache_misses"] = float(embedding_misses)
+    loss_dict["svb_embedding_cache_hit_rate"] = (
+        float(embedding_hits / embedding_total) if embedding_total > 0 else 0.0
+    )
 
     prompt_stats = _prompt_stats(sam_aux.get("prompt_pack"))
     loss_dict["svb_prompt_empty_box_ratio"] = prompt_stats.get("empty_box_ratio", 0.0)
@@ -231,6 +238,27 @@ def _backend_fallback_stats(backend_aux, batch_size: int) -> Tuple[float, float]
     fallback_samples = sum(sample_count for _, sample_count in records)
     denom = max(1, int(batch_size) * len(records))
     return (1.0 if any_fallback else 0.0), float(min(1.0, fallback_samples / denom))
+
+
+def _embedding_cache_stats(backend_aux) -> Tuple[int, int]:
+    hits = 0
+    misses = 0
+
+    def visit(node):
+        nonlocal hits, misses
+        if not isinstance(node, dict):
+            return
+        if "embedding_cache_hits" in node or "embedding_cache_misses" in node:
+            hits += int(node.get("embedding_cache_hits", 0) or 0)
+            misses += int(node.get("embedding_cache_misses", 0) or 0)
+        for key, value in node.items():
+            # embedding_cache_info contains cumulative counters; do not mix
+            # them with the current-batch hit rate recorded above.
+            if key != "embedding_cache_info" and isinstance(value, dict):
+                visit(value)
+
+    visit(backend_aux)
+    return hits, misses
 
 
 def _prompt_stats(prompt_pack) -> Dict[str, float]:

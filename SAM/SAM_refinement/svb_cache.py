@@ -3,14 +3,276 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import os
 import re
+import threading
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class SAMImageEmbeddingCache:
+    """Bounded two-level cache for frozen SAM image-encoder embeddings.
+
+    The key depends only on the exact image content and the SAM model/cache
+    version.  It deliberately excludes epoch and teacher predictions because
+    neither changes a frozen image encoder output.  CPU memory is an LRU front
+    cache; the optional disk layer makes exact augmented views reusable across
+    epochs and process restarts.
+    """
+
+    def __init__(
+        self,
+        cfg=None,
+        backend_tag: str = "",
+        model_tag: str = "",
+        enabled: Optional[bool] = None,
+        max_items: Optional[int] = None,
+    ) -> None:
+        if enabled is None:
+            legacy_enabled = bool(getattr(cfg, "use_sam_cache", True)) if cfg is not None else True
+            enabled = bool(getattr(cfg, "use_sam_embedding_cache", legacy_enabled)) if cfg is not None else True
+        self.enabled = bool(enabled)
+        if max_items is None:
+            max_items = getattr(cfg, "sam_image_embedding_cache_size", 128) if cfg is not None else 128
+        self.max_items = max(1, int(max_items))
+        self.backend_tag = str(backend_tag)
+        self.model_tag = str(model_tag)
+        self.cache_version = str(getattr(cfg, "sam_embedding_cache_version", "v1")) if cfg is not None else "v1"
+
+        self.disk_enabled = bool(getattr(cfg, "sam_embedding_cache_disk", False)) if cfg is not None else False
+        cache_dir = getattr(cfg, "sam_embedding_cache_dir", "./cache/sam_image_embeddings") if cfg is not None else "./cache/sam_image_embeddings"
+        self.cache_dir = Path(cache_dir)
+        max_disk_gb = float(getattr(cfg, "sam_embedding_cache_max_gb", 32.0)) if cfg is not None else 32.0
+        self.max_disk_bytes = max(0, int(max_disk_gb * (1024 ** 3)))
+        self.prune_interval = max(1, int(getattr(cfg, "sam_embedding_cache_prune_interval", 256))) if cfg is not None else 256
+        store_dtype = getattr(cfg, "sam_embedding_cache_store_dtype", "float16") if cfg is not None else "float16"
+        self.store_dtype = self._parse_store_dtype(store_dtype)
+
+        self._entries: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self.hits = 0
+        self.memory_hits = 0
+        self.disk_hits = 0
+        self.misses = 0
+        self.disk_writes = 0
+        self.disk_errors = 0
+        self._disk_pruned_once = False
+
+    def get_or_compute(
+        self,
+        image,
+        compute_fn: Callable[[], torch.Tensor],
+        device=None,
+        dtype=None,
+        extra_tag: str = "",
+    ) -> Tuple[torch.Tensor, bool]:
+        """Return an embedding and whether it came from memory or disk cache."""
+        if not self.enabled:
+            value = self._ensure_tensor(compute_fn())
+            return self._move(value, device=device, dtype=dtype), False
+
+        key = self.make_key(image, extra_tag=extra_tag)
+        cached = self._entries.get(key)
+        if cached is not None:
+            self.hits += 1
+            self.memory_hits += 1
+            self._entries.move_to_end(key)
+            return self._move(cached, device=device, dtype=dtype), True
+
+        cached = self._load_disk(key) if self.disk_enabled else None
+        if cached is not None:
+            self.hits += 1
+            self.disk_hits += 1
+            self._remember(key, cached)
+            return self._move(cached, device=device, dtype=dtype), True
+
+        self.misses += 1
+        value = self._ensure_tensor(compute_fn())
+        stored = self._for_storage(value)
+        self._remember(key, stored)
+        if self.disk_enabled:
+            self._write_disk(key, stored)
+        # Return the stored representation on the first miss as well.  When
+        # fp16 storage is selected this keeps miss/hit decoder inputs identical.
+        return self._move(stored, device=device, dtype=dtype), False
+
+    def make_key(self, image, extra_tag: str = "") -> str:
+        array = self._as_contiguous_array(image)
+        digest = hashlib.sha1(array.tobytes()).hexdigest()
+        return "|".join(
+            (
+                self.cache_version,
+                self.backend_tag,
+                self.model_tag,
+                str(extra_tag),
+                str(array.dtype),
+                str(array.shape),
+                digest,
+            )
+        )
+
+    def clear(self, clear_disk: bool = False) -> None:
+        self._entries.clear()
+        self.hits = 0
+        self.memory_hits = 0
+        self.disk_hits = 0
+        self.misses = 0
+        if clear_disk and self.cache_dir.is_dir():
+            for path in self.cache_dir.rglob("*.pt"):
+                try:
+                    path.unlink()
+                except OSError:
+                    self.disk_errors += 1
+
+    def cache_info(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "size": len(self._entries),
+            "max_items": self.max_items,
+            "memory_size": len(self._entries),
+            "memory_max_items": self.max_items,
+            "disk_enabled": self.disk_enabled,
+            "disk_dir": str(self.cache_dir),
+            "disk_max_bytes": self.max_disk_bytes,
+            "hits": self.hits,
+            "memory_hits": self.memory_hits,
+            "disk_hits": self.disk_hits,
+            "misses": self.misses,
+            "disk_writes": self.disk_writes,
+            "disk_errors": self.disk_errors,
+        }
+
+    def _remember(self, key: str, value: torch.Tensor) -> None:
+        self._entries[key] = value.detach().cpu()
+        self._entries.move_to_end(key)
+        while len(self._entries) > self.max_items:
+            self._entries.popitem(last=False)
+
+    def _path_for_key(self, key: str) -> Path:
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+        return self.cache_dir / digest[:2] / "{}.pt".format(digest)
+
+    def _load_disk(self, key: str) -> Optional[torch.Tensor]:
+        path = self._path_for_key(key)
+        if not path.is_file():
+            return None
+        try:
+            payload = self._torch_load(path)
+            if not isinstance(payload, dict) or payload.get("cache_key") != key:
+                return None
+            value = payload.get("embedding")
+            if not torch.is_tensor(value):
+                return None
+            try:
+                path.touch()
+            except OSError:
+                pass
+            return value.detach().cpu()
+        except Exception:
+            self.disk_errors += 1
+            return None
+
+    def _write_disk(self, key: str, value: torch.Tensor) -> None:
+        path = self._path_for_key(key)
+        if path.is_file():
+            return
+        tmp_path = path.with_name(".{}.{}.{}.tmp".format(path.name, os.getpid(), threading.get_ident()))
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"cache_key": key, "embedding": value.detach().cpu()}, str(tmp_path))
+            os.replace(str(tmp_path), str(path))
+            self.disk_writes += 1
+            if not self._disk_pruned_once or self.disk_writes % self.prune_interval == 0:
+                self._prune_disk()
+                self._disk_pruned_once = True
+        except Exception:
+            self.disk_errors += 1
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+
+    def _prune_disk(self) -> None:
+        if self.max_disk_bytes <= 0 or not self.cache_dir.is_dir():
+            return
+        try:
+            entries = []
+            total_bytes = 0
+            for path in self.cache_dir.rglob("*.pt"):
+                stat = path.stat()
+                total_bytes += stat.st_size
+                entries.append((stat.st_mtime_ns, stat.st_size, path))
+            if total_bytes <= self.max_disk_bytes:
+                return
+            entries.sort(key=lambda item: item[0])
+            for _, size, path in entries:
+                try:
+                    path.unlink()
+                    total_bytes -= size
+                except OSError:
+                    self.disk_errors += 1
+                if total_bytes <= self.max_disk_bytes:
+                    break
+        except OSError:
+            self.disk_errors += 1
+
+    def _for_storage(self, value: torch.Tensor) -> torch.Tensor:
+        stored = value.detach().cpu().contiguous()
+        if self.store_dtype is not None and stored.is_floating_point():
+            stored = stored.to(dtype=self.store_dtype)
+        return stored
+
+    @staticmethod
+    def _parse_store_dtype(value) -> Optional[torch.dtype]:
+        text = str(value or "native").strip().lower()
+        if text in ("float16", "fp16", "half"):
+            return torch.float16
+        if text in ("bfloat16", "bf16"):
+            return torch.bfloat16
+        if text in ("float32", "fp32"):
+            return torch.float32
+        if text in ("native", "none", "same"):
+            return None
+        raise ValueError("Unsupported sam_embedding_cache_store_dtype '{}'".format(value))
+
+    @staticmethod
+    def _ensure_tensor(value) -> torch.Tensor:
+        if not torch.is_tensor(value):
+            raise TypeError("SAM image embedding cache only supports torch.Tensor values")
+        return value.detach()
+
+    @staticmethod
+    def _move(value: torch.Tensor, device=None, dtype=None) -> torch.Tensor:
+        if device is None and dtype is None:
+            return value
+        return value.to(
+            device=device if device is not None else value.device,
+            dtype=dtype if dtype is not None else value.dtype,
+        )
+
+    @staticmethod
+    def _as_contiguous_array(image) -> np.ndarray:
+        if torch.is_tensor(image):
+            return image.detach().cpu().contiguous().numpy()
+        array = np.asarray(image)
+        if not array.flags.c_contiguous:
+            array = np.ascontiguousarray(array)
+        return array
+
+    @staticmethod
+    def _torch_load(path: Path):
+        try:
+            return torch.load(str(path), map_location="cpu", weights_only=True)
+        except TypeError:
+            return torch.load(str(path), map_location="cpu")
 
 
 class SVBPLRCache:
@@ -28,7 +290,8 @@ class SVBPLRCache:
     def __init__(self, cfg, logger=None) -> None:
         self.cfg = cfg
         self.logger = logger
-        self.enabled = bool(getattr(cfg, "use_sam_cache", True))
+        legacy_enabled = bool(getattr(cfg, "use_sam_cache", False))
+        self.enabled = bool(getattr(cfg, "use_svb_output_cache", legacy_enabled))
         self.cache_refined_masks = bool(getattr(cfg, "cache_refined_masks", True))
         self.cache_prompt_debug = bool(getattr(cfg, "cache_prompt_debug", True))
         self.cache_dir = Path(getattr(cfg, "sam_cache_dir", "./cache/sam_refined_pseudo"))

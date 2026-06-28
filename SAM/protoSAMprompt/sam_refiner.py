@@ -107,7 +107,13 @@ def sam_refiner(image,
                 input_images = torch.stack([sam.preprocess(x) for x in image], dim=0)
                 return sam.image_encoder(input_images)  # torch.Size([1, 256, 64, 64])
 
-            image_embeddings, _ = embedding_cache.get_or_compute(image[0], _compute_image_embeddings, device=sam.device)
+            image_embeddings, _ = embedding_cache.get_or_compute(
+                image[0],
+                _compute_image_embeddings,
+                device=sam.device,
+                dtype=image[0].dtype,
+                extra_tag="sam1_preprocess_v1",
+            )
         else:
             if ddp:
                 input_images = torch.stack([sam.module.preprocess(x) for x in image], dim=0)
