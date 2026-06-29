@@ -15,6 +15,7 @@ from CBM.sv_ume.schedules import (
     should_build_after_epoch,
     sv_ume_enabled,
 )
+from utils.log_control import log_enabled
 
 
 LOGGER = logging.getLogger(__name__)
@@ -974,6 +975,8 @@ class SVUMEManager:
         }
 
     def _info(self, message: str) -> None:
+        if not log_enabled(self.cfg):
+            return
         if self.logger is None:
             LOGGER.info(message)
             return
@@ -982,6 +985,8 @@ class SVUMEManager:
             log_fn(message)
 
     def _error(self, message: str) -> None:
+        if not log_enabled(self.cfg):
+            return
         if self.logger is None:
             LOGGER.error(message)
             return

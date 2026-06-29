@@ -19,6 +19,7 @@ from CBM.memory.bank import DenseBoundaryMemory
 from CBM.memory.builder import LabeledMemoryBuilder
 from CBM.retrieval.global_router import GlobalMemoryRouter
 from CBM.retrieval.pointwise import PointwiseBoundaryRetriever
+from utils.log_control import log_enabled
 
 
 def _normalize_device(device: Optional[torch.device]) -> Optional[torch.device]:
@@ -41,7 +42,6 @@ class CBMPFIEngine(nn.Module):
         self.memory = DenseBoundaryMemory(
             mem_dim=int(getattr(self.config, "cbm_memory_dim", 128)),
             value_dim=int(getattr(self.config, "cbm_value_dim", 8)),
-            print_diagnostics=bool(getattr(self.config, "cbm_print_diagnostics", True)),
         )
         self.builder = LabeledMemoryBuilder(self.memory, logger=logger)
 
@@ -414,6 +414,8 @@ class CBMPFIEngine(nn.Module):
         return default
 
     def _info(self, message: str) -> None:
+        if not log_enabled(self.config):
+            return
         if self.logger is None:
             print(message)
             return
@@ -422,6 +424,8 @@ class CBMPFIEngine(nn.Module):
             log_fn(message)
 
     def _warn(self, message: str) -> None:
+        if not log_enabled(self.config):
+            return
         if self.logger is None:
             print(message)
             return

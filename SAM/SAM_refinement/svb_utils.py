@@ -1,9 +1,39 @@
 from __future__ import annotations
 
-from typing import List, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
+
+
+class SAMInferenceError(RuntimeError):
+    """Raised when no valid SAM result can be produced for a sample."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        epoch=None,
+        step=None,
+        sample_indices: Optional[Sequence[int]] = None,
+        failures: Optional[Sequence[Any]] = None,
+    ) -> None:
+        self.message = str(message)
+        self.epoch = epoch
+        self.step = step
+        self.sample_indices = list(sample_indices or [])
+        self.failures = list(failures or [])
+        context = []
+        if epoch is not None:
+            context.append("epoch={}".format(epoch))
+        if step is not None:
+            context.append("step={}".format(step))
+        if self.sample_indices:
+            context.append("samples={}".format(self.sample_indices))
+        if self.failures:
+            context.append("failures={}".format(self.failures))
+        detail = "{} ({})".format(self.message, ", ".join(context)) if context else self.message
+        super().__init__(detail)
 
 
 def normalize_01(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:

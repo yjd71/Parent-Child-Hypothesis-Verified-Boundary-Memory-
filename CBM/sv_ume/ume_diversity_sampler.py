@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from CBM.memory.labels import DEFAULT_SAMPLE_PER_IMAGE, REGION_NAMES
 from CBM.sv_ume.unlabeled_dense_memory import UnlabeledMemoryToken
+from utils.log_control import log_enabled
 
 
 DEFAULT_LAMBDA_DIVERSITY = 0.2
@@ -643,7 +644,7 @@ class UMEDiversitySampler:
         return {region: cast(value[region]) for region in self.regions}
 
     def _log_summary(self, stats: Mapping[str, Any]) -> None:
-        if self.logger is None:
+        if not log_enabled(self.cfg) or self.logger is None:
             return
         message = (
             "[SV-UME] diversity selection "

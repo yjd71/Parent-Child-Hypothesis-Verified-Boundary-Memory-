@@ -11,13 +11,14 @@ del _base_cfg
 ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI-SAM/CBM-PFI/works/finetune_27_sv_ume_svb_plr_full"
 pred_save_root = ckpt_dir.rstrip("/\\") + "/training_preds"
 
+# Global CBM / SVB-PLR / SV-UME logging
+log_enable = True
+log_interval = 600
 
 # SVB-PLR main switches
 use_svb_plr = True
 use_sam_refine_unlabeled = True
 svb_ablation_mode = "full"  # off | teacher_sam_full | boundary_only | cbm_points | reliability | prompt_expert | conformal | full
-sv_training_log_enable = True
-sv_training_log_interval = 600
 svb_plr_start_epoch = 8
 sam_start_epoch = svb_plr_start_epoch
 sam_refine_interval = 1

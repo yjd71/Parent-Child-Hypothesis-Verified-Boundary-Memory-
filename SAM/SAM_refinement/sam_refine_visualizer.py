@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
+from utils.log_control import log_enabled
 
 try:
     from .svb_cache import SVBPLRCache
@@ -38,7 +39,7 @@ class SamRefineVisualizer:
         "points",
         "R_sam",
         "conf_ref",
-        "diff_or_student",
+        "sam_teacher_diff",
     )
 
     def __init__(self, cfg, logger=None) -> None:
@@ -109,17 +110,17 @@ class SamRefineVisualizer:
         ref = teacher_prob
 
         image_rgb = self._image_panel(images, idx, ref)
-        teacher_rgb = self._map_panel(ref, idx, ref)
-        sam_rgb = self._map_panel(sam_mask, idx, ref)
-        pref_rgb = self._map_panel(p_ref, idx, ref)
+        teacher_rgb = self._prob_map_panel(ref, idx, ref)
+        sam_rgb = self._prob_map_panel(sam_mask, idx, ref)
+        pref_rgb = self._prob_map_panel(p_ref, idx, ref)
         sfg_rgb = self._map_panel(self._map_from(evidence, "S_fg_up", ref), idx, ref)
         sbg_rgb = self._map_panel(self._map_from(evidence, "S_bg_up", ref), idx, ref)
         mbd_rgb = self._signed_map_panel(self._map_from(evidence, "M_bd_up", ref), idx, ref)
-        band_rgb = self._map_panel(sam_aux.get("refine_band"), idx, ref)
+        band_rgb = self._prob_map_panel(sam_aux.get("refine_band"), idx, ref)
         points_rgb = self._points_panel(image_rgb, prompt_pack, idx, ref)
-        rsam_rgb = self._map_panel(sam_aux.get("R_sam"), idx, ref)
-        conf_rgb = self._map_panel(conf_ref, idx, ref)
-        diff_rgb = self._diff_or_student_panel(student_pred, p_ref, ref, idx)
+        rsam_rgb = self._prob_map_panel(sam_aux.get("R_sam"), idx, ref)
+        conf_rgb = self._prob_map_panel(conf_ref, idx, ref)
+        diff_rgb = self._sam_teacher_diff_panel(sam_mask, ref, idx)
 
         return list(
             zip(
@@ -163,6 +164,12 @@ class SamRefineVisualizer:
             return self._gray_to_rgb(ref.new_zeros(ref.shape[-2:]))
         return self._gray_to_rgb(value4[idx, 0])
 
+    def _prob_map_panel(self, value, idx: int, ref: torch.Tensor):
+        value4 = self._optional_map(value, ref)
+        if value4.size(0) <= idx:
+            return self._gray_prob_to_rgb(ref.new_zeros(ref.shape[-2:]))
+        return self._gray_prob_to_rgb(value4[idx, 0])
+
     def _signed_map_panel(self, value, idx: int, ref: torch.Tensor):
         value4 = self._optional_map(value, ref)
         if value4.size(0) <= idx:
@@ -187,15 +194,9 @@ class SamRefineVisualizer:
         self._draw_point_list(draw, self._points_for(prompt_pack, "boundary_points", idx), radius, (255, 255, 0))
         return self._pil_to_array(image)
 
-    def _diff_or_student_panel(self, student_pred, p_ref, teacher_prob: torch.Tensor, idx: int):
-        if torch.is_tensor(student_pred):
-            pred = student_pred.detach().to(device=teacher_prob.device, dtype=teacher_prob.dtype)
-            if pred.min().detach().item() < 0.0 or pred.max().detach().item() > 1.0:
-                pred = pred.sigmoid()
-            return self._map_panel(pred, idx, teacher_prob)
-        pref = self._optional_map(p_ref, teacher_prob)
-        diff = pref - teacher_prob
-        return self._signed_map_panel(diff, idx, teacher_prob)
+    def _sam_teacher_diff_panel(self, sam_mask, teacher_prob: torch.Tensor, idx: int):
+        sam = self._optional_map(sam_mask, teacher_prob)
+        return self._signed_map_panel(sam - teacher_prob, idx, teacher_prob)
 
     @staticmethod
     def _draw_point_list(draw, points: torch.Tensor, radius: int, color) -> None:
@@ -262,6 +263,13 @@ class SamRefineVisualizer:
         return SamRefineVisualizer._rgb_tensor_to_uint8(rgb)
 
     @staticmethod
+    def _gray_prob_to_rgb(value: torch.Tensor):
+        x = value.detach().float().cpu()
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        rgb = torch.stack((x, x, x), dim=0)
+        return SamRefineVisualizer._rgb_tensor_to_uint8(rgb)
+
+    @staticmethod
     def _rgb_tensor_to_uint8(value: torch.Tensor):
         x = value.detach().float().cpu()
         if x.dim() == 4:
@@ -306,7 +314,7 @@ class SamRefineVisualizer:
         return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value))
 
     def _log_enabled(self) -> bool:
-        return bool(getattr(self.cfg, "svb_plr_log_enable", True))
+        return log_enabled(self.cfg)
 
     def _warn(self, message: str) -> None:
         if not self._log_enabled():

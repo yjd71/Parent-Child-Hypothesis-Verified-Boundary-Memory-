@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from utils.log_control import log_enabled
 
 
 def collect_visualization_tensors(aux):
@@ -40,7 +41,8 @@ def save_pfi_binary_visualizations_v42(
     try:
         return _save_visualizations(aux, batch, epoch, iteration, config, branch_name)
     except Exception as exc:
-        _warn(logger, f"[CBM] pfi_binary_visualizations_v42 save failed: {exc}")
+        if log_enabled(config):
+            _warn(logger, f"[CBM] pfi_binary_visualizations_v42 save failed: {exc}")
         return []
 
 

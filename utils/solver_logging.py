@@ -66,7 +66,15 @@ def log_training_progress(
         wandb.log({"{}-{}".format(wandb_prefix, k): v for k, v in loss_dict.items()}, step=step)
 
 
-def record_cbm_aux(loss_dict: Dict[str, Any], cbm, cbm_stage: int, aux, branch_name: str, logger=None) -> None:
+def record_cbm_aux(
+    loss_dict: Dict[str, Any],
+    cbm,
+    cbm_stage: int,
+    aux,
+    branch_name: str,
+    logger=None,
+    log_enabled: bool = True,
+) -> None:
     if cbm is not None:
         loss_dict["cbm_stage"] = float(cbm_stage)
         loss_dict["memory_ready"] = 1.0 if cbm.memory.is_ready() else 0.0
@@ -76,7 +84,7 @@ def record_cbm_aux(loss_dict: Dict[str, Any], cbm, cbm_stage: int, aux, branch_n
     loss_dict["valid_ratio"] = float(aux.get("valid_ratio", 0.0) or 0.0)
     loss_dict["retrieval_uncertainty_mean"] = float(aux.get("u_mean", 0.0) or 0.0)
     loss_dict["memory_tokens"] = float(aux.get("num_memory_tokens", 0) or 0)
-    if aux.get("fallback_reason"):
+    if log_enabled and aux.get("fallback_reason"):
         log_info(logger, "[CBM] {} fallback={}".format(branch_name, aux.get("fallback_reason")))
 
 
@@ -94,6 +102,10 @@ def record_svb_aux(loss_dict: Dict[str, Any], sam_aux, p_t, p_ref, conf_ref, log
     loss_dict["svb_sam_score_mean"] = _tensor_or_float_mean(sam_aux.get("sam_score"), default=0.0)
     loss_dict["svb_used_conformal"] = 1.0 if bool(sam_aux.get("used_conformal", False)) else 0.0
     loss_dict["svb_lambda_epoch"] = float(sam_aux.get("lambda_epoch", 0.0) or 0.0)
+    loss_dict["svb_valid_sam_candidate_ratio"] = _valid_candidate_ratio(sam_aux.get("selector_aux"))
+    sam_teacher_mae, sam_teacher_exact_ratio = _sam_teacher_stats(sam_aux.get("sam_mask"), p_t)
+    loss_dict["svb_sam_teacher_mae"] = sam_teacher_mae
+    loss_dict["svb_sam_teacher_exact_ratio"] = sam_teacher_exact_ratio
 
     backend_fallback, backend_fallback_ratio = _backend_fallback_stats(
         sam_aux.get("backend_aux"),
@@ -209,6 +221,38 @@ def _tensor_max(value, default=0.0) -> float:
     if not torch.is_tensor(value) or value.numel() == 0:
         return float(default)
     return float(value.detach().float().max().item())
+
+
+def _valid_candidate_ratio(selector_aux) -> float:
+    if not isinstance(selector_aux, Mapping):
+        return 0.0
+    valid = selector_aux.get("valid_candidates")
+    if torch.is_tensor(valid) and valid.numel() > 0:
+        return float(valid.detach().float().mean().item())
+    return _tensor_or_float_mean(selector_aux.get("valid_candidate_ratio"), default=0.0)
+
+
+def _sam_teacher_stats(sam_mask, teacher_prob) -> Tuple[float, float]:
+    if not torch.is_tensor(sam_mask) or not torch.is_tensor(teacher_prob):
+        return 0.0, 0.0
+    sam = sam_mask.detach().float()
+    teacher = teacher_prob.detach().to(device=sam.device, dtype=sam.dtype)
+    if sam.dim() == 3:
+        sam = sam.unsqueeze(1)
+    if teacher.dim() == 3:
+        teacher = teacher.unsqueeze(1)
+    if sam.dim() != 4 or teacher.dim() != 4 or sam.size(0) != teacher.size(0):
+        return 0.0, 0.0
+    if sam.size(1) != 1:
+        sam = sam[:, :1]
+    if teacher.size(1) != 1:
+        teacher = teacher[:, :1]
+    if tuple(sam.shape[-2:]) != tuple(teacher.shape[-2:]):
+        sam = F.interpolate(sam, size=teacher.shape[-2:], mode="bilinear", align_corners=False)
+    diff = (sam - teacher).abs()
+    mae = float(diff.mean().item())
+    exact_ratio = float((diff.flatten(1).amax(dim=1) == 0).float().mean().item())
+    return mae, exact_ratio
 
 
 def _backend_fallback_stats(backend_aux, batch_size: int) -> Tuple[float, float]:

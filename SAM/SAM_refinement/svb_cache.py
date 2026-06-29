@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+from utils.log_control import log_enabled
 
 
 LOGGER = logging.getLogger(__name__)
@@ -580,7 +581,7 @@ class SVBPLRCache:
         return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value))
 
     def _log_enabled(self) -> bool:
-        return bool(getattr(self.cfg, "svb_plr_log_enable", True))
+        return log_enabled(self.cfg)
 
     def _warn(self, message: str) -> None:
         if not self._log_enabled():

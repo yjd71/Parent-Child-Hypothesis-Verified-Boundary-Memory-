@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from utils.log_control import should_log
 
 try:
     from .cbm_prompt_generator import CBMPromptGenerator
@@ -15,7 +16,7 @@ try:
     from .sam_refine_visualizer import SamRefineVisualizer
     from .sam_reliability_filter import SAMCBMReliabilityFilter
     from .svb_cache import SVBPLRCache
-    from .svb_utils import binary_reliability, resize_like
+    from .svb_utils import SAMInferenceError, binary_reliability, resize_like
 except ImportError:
     from SAM.SAM_refinement.cbm_prompt_generator import CBMPromptGenerator
     from SAM.SAM_refinement.conformal_sam_calibrator import ConformalSAMCalibrator
@@ -24,7 +25,7 @@ except ImportError:
     from SAM.SAM_refinement.sam_refine_visualizer import SamRefineVisualizer
     from SAM.SAM_refinement.sam_reliability_filter import SAMCBMReliabilityFilter
     from SAM.SAM_refinement.svb_cache import SVBPLRCache
-    from SAM.SAM_refinement.svb_utils import binary_reliability, resize_like
+    from SAM.SAM_refinement.svb_utils import SAMInferenceError, binary_reliability, resize_like
 
 
 LOGGER = logging.getLogger(__name__)
@@ -68,8 +69,6 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
         "vis_sam_refine_max_samples": 2,
         "sam_refine_vis_dir": "outputs/svb_plr_visualization",
         "svb_ablation_mode": "full",
-        "svb_plr_log_enable": True,
-        "svb_plr_log_interval": 200,
         "sam_beta_max": 0.75,
     }
 
@@ -142,7 +141,12 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
                 reason = "sam_backend_unavailable"
                 if self._sam_backend_init_error:
                     reason = "{}: {}".format(reason, self._sam_backend_init_error)
-                return self._fallback_output(p_t, reason)
+                raise SAMInferenceError(
+                    reason,
+                    epoch=epoch,
+                    step=step,
+                    sample_indices=list(range(p_t.size(0))),
+                )
 
             prompt_pack = self.prompt_generator(p_t, retrieval_aux or {})
             prompt_pack = self._apply_ablation_prompt(prompt_pack, p_t)
@@ -205,6 +209,16 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
                     student_pred=student_pred,
                 )
             return p_ref.detach(), conf_ref.detach(), sam_aux
+        except SAMInferenceError as exc:
+            if exc.epoch is None and exc.step is None:
+                raise SAMInferenceError(
+                    exc.message,
+                    epoch=epoch,
+                    step=step,
+                    sample_indices=exc.sample_indices,
+                    failures=exc.failures,
+                ) from exc
+            raise
         except Exception as exc:
             reason = "svb_plr_exception: {}".format(exc)
             self._warn("[SVB-PLR] refinement fallback: {}".format(reason))
@@ -234,16 +248,24 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
             )
             masks = self._as_bkhw_masks(sam_out.get("masks"), teacher_prob)
             scores = self._as_bk_scores(sam_out.get("scores"), masks, teacher_prob) if masks is not None else None
+            valid_candidates = (
+                PromptExpertSelector._as_bk_valid(sam_out.get("valid_candidates"), masks, teacher_prob)
+                if masks is not None
+                else None
+            )
+            expert_backend_aux = sam_out.get("backend_aux", {})
             candidate = {
                 "expert": expert,
                 "masks": masks,
                 "scores": scores,
+                "valid_candidates": valid_candidates,
                 "logits": sam_out.get("logits"),
+                "backend_aux": expert_backend_aux,
             }
             sam_candidates.append(candidate)
             if masks is not None:
                 candidate_masks.append(masks)
-            backend_aux[expert] = sam_out.get("backend_aux", {})
+            backend_aux[expert] = expert_backend_aux
 
         if candidate_masks:
             prompt_pack["candidate_masks"] = torch.cat(candidate_masks, dim=1).detach()
@@ -274,24 +296,30 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
     def _default_select(self, sam_out: Dict[str, Any], teacher_prob: torch.Tensor):
         masks = self._as_bkhw_masks(sam_out.get("masks"), teacher_prob)
         if masks is None or masks.numel() == 0 or masks.size(1) == 0:
-            sam_mask = teacher_prob.detach().clamp(0.0, 1.0)
-            sam_score = teacher_prob.new_zeros((teacher_prob.size(0),))
-            selector_aux = {
-                "use_prompt_expert": False,
-                "used_fallback": True,
-                "fallback_reason": "empty_default_sam_masks",
-                "best_expert": ["default_fallback"] * teacher_prob.size(0),
-                "best_candidate_index": teacher_prob.new_zeros((teacher_prob.size(0),), dtype=torch.long),
-            }
-            return sam_mask, sam_score, selector_aux
+            raise SAMInferenceError(
+                "Default SAM prompt returned no candidate masks",
+                sample_indices=list(range(teacher_prob.size(0))),
+                failures=[sam_out.get("backend_aux", {})],
+            )
 
         scores = self._as_bk_scores(sam_out.get("scores"), masks, teacher_prob)
+        valid_candidates = PromptExpertSelector._as_bk_valid(
+            sam_out.get("valid_candidates"), masks, teacher_prob
+        )
+        invalid_samples = (~valid_candidates.any(dim=1)).nonzero(as_tuple=False).flatten().tolist()
+        if invalid_samples:
+            raise SAMInferenceError(
+                "Default SAM prompt has no valid candidates",
+                sample_indices=invalid_samples,
+                failures=[sam_out.get("backend_aux", {})],
+            )
         if scores is None:
-            best_idx = torch.zeros((teacher_prob.size(0),), device=teacher_prob.device, dtype=torch.long)
-            sam_score = teacher_prob.new_zeros((teacher_prob.size(0),))
+            ranked_scores = teacher_prob.new_zeros(valid_candidates.shape)
         else:
-            best_idx = scores.argmax(dim=1)
-            sam_score = scores[torch.arange(scores.size(0), device=scores.device), best_idx]
+            ranked_scores = scores
+        ranked_scores = ranked_scores.masked_fill(~valid_candidates, float("-inf"))
+        best_idx = ranked_scores.argmax(dim=1)
+        sam_score = ranked_scores[torch.arange(ranked_scores.size(0), device=ranked_scores.device), best_idx]
         batch_idx = torch.arange(teacher_prob.size(0), device=teacher_prob.device)
         sam_mask = masks[batch_idx, best_idx].unsqueeze(1).clamp(0.0, 1.0)
         selector_aux = {
@@ -302,6 +330,8 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
             "expert_scores": {"default": scores.detach() if scores is not None else None},
             "expert_components": {},
             "selected_logits": None,
+            "valid_candidates": valid_candidates.detach(),
+            "valid_candidate_ratio": valid_candidates.float().mean().detach(),
         }
         return sam_mask, sam_score.detach(), selector_aux
 
@@ -563,21 +593,8 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
     def _cfg_float(self, name: str) -> float:
         return float(self._cfg(name))
 
-    def _log_enabled(self) -> bool:
-        return self._cfg_bool("svb_plr_log_enable")
-
-    def _log_interval(self) -> int:
-        try:
-            return max(1, self._cfg_int("svb_plr_log_interval"))
-        except (TypeError, ValueError):
-            return 200
-
     def _should_log(self) -> bool:
-        if not self._log_enabled():
-            return False
-        if self._current_step is None:
-            return True
-        return self._current_step % self._log_interval() == 0
+        return should_log(self.cfg, self._current_step)
 
     @staticmethod
     def _normalize_step(step) -> Optional[int]:

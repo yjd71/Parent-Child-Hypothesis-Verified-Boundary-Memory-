@@ -13,6 +13,11 @@ from SAM.protoSAMprompt.train_pseudo_refiner import (
     build_sam_pseudo_label_refiner,
 )
 
+try:
+    from .svb_utils import SAMInferenceError
+except ImportError:
+    from SAM.SAM_refinement.svb_utils import SAMInferenceError
+
 
 class ExistingSAMBackendAdapter(nn.Module):
     """Adapter around the existing SAM/protoSAMprompt backends.
@@ -24,6 +29,7 @@ class ExistingSAMBackendAdapter(nn.Module):
     Public predict output:
         masks: [B, K, Ht, Wt]
         scores: [B, K]
+        valid_candidates: bool [B, K]
         logits: optional [B, K, ...]
         backend_aux: dict
     """
@@ -72,6 +78,9 @@ class ExistingSAMBackendAdapter(nn.Module):
             point_coords: optional per-sample xy point coords
             point_labels: optional per-sample point labels
             mask_inputs: optional mask prompts
+
+        Every returned mask slot has a corresponding valid_candidates entry.
+        Failed samples and padding slots are zero-filled and marked invalid.
         """
         try:
             images, teacher_prob = self._validate_inputs(images, teacher_prob)
@@ -102,8 +111,15 @@ class ExistingSAMBackendAdapter(nn.Module):
                 }
             )
             return result
+        except SAMInferenceError:
+            raise
         except Exception as exc:
-            return self._fallback_output(teacher_prob, "predict_exception: {}".format(exc))
+            raise SAMInferenceError(
+                "SAM backend prediction failed",
+                epoch=epoch,
+                step=step,
+                failures=[{"backend": getattr(self, "backend_name", "unknown"), "error": str(exc)}],
+            ) from exc
 
     def _predict_auto_prompt(self, images: torch.Tensor, teacher_prob: torch.Tensor) -> Dict[str, Any]:
         image_np_list = self._denormalize_batch(images)
@@ -124,13 +140,14 @@ class ExistingSAMBackendAdapter(nn.Module):
                 sample_scores.append(teacher_prob.new_full((refined.size(0),), 0.5))
             except Exception as exc:
                 failed.append((idx, str(exc)))
-                sample_masks.append(teacher_prob[idx, 0].detach().clamp(0, 1).reshape(1, *teacher_prob.shape[-2:]))
-                sample_scores.append(teacher_prob.new_zeros((1,)))
+                sample_masks.append(teacher_prob.new_empty((0, *teacher_prob.shape[-2:])))
+                sample_scores.append(teacher_prob.new_empty((0,)))
 
-        masks, scores = self._pad_candidates(sample_masks, sample_scores, teacher_prob)
+        masks, scores, valid_candidates = self._pad_candidates(sample_masks, sample_scores, teacher_prob)
         return {
             "masks": masks,
             "scores": scores,
+            "valid_candidates": valid_candidates,
             "logits": None,
             "backend_aux": {
                 "used_fallback": bool(failed),
@@ -199,7 +216,7 @@ class ExistingSAMBackendAdapter(nn.Module):
                     [prompt_dict],
                     multimask_output=self.multimask_output,
                 )[0]
-                masks = self._flatten_sam1_masks(sam_output["masks"])
+                masks = self._sam1_mask_logits_to_prob(sam_output["masks"])
                 scores = sam_output.get("iou_predictions")
                 logits = sam_output.get("low_res_logits")
                 masks = self._resize_candidate_masks(masks.to(device=teacher_prob.device, dtype=teacher_prob.dtype), teacher_prob)
@@ -209,15 +226,16 @@ class ExistingSAMBackendAdapter(nn.Module):
                 sample_logits.append(self._flatten_logits(logits, teacher_prob.device))
             except Exception as exc:
                 failed.append((idx, str(exc)))
-                sample_masks.append(teacher_prob[idx, 0].detach().clamp(0, 1).reshape(1, *teacher_prob.shape[-2:]))
-                sample_scores.append(teacher_prob.new_zeros((1,)))
+                sample_masks.append(teacher_prob.new_empty((0, *teacher_prob.shape[-2:])))
+                sample_scores.append(teacher_prob.new_empty((0,)))
                 sample_logits.append(None)
 
-        masks, scores = self._pad_candidates(sample_masks, sample_scores, teacher_prob)
+        masks, scores, valid_candidates = self._pad_candidates(sample_masks, sample_scores, teacher_prob)
         logits = self._pad_logits(sample_logits, masks.size(1), teacher_prob)
         return {
             "masks": masks,
             "scores": scores,
+            "valid_candidates": valid_candidates,
             "logits": logits,
             "backend_aux": {
                 "used_fallback": bool(failed),
@@ -289,15 +307,16 @@ class ExistingSAMBackendAdapter(nn.Module):
                 sample_logits.append(logits)
             except Exception as exc:
                 failed.append((idx, str(exc)))
-                sample_masks.append(teacher_prob[idx, 0].detach().clamp(0, 1).reshape(1, *teacher_prob.shape[-2:]))
-                sample_scores.append(teacher_prob.new_zeros((1,)))
+                sample_masks.append(teacher_prob.new_empty((0, *teacher_prob.shape[-2:])))
+                sample_scores.append(teacher_prob.new_empty((0,)))
                 sample_logits.append(None)
 
-        masks, scores = self._pad_candidates(sample_masks, sample_scores, teacher_prob)
+        masks, scores, valid_candidates = self._pad_candidates(sample_masks, sample_scores, teacher_prob)
         logits = self._pad_logits(sample_logits, masks.size(1), teacher_prob)
         return {
             "masks": masks,
             "scores": scores,
+            "valid_candidates": valid_candidates,
             "logits": logits,
             "backend_aux": {
                 "used_fallback": bool(failed),
@@ -330,18 +349,40 @@ class ExistingSAMBackendAdapter(nn.Module):
         box_tensor = self._tensor_or_none(boxes, device=sam.device, dtype=torch.float32)
         if box_tensor is not None and box_tensor.numel() > 0:
             box_tensor = box_tensor.reshape(-1, 4)
-            prompt_dict["boxes"] = resize_transform.apply_boxes_torch(box_tensor, original_size)
+        else:
+            box_tensor = None
 
         coords_tensor = self._tensor_or_none(point_coords, device=sam.device, dtype=torch.float32)
         labels_tensor = self._tensor_or_none(point_labels, device=sam.device, dtype=torch.long)
         if coords_tensor is not None and labels_tensor is not None and coords_tensor.numel() > 0 and labels_tensor.numel() > 0:
             coords_tensor = coords_tensor.reshape(1, -1, 2) if coords_tensor.dim() == 2 else coords_tensor.reshape(-1, coords_tensor.size(-2), 2)
-            labels_tensor = labels_tensor.reshape(coords_tensor.size(0), -1)
-            prompt_dict["point_coords"] = resize_transform.apply_coords_torch(coords_tensor, original_size)
-            prompt_dict["point_labels"] = labels_tensor
+            labels_tensor = labels_tensor.reshape(1, -1) if labels_tensor.dim() == 1 else labels_tensor.reshape(labels_tensor.size(0), -1)
+            if labels_tensor.size(1) != coords_tensor.size(1):
+                raise ValueError(
+                    "point label count {} does not match coordinate count {}".format(
+                        labels_tensor.size(1), coords_tensor.size(1)
+                    )
+                )
+        else:
+            coords_tensor = None
+            labels_tensor = None
 
         mask_tensor = self._prepare_mask_input_tensor(mask_inputs, device=sam.device, dtype=torch.float32)
-        if mask_tensor is not None and mask_tensor.numel() > 0:
+        if mask_tensor is not None and mask_tensor.numel() == 0:
+            mask_tensor = None
+
+        box_tensor, coords_tensor, labels_tensor, mask_tensor = self._broadcast_sam1_prompt_batches(
+            box_tensor,
+            coords_tensor,
+            labels_tensor,
+            mask_tensor,
+        )
+        if box_tensor is not None:
+            prompt_dict["boxes"] = resize_transform.apply_boxes_torch(box_tensor, original_size)
+        if coords_tensor is not None and labels_tensor is not None:
+            prompt_dict["point_coords"] = resize_transform.apply_coords_torch(coords_tensor, original_size)
+            prompt_dict["point_labels"] = labels_tensor
+        if mask_tensor is not None:
             prompt_dict["mask_inputs"] = mask_tensor
 
         return prompt_dict
@@ -388,26 +429,11 @@ class ExistingSAMBackendAdapter(nn.Module):
         return calls
 
     def _fallback_output(self, teacher_prob: torch.Tensor, reason: str) -> Dict[str, Any]:
-        if torch.is_tensor(teacher_prob) and teacher_prob.dim() == 4:
-            masks = teacher_prob.detach().clamp(0, 1)
-            if masks.size(1) != 1:
-                masks = masks[:, :1]
-            masks = masks[:, 0].unsqueeze(1)
-            scores = masks.new_zeros((masks.size(0), 1))
-        else:
-            device = teacher_prob.device if torch.is_tensor(teacher_prob) else torch.device("cpu")
-            masks = torch.empty((0, 1, 0, 0), device=device)
-            scores = torch.empty((0, 1), device=device)
-        return {
-            "masks": masks,
-            "scores": scores,
-            "logits": None,
-            "backend_aux": {
-                "backend": getattr(self, "backend_name", "unknown"),
-                "used_fallback": True,
-                "fallback_reason": reason,
-            },
-        }
+        raise SAMInferenceError(
+            reason,
+            sample_indices=list(range(teacher_prob.size(0))) if torch.is_tensor(teacher_prob) and teacher_prob.dim() else [],
+            failures=[{"backend": getattr(self, "backend_name", "unknown"), "error": reason}],
+        )
 
     @staticmethod
     def _extract_prompt(prompt_pack: Optional[Dict[str, Any]], explicit_value, key: str, fallback_key: Optional[str] = None):
@@ -490,6 +516,10 @@ class ExistingSAMBackendAdapter(nn.Module):
         return ExistingSAMBackendAdapter._ensure_khw(masks)
 
     @staticmethod
+    def _sam1_mask_logits_to_prob(masks: torch.Tensor) -> torch.Tensor:
+        return ExistingSAMBackendAdapter._flatten_sam1_masks(masks).float().sigmoid()
+
+    @staticmethod
     def _flatten_scores(scores: Optional[torch.Tensor], count: int, device, default: float = 0.5) -> torch.Tensor:
         if scores is None:
             return torch.full((count,), float(default), device=device)
@@ -511,22 +541,55 @@ class ExistingSAMBackendAdapter(nn.Module):
         sample_masks: Sequence[torch.Tensor],
         sample_scores: Sequence[torch.Tensor],
         teacher_prob: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = len(sample_masks)
         max_k = max((mask.size(0) for mask in sample_masks), default=1)
         max_k = max(1, max_k)
         height, width = teacher_prob.shape[-2:]
-        masks_out = teacher_prob.new_empty((batch_size, max_k, height, width))
+        masks_out = teacher_prob.new_zeros((batch_size, max_k, height, width))
         scores_out = teacher_prob.new_zeros((batch_size, max_k))
+        valid_out = torch.zeros((batch_size, max_k), device=teacher_prob.device, dtype=torch.bool)
         for idx, masks in enumerate(sample_masks):
+            if masks.numel() == 0:
+                continue
             masks = ExistingSAMBackendAdapter._resize_candidate_masks(masks.to(device=teacher_prob.device, dtype=teacher_prob.dtype), teacher_prob)
             k = masks.size(0)
             masks_out[idx, :k] = masks
-            if k < max_k:
-                masks_out[idx, k:] = teacher_prob[idx, 0].detach().clamp(0, 1)
+            valid_out[idx, :k] = True
             scores = sample_scores[idx].to(device=teacher_prob.device, dtype=teacher_prob.dtype).reshape(-1)
             scores_out[idx, : min(k, scores.numel())] = scores[: min(k, scores.numel())]
-        return masks_out.clamp(0, 1), scores_out
+        return masks_out.clamp(0, 1), scores_out, valid_out
+
+    @staticmethod
+    def _broadcast_sam1_prompt_batches(boxes, point_coords, point_labels, mask_inputs):
+        named = {
+            "boxes": boxes,
+            "point_coords": point_coords,
+            "point_labels": point_labels,
+            "mask_inputs": mask_inputs,
+        }
+        batch_sizes = [value.size(0) for value in named.values() if torch.is_tensor(value)]
+        target_batch = max(batch_sizes, default=1)
+        broadcasted = {}
+        for name, value in named.items():
+            if value is None:
+                broadcasted[name] = None
+            elif value.size(0) == target_batch:
+                broadcasted[name] = value
+            elif value.size(0) == 1:
+                broadcasted[name] = value.expand(target_batch, *value.shape[1:])
+            else:
+                raise ValueError(
+                    "SAM1 prompt batch mismatch: {} has batch {}, expected 1 or {}".format(
+                        name, value.size(0), target_batch
+                    )
+                )
+        return (
+            broadcasted["boxes"],
+            broadcasted["point_coords"],
+            broadcasted["point_labels"],
+            broadcasted["mask_inputs"],
+        )
 
     @staticmethod
     def _pad_logits(sample_logits: Sequence[Optional[torch.Tensor]], max_k: int, teacher_prob: torch.Tensor):

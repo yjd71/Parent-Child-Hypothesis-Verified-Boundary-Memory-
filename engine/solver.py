@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, Subset
 
 from data import prepare_dataloader, prepare_labeled_memory_dataloader
 from utils import AverageMeter, retry_if_cuda_oom
+from utils.log_control import log_enabled, should_log
 from utils.solver_logging import (
     add_weighted_unsup_stats,
     log_info,
@@ -203,7 +204,12 @@ class SemiSupervisedTrainer:
             calibrator.load_calibrator_state(state, device=self.device)
             self._svb_conformal_fitted = bool(calibrator.is_fitted())
             self._svb_conformal_state_loaded = True
-            log_svb_calibrator_state(self.logger, self.svb_plr, "[SVB-PLR] conformal state restored", log_enabled=self._svb_should_log())
+            log_svb_calibrator_state(
+                self.logger,
+                self.svb_plr,
+                "[SVB-PLR] conformal state restored",
+                log_enabled=self._logging_enabled(),
+            )
         except Exception as exc:
             self._svb_conformal_state_loaded = True
             self._log_svb_info("[SVB-PLR] conformal state restore failed: {}".format(exc))
@@ -382,7 +388,15 @@ class SemiSupervisedTrainer:
             loss = loss + loss_sv_ume
             for loss_name, loss_value in sv_ume_losses.items():
                 self.loss_dict[loss_name] = float(loss_value.detach().item())
-        record_cbm_aux(self.loss_dict, self.cbm, self.cbm_stage, cbm_aux, branch_name, logger=self.logger)
+        record_cbm_aux(
+            self.loss_dict,
+            self.cbm,
+            self.cbm_stage,
+            cbm_aux,
+            branch_name,
+            logger=self.logger,
+            log_enabled=self._should_log(),
+        )
         self._maybe_save_cbm_visualizations(cbm_aux, batch, branch_name)
 
         self.loss_log.update(loss.item(), inputs.size(0))
@@ -478,7 +492,7 @@ class SemiSupervisedTrainer:
                 enable_cbm_loss=enable_labeled_cbm_loss,
                 branch_name="Sup",
             )
-            if batch_idx % 20 == 0:
+            if self._should_log():
                 log_training_progress(
                     logger=self.logger,
                     loss_dict=self.loss_dict,
@@ -556,10 +570,10 @@ class SemiSupervisedTrainer:
                         p_ref,
                         conf_ref,
                         logger=self.logger,
-                        log_enabled=self._svb_should_log(),
+                        log_enabled=self._should_log(),
                     )
 
-                if batch_idx % 20 == 0:
+                if self._should_log():
                     log_training_progress(
                         logger=self.logger,
                         loss_dict=self.loss_dict,
@@ -792,7 +806,7 @@ class SemiSupervisedTrainer:
         return objects[0]
 
     def _log_sv_ume(self, message):
-        if self._is_main_process():
+        if self._is_main_process() and self._logging_enabled():
             self._log_info(message)
 
     def _prepare_svb_epoch(self, epoch):
@@ -830,7 +844,7 @@ class SemiSupervisedTrainer:
                 self.logger,
                 self.svb_plr,
                 "[SVB-PLR] conformal calibrator state",
-                log_enabled=self._svb_should_log(),
+                log_enabled=self._logging_enabled(),
             )
         except Exception as exc:
             self._log_svb_info("[SVB-PLR] conformal calibrator fit skipped: {}".format(exc))
@@ -938,29 +952,19 @@ class SemiSupervisedTrainer:
         )
 
     def _log_info(self, message):
-        log_info(self.logger, message)
+        if self._logging_enabled():
+            log_info(self.logger, message)
 
-    def _svb_log_enabled(self):
-        return bool(getattr(self.config, "svb_plr_log_enable", True))
+    def _logging_enabled(self):
+        return log_enabled(self.config)
 
-    def _svb_log_interval(self):
-        try:
-            return max(1, int(getattr(self.config, "svb_plr_log_interval", 200)))
-        except (TypeError, ValueError):
-            return 200
-
-    def _svb_should_log(self, step=None):
-        if not self._svb_log_enabled():
-            return False
+    def _should_log(self, step=None):
         if step is None:
             step = getattr(self, "global_step", None)
-        try:
-            return int(step) % self._svb_log_interval() == 0
-        except (TypeError, ValueError):
-            return True
+        return should_log(self.config, step)
 
     def _log_svb_info(self, message):
-        if self._svb_should_log():
+        if self._logging_enabled():
             self._log_info(message)
 
     def _should_evaluate_epoch(self, epoch):

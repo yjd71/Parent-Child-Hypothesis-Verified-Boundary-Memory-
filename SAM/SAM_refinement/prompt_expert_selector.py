@@ -8,9 +8,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from .svb_utils import resize_like, soft_boundary_alignment, soft_iou
+    from .svb_utils import SAMInferenceError, resize_like, soft_boundary_alignment, soft_iou
 except ImportError:
-    from SAM.SAM_refinement.svb_utils import resize_like, soft_boundary_alignment, soft_iou
+    from SAM.SAM_refinement.svb_utils import SAMInferenceError, resize_like, soft_boundary_alignment, soft_iou
 
 
 class PromptExpertSelector(nn.Module):
@@ -76,20 +76,27 @@ class PromptExpertSelector(nn.Module):
         """Select the best candidate mask for each image.
 
         Shape:
-            sam_candidates: list of {"expert", "masks": [B,K,H,W], "scores": [B,K]}
+            sam_candidates: list of {"expert", "masks": [B,K,H,W],
+                "scores": [B,K], "valid_candidates": bool [B,K]}
             teacher_prob: [B, 1, H, W]
             return: best_mask [B,1,H,W], best_score [B], selector_aux dict
         """
         p_t = self._as_teacher_prob(teacher_prob)
         if not sam_candidates:
-            return self._fallback_selection(p_t, "empty_sam_candidates")
+            return self._fallback_selection(
+                p_t,
+                "empty_sam_candidates",
+                sample_indices=list(range(p_t.size(0))),
+            )
 
         expert_scores: Dict[str, torch.Tensor] = {}
         expert_components: Dict[str, Dict[str, torch.Tensor]] = {}
         masks_by_expert: List[torch.Tensor] = []
         logits_by_expert: List[Optional[torch.Tensor]] = []
+        valid_by_expert: List[torch.Tensor] = []
         names_by_expert: List[str] = []
         local_indices_by_expert: List[torch.Tensor] = []
+        failure_details: List[Dict[str, Any]] = []
 
         for candidate_idx, candidate in enumerate(sam_candidates):
             candidate_map = candidate if isinstance(candidate, Mapping) else {}
@@ -101,6 +108,7 @@ class PromptExpertSelector(nn.Module):
                 continue
 
             scores = self._as_bk_scores(candidate_map.get("scores"), masks, p_t)
+            valid_candidates = self._as_bk_valid(candidate_map.get("valid_candidates"), masks, p_t)
             components = self._score_components(masks, scores, p_t, prompt_pack)
             total = (
                 self._cfg_float("sam_selector_lambda_iou") * components["iou"]
@@ -109,19 +117,38 @@ class PromptExpertSelector(nn.Module):
                 - self._cfg_float("sam_selector_lambda_over") * components["over"]
                 + self._cfg_float("sam_prompt_select_tau") * components["sam_score"]
             )
+            total = total.masked_fill(~valid_candidates, float("-inf"))
 
             expert_scores[expert_name] = total
             expert_components[expert_name] = components
             masks_by_expert.append(masks)
             logits_by_expert.append(self._as_candidate_logits(candidate_map.get("logits"), masks, p_t))
+            valid_by_expert.append(valid_candidates)
             names_by_expert.append(expert_name)
             local_indices_by_expert.append(torch.arange(masks.size(1), device=p_t.device, dtype=torch.long))
+            backend_aux = candidate_map.get("backend_aux")
+            if isinstance(backend_aux, Mapping):
+                failure_details.append({"expert": expert_name, "backend_aux": dict(backend_aux)})
 
         if not masks_by_expert:
-            return self._fallback_selection(p_t, "empty_candidate_masks")
+            return self._fallback_selection(
+                p_t,
+                "empty_candidate_masks",
+                sample_indices=list(range(p_t.size(0))),
+                failures=failure_details,
+            )
 
         all_masks = torch.cat(masks_by_expert, dim=1)
         all_scores = torch.cat([expert_scores[name] for name in names_by_expert], dim=1)
+        all_valid = torch.cat(valid_by_expert, dim=1)
+        invalid_samples = (~all_valid.any(dim=1)).nonzero(as_tuple=False).flatten().tolist()
+        if invalid_samples:
+            return self._fallback_selection(
+                p_t,
+                "all_sam_candidates_invalid",
+                sample_indices=invalid_samples,
+                failures=failure_details,
+            )
         all_local_indices = torch.cat(local_indices_by_expert, dim=0)
         best_flat = all_scores.argmax(dim=1)
         batch_indices = torch.arange(p_t.size(0), device=p_t.device)
@@ -140,6 +167,8 @@ class PromptExpertSelector(nn.Module):
             "best_candidate_index": best_candidate_index,
             "use_prompt_expert": self._cfg_bool("use_prompt_expert"),
             "selected_logits": selected_logits,
+            "valid_candidates": all_valid.detach(),
+            "valid_candidate_ratio": all_valid.float().mean().detach(),
             "used_fallback": False,
         }
         return best_mask, best_score, selector_aux
@@ -331,6 +360,42 @@ class PromptExpertSelector(nn.Module):
         return scores[:, :num_candidates].clamp(0.0, 1.0)
 
     @staticmethod
+    def _as_bk_valid(value: Any, masks: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        batch_size, num_candidates = masks.shape[:2]
+        if value is None:
+            return torch.ones((batch_size, num_candidates), device=ref.device, dtype=torch.bool)
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(value, device=ref.device)
+        valid = value.detach().to(device=ref.device, dtype=torch.bool)
+        if valid.dim() == 0:
+            valid = valid.reshape(1, 1).expand(batch_size, num_candidates)
+        elif valid.dim() == 1:
+            if valid.numel() == num_candidates:
+                valid = valid.reshape(1, num_candidates).expand(batch_size, -1)
+            elif valid.numel() == batch_size:
+                valid = valid.reshape(batch_size, 1).expand(-1, num_candidates)
+            else:
+                raise SAMInferenceError(
+                    "valid_candidates has incompatible length {} for [{},{}]".format(
+                        valid.numel(), batch_size, num_candidates
+                    )
+                )
+        else:
+            valid = valid.reshape(valid.size(0), -1)
+        if valid.size(0) != batch_size:
+            if valid.size(0) == 1:
+                valid = valid.expand(batch_size, -1)
+            else:
+                raise SAMInferenceError(
+                    "valid_candidates batch {} does not match {}".format(valid.size(0), batch_size)
+                )
+        if valid.size(1) != num_candidates:
+            raise SAMInferenceError(
+                "valid_candidates count {} does not match {}".format(valid.size(1), num_candidates)
+            )
+        return valid
+
+    @staticmethod
     def _as_candidate_logits(value: Any, masks: torch.Tensor, ref: torch.Tensor) -> Optional[torch.Tensor]:
         if not torch.is_tensor(value):
             return None
@@ -403,20 +468,18 @@ class PromptExpertSelector(nn.Module):
             selected.append(chosen)
         return torch.stack(selected, dim=0).unsqueeze(1).to(device=ref.device, dtype=ref.dtype)
 
-    def _fallback_selection(self, teacher_prob: torch.Tensor, reason: str):
-        best_mask = teacher_prob.detach().clamp(0.0, 1.0)
-        best_score = teacher_prob.new_zeros((teacher_prob.size(0),))
-        selector_aux = {
-            "expert_scores": {},
-            "expert_components": {},
-            "best_expert": ["fallback"] * teacher_prob.size(0),
-            "best_candidate_index": teacher_prob.new_zeros((teacher_prob.size(0),), dtype=torch.long),
-            "use_prompt_expert": self._cfg_bool("use_prompt_expert"),
-            "selected_logits": None,
-            "used_fallback": True,
-            "fallback_reason": reason,
-        }
-        return best_mask, best_score, selector_aux
+    def _fallback_selection(
+        self,
+        teacher_prob: torch.Tensor,
+        reason: str,
+        sample_indices=None,
+        failures=None,
+    ):
+        raise SAMInferenceError(
+            "SAM prompt selection failed: {}".format(reason),
+            sample_indices=sample_indices,
+            failures=failures,
+        )
 
     def _cfg(self, name: str) -> Any:
         if self.cfg is not None and hasattr(self.cfg, name):

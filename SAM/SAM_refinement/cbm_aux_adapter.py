@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping
 from typing import Any, Dict, List
-
-
-LOGGER = logging.getLogger(__name__)
 
 RETRIEVAL_AUX_KEYS = (
     "Y_map",
@@ -107,9 +103,6 @@ def validate_retrieval_aux(retrieval_aux: Any) -> Dict[str, Any]:
     aux = _as_mapping(retrieval_aux)
     present_keys = [key for key in REQUIRED_CBM_EVIDENCE_KEYS if aux.get(key) is not None]
     missing_keys = [key for key in REQUIRED_CBM_EVIDENCE_KEYS if aux.get(key) is None]
-
-    if missing_keys:
-        LOGGER.info("Missing CBM retrieval evidence keys for SVB-PLR: %s", ", ".join(missing_keys))
 
     return {
         "valid": not missing_keys,

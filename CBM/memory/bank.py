@@ -21,7 +21,6 @@ class DenseBoundaryMemory:
         regions: Sequence[str] = REGION_NAMES,
         sample_per_image: Optional[Dict[str, int]] = None,
         max_sizes: Optional[Dict[str, int]] = None,
-        print_diagnostics: bool = True,
     ) -> None:
         if value_dim != 8:
             raise ValueError("DenseBoundaryMemory currently uses fixed value_dim=8")
@@ -30,7 +29,6 @@ class DenseBoundaryMemory:
         self.regions = tuple(regions)
         self.sample_per_image = sample_per_image or dict(DEFAULT_SAMPLE_PER_IMAGE)
         self.max_sizes = max_sizes or dict(DEFAULT_MAX_SIZES)
-        self.print_diagnostics = print_diagnostics
         self.clear()
 
     def clear(self) -> None:
@@ -115,9 +113,6 @@ class DenseBoundaryMemory:
             self.meta[region] = region_meta
 
         self._finalized = True
-        if self.print_diagnostics:
-            print(self.diagnostic_string())
-
     def is_ready(self) -> bool:
         return self._finalized and sum(self.keys[region].size(0) for region in self.regions) > 0
 

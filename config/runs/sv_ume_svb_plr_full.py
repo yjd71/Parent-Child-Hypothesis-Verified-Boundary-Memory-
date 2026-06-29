@@ -13,12 +13,14 @@ pred_save_root = ckpt_dir.rstrip("/\\") + "/training_preds"
 
 load_all = False
 
+# Global CBM / SVB-PLR / SV-UME logging
+log_enable = False
+log_interval = 600
+
 # SVB-PLR main switches
 use_svb_plr = True
 use_sam_refine_unlabeled = True
 svb_ablation_mode = "full"  # off | teacher_sam_full | boundary_only | cbm_points | reliability | prompt_expert | conformal | full
-sv_training_log_enable = False
-sv_training_log_interval = 600
 svb_plr_start_epoch = 16
 sam_start_epoch = svb_plr_start_epoch
 sam_refine_interval = 1

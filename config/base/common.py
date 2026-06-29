@@ -10,6 +10,11 @@ precisionHigh = True
 compile = False
 verbose_eval = True
 
+# Global training/module logging. This single switch and interval control
+# CBM, SVB-PLR and SV-UME logs; visualization settings remain independent.
+log_enable = True
+log_interval = 200
+
 lambdas_pix_last = {
     # not 0 means opening this loss
     # original rate -- 1 : 30 : 1.5 : 0.2, bce x 30

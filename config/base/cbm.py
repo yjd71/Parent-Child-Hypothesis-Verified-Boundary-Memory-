@@ -15,7 +15,6 @@ CBM_DEFAULTS = {
     "cbm_context_tau_feat": 0.1,
     "cbm_context_tau_prob": 0.2,
     "cbm_context_tau_evi": 0.2,
-    "cbm_print_diagnostics": True,
     "cbm_lambda_mem": 0.2,
     "cbm_lambda_bd": 0.2,
     "cbm_lambda_ctx": 0.05,
