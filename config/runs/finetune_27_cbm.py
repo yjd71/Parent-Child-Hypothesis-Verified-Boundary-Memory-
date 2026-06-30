@@ -5,7 +5,7 @@ import os
 ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM-PFI/works/CBM_finetune_from27_topk64"
 
 
-tot_epochs = 11
+tot_epochs = 15
 
 sup_only_train_epoch = 5
 distributed_train = False
@@ -16,7 +16,7 @@ rand_seed = 7
 lr = 2e-5
 
 # 后期关闭 BCE，转向结构型损失（SSIM 为主，IoU 逐步减弱）。
-IoU_finetune_last_epochs = [0, -6][0]
+IoU_finetune_last_epochs = [0, -3][1]
 
 # model settings
 compile_model = False
@@ -62,7 +62,7 @@ testing_sets = "TE-COD10K+TE-CAMO"
 pred_save_root = os.path.join(ckpt_dir, 'training_preds')
 
 # eval
-eval_epoch = 4
+eval_epoch = 7
 eval_step = 1
 # save model_checkpoint
 save_step = 1

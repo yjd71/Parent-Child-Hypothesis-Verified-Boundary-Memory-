@@ -52,6 +52,8 @@ class CBMPromptGenerator(nn.Module):
         "sam_use_box_prompt": True,
         "sam_use_point_prompt": True,
         "sam_use_mask_prompt": True,
+        "sam_mask_prompt_eps": 0.05,
+        "sam_mask_prompt_strength": 1.0,
         "sam_use_boundary_points": True,
     }
 
@@ -244,11 +246,15 @@ class CBMPromptGenerator(nn.Module):
         return [box.to(device=p_t.device, dtype=torch.float32) for box in boxes]
 
     def _build_mask_prompt(self, p_t: torch.Tensor, refine_band: torch.Tensor) -> torch.Tensor:
-        mask_prompt = p_t.detach().clamp(0.0, 1.0)
-        if not self._cfg_bool("sam_refine_boundary_only"):
-            return mask_prompt
-        blurred_teacher = F.avg_pool2d(mask_prompt, kernel_size=3, stride=1, padding=1)
-        return (mask_prompt * (1.0 - refine_band) + blurred_teacher * refine_band).clamp(0.0, 1.0)
+        probability = p_t.detach().clamp(0.0, 1.0)
+        if self._cfg_bool("sam_refine_boundary_only"):
+            blurred_teacher = F.avg_pool2d(probability, kernel_size=3, stride=1, padding=1)
+            probability = (
+                probability * (1.0 - refine_band) + blurred_teacher * refine_band
+            ).clamp(0.0, 1.0)
+        eps = min(max(self._cfg_float("sam_mask_prompt_eps"), 1e-6), 0.499999)
+        strength = self._cfg_float("sam_mask_prompt_strength")
+        return torch.logit(probability.clamp(eps, 1.0 - eps)) * strength
 
     def _apply_prompt_switches(self, prompt_pack: Dict[str, Any], ref: torch.Tensor) -> Dict[str, Any]:
         """Apply user-facing prompt switches without dropping evidence maps."""

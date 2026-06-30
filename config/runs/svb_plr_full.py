@@ -15,7 +15,7 @@ pred_save_root = ckpt_dir.rstrip("/\\") + "/training_preds"
 # SVB-PLR main switches
 use_svb_plr = True
 use_sam_refine_unlabeled = True
-svb_ablation_mode = "full"  # off | teacher_sam_full | boundary_only | cbm_points | reliability | prompt_expert | conformal | full
+svb_ablation_mode = "full"  # off | teacher_sam_full | boundary_only | cbm_points | reliability | conformal | full
 sam_start_epoch = 16
 sam_refine_interval = 1
 
@@ -66,13 +66,6 @@ sam_lambda_end = 0.3
 sam_lambda_decay = False
 
 
-# Prompt expert selector
-use_prompt_expert = False
-sam_prompt_experts = ["box", "box_point", "mask", "boundary"]
-sam_prompt_select_tau = 0.1
-
-
-
 # Cache
 # The legacy switch stays off.  Output pseudo labels depend on the changing
 # teacher, so caching one full-resolution payload per image and epoch has very
@@ -116,7 +109,6 @@ others = {
     "sam_backend": sam_pseudo_backend,
     "sam_start_epoch": sam_start_epoch,
     "sam_use_conformal": sam_use_conformal,
-    "use_prompt_expert": use_prompt_expert,
     "use_svb_weighted_unsup_loss": use_svb_weighted_unsup_loss,
 }
 

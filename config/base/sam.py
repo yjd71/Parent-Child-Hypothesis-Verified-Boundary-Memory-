@@ -21,7 +21,7 @@ sam2_use_bfloat16 = True
 # stay disabled by default so existing training behavior is unchanged.
 use_svb_plr = False
 use_sam_refine_unlabeled = False
-svb_ablation_mode = "full"  # off | teacher_sam_full | boundary_only | cbm_points | reliability | prompt_expert | conformal | full
+svb_ablation_mode = "full"  # off | teacher_sam_full | boundary_only | cbm_points | reliability | conformal | full
 svb_plr_start_epoch = 16
 sam_start_epoch = svb_plr_start_epoch
 sam_refine_interval = 1
@@ -167,11 +167,6 @@ sam_beta_max = 0.75
 sam_lambda_start = 1.0
 sam_lambda_end = 0.3
 sam_lambda_decay = True
-
-# Prompt expert
-use_prompt_expert = True
-sam_prompt_experts = ["box", "box_point", "mask", "boundary"]
-sam_prompt_select_tau = 0.1
 
 # Cache
 # The legacy switch stays off.  Output pseudo labels depend on the changing

@@ -2,7 +2,7 @@ import os
 
 # Reuse the epoch-27 fine-tune config, then override the settings for a
 # weights-only restart + aggressive SVB-PLR run.
-with open(os.path.join("config", "runs", "finetune_27.py"), "r", encoding="utf-8") as _base_cfg:
+with open(os.path.join("config", "runs", "finetune_27_cbm.py"), "r", encoding="utf-8") as _base_cfg:
     exec(_base_cfg.read())
 del _base_cfg
 
@@ -115,12 +115,6 @@ sam_lambda_end = 0.3
 sam_lambda_decay = False
 
 
-# Prompt expert selector
-use_prompt_expert = False
-sam_prompt_experts = ["box", "box_point", "mask", "boundary"]
-sam_prompt_select_tau = 0.1
-
-
 # Cache
 # The legacy switch stays off.  Output pseudo labels depend on the changing
 # teacher, so caching one full-resolution payload per image and epoch has very
@@ -172,7 +166,6 @@ others = {
     "sam_backend": sam_pseudo_backend,
     "sam_start_epoch": sam_start_epoch,
     "sam_use_conformal": sam_use_conformal,
-    "use_prompt_expert": use_prompt_expert,
     "use_svb_weighted_unsup_loss": use_svb_weighted_unsup_loss,
     "resume_mode": "weights_only",
 }

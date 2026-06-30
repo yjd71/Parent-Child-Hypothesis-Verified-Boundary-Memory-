@@ -179,11 +179,14 @@ class ExistingSAMBackendAdapter(nn.Module):
         failed: List[Tuple[int, str]] = []
         embedding_cache_hits = 0
         embedding_cache_misses = 0
+        embedding_stats: List[Dict[str, Any]] = []
+        coordinate_stats: List[Dict[str, Any]] = []
         embedding_cache = getattr(self.refiner, "embedding_cache", None)
+        image_encoder_dtype = self._image_encoder_dtype(sam.image_encoder)
 
         for idx, image_np in enumerate(image_np_list):
             try:
-                prompt_dict = self._prepare_sam1_prompt_dict(
+                prompt_dict, coordinate_meta = self._prepare_sam1_prompt_dict(
                     image_np=image_np,
                     image_tensor=images[idx],
                     teacher_prob=teacher_prob[idx : idx + 1],
@@ -193,16 +196,19 @@ class ExistingSAMBackendAdapter(nn.Module):
                     point_labels=self._sample_labels(point_labels, idx, images.size(0)),
                     mask_inputs=self._sample_mask_inputs(mask_inputs, idx, images.size(0)),
                 )
+                coordinate_meta["sample_index"] = idx
+                coordinate_stats.append(coordinate_meta)
                 if not any(key in prompt_dict for key in ("boxes", "point_coords", "mask_inputs")):
                     raise ValueError("empty_external_prompt")
 
+                cache_hit = False
                 if embedding_cache is not None:
                     image_embeddings, cache_hit = embedding_cache.get_or_compute(
                         image_np,
                         lambda: sam.image_encoder(torch.stack([sam.preprocess(prompt_dict["image"])], dim=0)),
                         device=sam.device,
-                        dtype=prompt_dict["image"].dtype,
-                        extra_tag="sam1_preprocess_v1",
+                        dtype=image_encoder_dtype,
+                        extra_tag="sam1_preprocess_v2_float_embed",
                     )
                     if cache_hit:
                         embedding_cache_hits += 1
@@ -211,6 +217,10 @@ class ExistingSAMBackendAdapter(nn.Module):
                 else:
                     input_image = torch.stack([sam.preprocess(prompt_dict["image"])], dim=0)
                     image_embeddings = sam.image_encoder(input_image)
+                    image_embeddings = image_embeddings.to(device=sam.device, dtype=image_encoder_dtype)
+                sample_embedding_stats = self._validate_embedding(image_embeddings)
+                sample_embedding_stats.update({"sample_index": idx, "cache_hit": bool(cache_hit)})
+                embedding_stats.append(sample_embedding_stats)
                 sam_output = sam.forward_with_image_embeddings(
                     image_embeddings,
                     [prompt_dict],
@@ -244,6 +254,10 @@ class ExistingSAMBackendAdapter(nn.Module):
                 "embedding_cache_hits": embedding_cache_hits,
                 "embedding_cache_misses": embedding_cache_misses,
                 "embedding_cache_info": embedding_cache.cache_info() if embedding_cache is not None else None,
+                "embedding_stats": embedding_stats,
+                **self._summarize_embedding_stats(embedding_stats),
+                "prompt_coordinate_stats": coordinate_stats,
+                **self._summarize_coordinate_stats(coordinate_stats),
             },
         }
 
@@ -262,15 +276,20 @@ class ExistingSAMBackendAdapter(nn.Module):
         sample_scores: List[torch.Tensor] = []
         sample_logits: List[Optional[torch.Tensor]] = []
         failed: List[Tuple[int, str]] = []
+        coordinate_stats: List[Dict[str, Any]] = []
 
         for idx, image_np in enumerate(image_np_list):
             try:
-                prompt_args = self._prepare_sam2_prompt_args(
+                prompt_args, coordinate_meta = self._prepare_sam2_prompt_args(
                     boxes=self._sample_boxes(boxes, idx, images.size(0)),
                     point_coords=self._sample_points(point_coords, idx, images.size(0)),
                     point_labels=self._sample_labels(point_labels, idx, images.size(0)),
                     mask_inputs=self._sample_mask_inputs(mask_inputs, idx, images.size(0)),
+                    teacher_hw=tuple(teacher_prob.shape[-2:]),
+                    image_hw=tuple(image_np.shape[:2]),
                 )
+                coordinate_meta["sample_index"] = idx
+                coordinate_stats.append(coordinate_meta)
                 if not any(value is not None for value in prompt_args.values()):
                     raise ValueError("empty_external_prompt")
 
@@ -322,6 +341,8 @@ class ExistingSAMBackendAdapter(nn.Module):
                 "used_fallback": bool(failed),
                 "fallback_samples": failed,
                 "path": "sam2_external_prompt",
+                "prompt_coordinate_stats": coordinate_stats,
+                **self._summarize_coordinate_stats(coordinate_stats),
             },
         }
 
@@ -335,12 +356,14 @@ class ExistingSAMBackendAdapter(nn.Module):
         point_coords,
         point_labels,
         mask_inputs,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
         from SAM.protoSAMprompt.sam_refiner import prepare_image
 
         sam = self.refiner.sam
         image = prepare_image(image_np, resize_transform, sam.device)
         original_size = tuple(image_np.shape[:2])
+        teacher_hw = tuple(teacher_prob.shape[-2:])
+        coordinate_meta = self._coordinate_meta(teacher_hw, original_size)
         prompt_dict: Dict[str, torch.Tensor] = {
             "image": image,
             "original_size": original_size,
@@ -349,6 +372,7 @@ class ExistingSAMBackendAdapter(nn.Module):
         box_tensor = self._tensor_or_none(boxes, device=sam.device, dtype=torch.float32)
         if box_tensor is not None and box_tensor.numel() > 0:
             box_tensor = box_tensor.reshape(-1, 4)
+            box_tensor = self._scale_and_clip_boxes(box_tensor, coordinate_meta)
         else:
             box_tensor = None
 
@@ -356,6 +380,7 @@ class ExistingSAMBackendAdapter(nn.Module):
         labels_tensor = self._tensor_or_none(point_labels, device=sam.device, dtype=torch.long)
         if coords_tensor is not None and labels_tensor is not None and coords_tensor.numel() > 0 and labels_tensor.numel() > 0:
             coords_tensor = coords_tensor.reshape(1, -1, 2) if coords_tensor.dim() == 2 else coords_tensor.reshape(-1, coords_tensor.size(-2), 2)
+            coords_tensor = self._scale_and_clip_points(coords_tensor, coordinate_meta)
             labels_tensor = labels_tensor.reshape(1, -1) if labels_tensor.dim() == 1 else labels_tensor.reshape(labels_tensor.size(0), -1)
             if labels_tensor.size(1) != coords_tensor.size(1):
                 raise ValueError(
@@ -385,9 +410,18 @@ class ExistingSAMBackendAdapter(nn.Module):
         if mask_tensor is not None:
             prompt_dict["mask_inputs"] = mask_tensor
 
-        return prompt_dict
+        return prompt_dict, coordinate_meta
 
-    def _prepare_sam2_prompt_args(self, boxes, point_coords, point_labels, mask_inputs) -> Dict[str, Optional[np.ndarray]]:
+    def _prepare_sam2_prompt_args(
+        self,
+        boxes,
+        point_coords,
+        point_labels,
+        mask_inputs,
+        teacher_hw,
+        image_hw,
+    ) -> Tuple[Dict[str, Optional[np.ndarray]], Dict[str, Any]]:
+        coordinate_meta = self._coordinate_meta(teacher_hw, image_hw)
         box = self._to_numpy_or_none(boxes, dtype=np.float32)
         coords = self._to_numpy_or_none(point_coords, dtype=np.float32)
         labels = self._to_numpy_or_none(point_labels, dtype=np.int32)
@@ -395,18 +429,23 @@ class ExistingSAMBackendAdapter(nn.Module):
 
         if box is not None:
             box = box.reshape(-1, 4)
+            box = self._scale_and_clip_boxes_numpy(box, coordinate_meta)
         if coords is not None:
             coords = coords.reshape(-1, coords.shape[-2], 2) if coords.ndim == 3 else coords.reshape(1, -1, 2)
+            coords = self._scale_and_clip_points_numpy(coords, coordinate_meta)
         if labels is not None:
             labels = labels.reshape(coords.shape[0], -1) if coords is not None else labels.reshape(1, -1)
         if mask_input is not None:
             mask_input = self._prepare_sam2_mask_input(mask_input)
-        return {
-            "boxes": box,
-            "point_coords": coords,
-            "point_labels": labels,
-            "mask_inputs": mask_input,
-        }
+        return (
+            {
+                "boxes": box,
+                "point_coords": coords,
+                "point_labels": labels,
+                "mask_inputs": mask_input,
+            },
+            coordinate_meta,
+        )
 
     def _sam2_prompt_calls(self, prompt_args: Dict[str, Optional[np.ndarray]]) -> List[Dict[str, Any]]:
         boxes = prompt_args.get("boxes")
@@ -471,6 +510,120 @@ class ExistingSAMBackendAdapter(nn.Module):
         if isinstance(device, int):
             return torch.device("cuda:{}".format(device))
         return torch.device(device)
+
+    @staticmethod
+    def _image_encoder_dtype(image_encoder) -> torch.dtype:
+        try:
+            dtype = next(image_encoder.parameters()).dtype
+        except StopIteration as exc:
+            raise RuntimeError("SAM image encoder has no parameters; cannot determine embedding dtype") from exc
+        if not torch.empty((), dtype=dtype).is_floating_point():
+            raise TypeError("SAM image encoder dtype must be floating point, got {}".format(dtype))
+        return dtype
+
+    @staticmethod
+    def _validate_embedding(image_embeddings: torch.Tensor) -> Dict[str, Any]:
+        if not torch.is_tensor(image_embeddings):
+            raise TypeError("SAM image embeddings must be a torch.Tensor")
+        if not image_embeddings.is_floating_point():
+            raise TypeError(
+                "SAM image embeddings must be floating point, got {}".format(image_embeddings.dtype)
+            )
+        if image_embeddings.numel() == 0:
+            raise ValueError("SAM image embeddings are empty")
+        if not torch.isfinite(image_embeddings).all():
+            raise ValueError("SAM image embeddings contain non-finite values")
+        if not torch.any(image_embeddings != 0):
+            raise ValueError("SAM image embeddings are all zero")
+        stats_tensor = image_embeddings.detach().to(dtype=torch.float32)
+        return {
+            "dtype": str(image_embeddings.dtype),
+            "min": float(stats_tensor.min().item()),
+            "max": float(stats_tensor.max().item()),
+            "mean": float(stats_tensor.mean().item()),
+            "std": float(stats_tensor.std(unbiased=False).item()),
+        }
+
+    @staticmethod
+    def _summarize_embedding_stats(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        if not samples:
+            return {}
+        return {
+            "embedding_dtype": samples[0]["dtype"],
+            "embedding_min": min(float(item["min"]) for item in samples),
+            "embedding_max": max(float(item["max"]) for item in samples),
+            "embedding_mean": sum(float(item["mean"]) for item in samples) / len(samples),
+            "embedding_std": sum(float(item["std"]) for item in samples) / len(samples),
+        }
+
+    @staticmethod
+    def _coordinate_meta(teacher_hw, image_hw) -> Dict[str, Any]:
+        teacher_h, teacher_w = (int(teacher_hw[0]), int(teacher_hw[1]))
+        image_h, image_w = (int(image_hw[0]), int(image_hw[1]))
+        if min(teacher_h, teacher_w, image_h, image_w) <= 0:
+            raise ValueError(
+                "teacher/image spatial sizes must be positive, got {} and {}".format(
+                    (teacher_h, teacher_w), (image_h, image_w)
+                )
+            )
+        return {
+            "teacher_hw": (teacher_h, teacher_w),
+            "image_hw": (image_h, image_w),
+            "scale_x": float(image_w) / float(teacher_w),
+            "scale_y": float(image_h) / float(teacher_h),
+        }
+
+    @staticmethod
+    def _scale_and_clip_boxes(boxes: torch.Tensor, meta: Dict[str, Any]) -> torch.Tensor:
+        boxes = boxes.clone()
+        boxes[..., (0, 2)] *= float(meta["scale_x"])
+        boxes[..., (1, 3)] *= float(meta["scale_y"])
+        image_h, image_w = meta["image_hw"]
+        boxes[..., (0, 2)] = boxes[..., (0, 2)].clamp(0.0, float(image_w - 1))
+        boxes[..., (1, 3)] = boxes[..., (1, 3)].clamp(0.0, float(image_h - 1))
+        return boxes
+
+    @staticmethod
+    def _scale_and_clip_points(points: torch.Tensor, meta: Dict[str, Any]) -> torch.Tensor:
+        points = points.clone()
+        points[..., 0] *= float(meta["scale_x"])
+        points[..., 1] *= float(meta["scale_y"])
+        image_h, image_w = meta["image_hw"]
+        points[..., 0] = points[..., 0].clamp(0.0, float(image_w - 1))
+        points[..., 1] = points[..., 1].clamp(0.0, float(image_h - 1))
+        return points
+
+    @staticmethod
+    def _scale_and_clip_boxes_numpy(boxes: np.ndarray, meta: Dict[str, Any]) -> np.ndarray:
+        boxes = np.array(boxes, dtype=np.float32, copy=True)
+        boxes[..., (0, 2)] *= float(meta["scale_x"])
+        boxes[..., (1, 3)] *= float(meta["scale_y"])
+        image_h, image_w = meta["image_hw"]
+        boxes[..., (0, 2)] = np.clip(boxes[..., (0, 2)], 0.0, float(image_w - 1))
+        boxes[..., (1, 3)] = np.clip(boxes[..., (1, 3)], 0.0, float(image_h - 1))
+        return boxes
+
+    @staticmethod
+    def _scale_and_clip_points_numpy(points: np.ndarray, meta: Dict[str, Any]) -> np.ndarray:
+        points = np.array(points, dtype=np.float32, copy=True)
+        points[..., 0] *= float(meta["scale_x"])
+        points[..., 1] *= float(meta["scale_y"])
+        image_h, image_w = meta["image_hw"]
+        points[..., 0] = np.clip(points[..., 0], 0.0, float(image_w - 1))
+        points[..., 1] = np.clip(points[..., 1], 0.0, float(image_h - 1))
+        return points
+
+    @staticmethod
+    def _summarize_coordinate_stats(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        if not samples:
+            return {}
+        first = samples[0]
+        return {
+            "teacher_hw": first["teacher_hw"],
+            "image_hw": first["image_hw"],
+            "prompt_scale_x": first["scale_x"],
+            "prompt_scale_y": first["scale_y"],
+        }
 
     def _freeze_backend(self) -> None:
         modules = []
@@ -577,7 +730,13 @@ class ExistingSAMBackendAdapter(nn.Module):
             elif value.size(0) == target_batch:
                 broadcasted[name] = value
             elif value.size(0) == 1:
-                broadcasted[name] = value.expand(target_batch, *value.shape[1:])
+                # ResizeLongestSide mutates coordinate tensors in-place.  An
+                # expanded singleton batch has a zero stride and therefore
+                # cannot be written safely, so materialize an independent
+                # writable tensor for every prompt batch entry.
+                broadcasted[name] = value.expand(
+                    target_batch, *value.shape[1:]
+                ).clone()
             else:
                 raise ValueError(
                     "SAM1 prompt batch mismatch: {} has batch {}, expected 1 or {}".format(

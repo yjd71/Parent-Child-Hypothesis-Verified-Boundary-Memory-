@@ -10,8 +10,8 @@ precisionHigh = True
 compile = False
 verbose_eval = True
 
-# Global training/module logging. This single switch and interval control
-# CBM, SVB-PLR and SV-UME logs; visualization settings remain independent.
+# CBM / SVB-PLR / SV-UME logging only. Baseline training progress keeps its
+# fixed 20-batch cadence; visualization save settings remain independent.
 log_enable = True
 log_interval = 200
 

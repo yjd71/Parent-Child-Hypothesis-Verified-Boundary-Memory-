@@ -8,6 +8,34 @@ import wandb
 from torch.distributed import get_rank
 
 
+BASIC_TRAIN_LOG_INTERVAL = 20
+
+_CBM_METRIC_KEYS = {
+    "cbm_stage",
+    "memory_ready",
+    "gate_mean",
+    "valid_ratio",
+    "retrieval_uncertainty_mean",
+    "memory_tokens",
+}
+_SVB_METRIC_KEYS = {
+    "conf_ref_mean",
+    "conf_ref_min",
+    "conf_ref_max",
+    "boundary_boost_mean",
+    "weighted_unsup_weight_mean",
+    "weighted_unsup_weight_min",
+    "weighted_unsup_weight_max",
+    "weighted_unsup_refine_band_mean",
+    "loss_weighted_unsup",
+}
+_SV_UME_METRIC_KEYS = {
+    "loss_ume_evi",
+    "loss_source_cons",
+    "loss_sv_ume",
+}
+
+
 def log_info(logger, message: str) -> None:
     if logger is None:
         print(message)
@@ -24,6 +52,33 @@ def format_loss_info(loss_dict: Mapping[str, Any], title: str, include_cbm_losse
             continue
         info_loss += ", {}: {:.3f}".format(loss_name, float(loss_value))
     return info_loss
+
+
+def partition_training_metrics(
+    loss_dict: Mapping[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    """Split baseline training metrics from module-owned diagnostics."""
+    base_metrics: Dict[str, Any] = {}
+    module_metrics: Dict[str, Dict[str, Any]] = {
+        "CBM": {},
+        "SVB-PLR": {},
+        "SV-UME": {},
+    }
+    for name, value in loss_dict.items():
+        group = _module_metric_group(str(name))
+        if group is None:
+            base_metrics[name] = value
+        else:
+            module_metrics[group][name] = value
+    return base_metrics, module_metrics
+
+
+def should_log_training_progress(batch_idx: Any) -> bool:
+    """Return the fixed baseline logging cadence, independent of module config."""
+    try:
+        return int(batch_idx) % BASIC_TRAIN_LOG_INTERVAL == 0
+    except (TypeError, ValueError):
+        return False
 
 
 def add_weighted_unsup_stats(loss_dict: Dict[str, Any], conf_ref, loss_weight, refine_band, boost_map) -> None:
@@ -51,7 +106,10 @@ def log_training_progress(
     distributed_train: bool = False,
     include_cbm_losses: bool = True,
     progress_label: str = "",
+    log_base: bool = True,
+    log_modules: bool = False,
 ) -> None:
+    base_metrics, module_metrics = partition_training_metrics(loss_dict)
     label = "{} ".format(progress_label) if progress_label else ""
     info_progress = "{}Epoch[{}/{}] Iter[{}/{}].".format(
         label,
@@ -60,10 +118,47 @@ def log_training_progress(
         batch_idx,
         num_batches,
     )
-    info_loss = format_loss_info(loss_dict, title, include_cbm_losses=include_cbm_losses)
-    log_info(logger, " ".join((info_progress, info_loss)))
+    if log_base:
+        info_loss = format_loss_info(
+            base_metrics,
+            title,
+            include_cbm_losses=include_cbm_losses,
+        )
+        log_info(logger, " ".join((info_progress, info_loss)))
+
+    if log_modules:
+        module_progress = "Epoch[{}/{}] Iter[{}/{}].".format(
+            epoch,
+            total_epochs,
+            batch_idx,
+            num_batches,
+        )
+        for module_name, metrics in module_metrics.items():
+            if not metrics:
+                continue
+            info_metrics = format_loss_info(metrics, "Metrics")
+            log_info(
+                logger,
+                "[{}] {} {} {}".format(
+                    module_name,
+                    wandb_prefix,
+                    module_progress,
+                    info_metrics,
+                ),
+            )
+
     if _is_rank_zero(distributed_train):
-        wandb.log({"{}-{}".format(wandb_prefix, k): v for k, v in loss_dict.items()}, step=step)
+        wandb_metrics: Dict[str, Any] = {}
+        if log_base:
+            wandb_metrics.update(base_metrics)
+        if log_modules:
+            for metrics in module_metrics.values():
+                wandb_metrics.update(metrics)
+        if wandb_metrics:
+            wandb.log(
+                {"{}-{}".format(wandb_prefix, k): v for k, v in wandb_metrics.items()},
+                step=step,
+            )
 
 
 def record_cbm_aux(
@@ -132,9 +227,6 @@ def record_svb_aux(loss_dict: Dict[str, Any], sam_aux, p_t, p_ref, conf_ref, log
     loss_dict["svb_prompt_point_count"] = prompt_stats.get("point_count", 0.0)
     loss_dict["svb_prompt_boundary_point_count"] = prompt_stats.get("boundary_point_count", 0.0)
     loss_dict["svb_prompt_has_mask"] = prompt_stats.get("has_mask", 0.0)
-
-    for expert_name, ratio in _best_expert_ratios(sam_aux.get("selector_aux"), batch_size).items():
-        loss_dict["svb_best_expert_{}".format(expert_name)] = ratio
 
     _record_svb_maps(loss_dict, sam_aux, p_t, p_ref)
     if log_enabled and sam_aux.get("fallback_reason"):
@@ -221,6 +313,16 @@ def _tensor_max(value, default=0.0) -> float:
     if not torch.is_tensor(value) or value.numel() == 0:
         return float(default)
     return float(value.detach().float().max().item())
+
+
+def _module_metric_group(name: str):
+    if name in _CBM_METRIC_KEYS or name.startswith(("loss_cbm_", "raw_cbm_", "cbm_")):
+        return "CBM"
+    if name in _SVB_METRIC_KEYS or name.startswith("svb_"):
+        return "SVB-PLR"
+    if name in _SV_UME_METRIC_KEYS or name.startswith(("sv_ume_", "ume_")):
+        return "SV-UME"
+    return None
 
 
 def _valid_candidate_ratio(selector_aux) -> float:
@@ -320,25 +422,15 @@ def _prompt_stats(prompt_pack) -> Dict[str, float]:
     return out
 
 
-def _best_expert_ratios(selector_aux, batch_size: int) -> Dict[str, float]:
-    default_names = ("box", "box_point", "mask", "boundary", "default", "fallback")
-    counts = {name: 0 for name in default_names}
-    if isinstance(selector_aux, dict):
-        best_expert = selector_aux.get("best_expert")
-        if isinstance(best_expert, (list, tuple)):
-            for name in best_expert:
-                clean = str(name).replace("-", "_").replace(" ", "_")
-                counts[clean] = counts.get(clean, 0) + 1
-    denom = max(1, int(batch_size))
-    return {name: float(count / denom) for name, count in counts.items()}
-
-
 __all__ = [
+    "BASIC_TRAIN_LOG_INTERVAL",
     "add_weighted_unsup_stats",
     "format_loss_info",
     "log_training_progress",
     "log_info",
     "log_svb_calibrator_state",
+    "partition_training_metrics",
     "record_cbm_aux",
     "record_svb_aux",
+    "should_log_training_progress",
 ]

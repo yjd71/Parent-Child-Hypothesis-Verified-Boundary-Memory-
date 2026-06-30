@@ -20,16 +20,23 @@ def retry_if_cuda_oom(func):
             try:
                 return func(*args, **kwargs)
             except RuntimeError as e:
-                if 'CUDA out of memory' in str(e):
-                    if attempt < max_attempts - 1:
-                        logger.warn_info(f"CUDA OOM: Retrying... (Attempt {attempt + 1}/{max_attempts})")
-                        time.sleep(1) 
-                        torch.cuda.empty_cache()
-                        gc.collect()
-                    continue
-                else:
+                cuda_oom_type = getattr(torch.cuda, "OutOfMemoryError", ())
+                is_cuda_oom = (
+                    isinstance(e, cuda_oom_type)
+                    if cuda_oom_type
+                    else False
+                ) or "cuda out of memory" in str(e).lower()
+                if not is_cuda_oom:
+                    raise
+                if attempt >= max_attempts - 1:
                     logger.warn_info("Reached maximum retry attempts for CUDA OOM.")
                     raise
+                logger.warn_info(
+                    f"CUDA OOM: Retrying... (Attempt {attempt + 1}/{max_attempts})"
+                )
+                time.sleep(1)
+                torch.cuda.empty_cache()
+                gc.collect()
     return wrapper
 
 class AverageMeter(object):

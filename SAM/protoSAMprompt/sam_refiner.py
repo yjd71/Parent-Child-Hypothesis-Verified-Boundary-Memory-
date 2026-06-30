@@ -11,6 +11,31 @@ except ImportError:
 from utils.utils2 import prepare_image, extract_bboxes_expand, extract_points, extract_mask
 
 
+def _sam_image_encoder_dtype(sam, ddp=False):
+    model = sam.module if ddp else sam
+    try:
+        dtype = next(model.image_encoder.parameters()).dtype
+    except StopIteration as exc:
+        raise RuntimeError("SAM image encoder has no parameters; cannot determine embedding dtype") from exc
+    if not torch.empty((), dtype=dtype).is_floating_point():
+        raise TypeError("SAM image encoder dtype must be floating point, got {}".format(dtype))
+    return dtype
+
+
+def _validate_image_embeddings(image_embeddings):
+    if not torch.is_tensor(image_embeddings):
+        raise TypeError("SAM image embeddings must be a torch.Tensor")
+    if not image_embeddings.is_floating_point():
+        raise TypeError("SAM image embeddings must be floating point, got {}".format(image_embeddings.dtype))
+    if image_embeddings.numel() == 0:
+        raise ValueError("SAM image embeddings are empty")
+    if not torch.isfinite(image_embeddings).all():
+        raise ValueError("SAM image embeddings contain non-finite values")
+    if not torch.any(image_embeddings != 0):
+        raise ValueError("SAM image embeddings are all zero")
+    return image_embeddings
+
+
 def sam_input_prepare(image, pred_masks, image_embeddings=None, resize_transform=None, use_point=True, use_box=True, use_mask=True, add_neg=True, margin=0.0, gamma=1.0, strength=15):
     ori_size = pred_masks.shape[-2:]
     input_dict = {
@@ -99,6 +124,7 @@ def sam_refiner(image,
 
     with torch.no_grad():
         interm_embeddings = None
+        image_encoder_dtype = _sam_image_encoder_dtype(sam, ddp=ddp)
         if embedding_cache is not None and not use_samhq:
             def _compute_image_embeddings():
                 if ddp:
@@ -111,8 +137,8 @@ def sam_refiner(image,
                 image[0],
                 _compute_image_embeddings,
                 device=sam.device,
-                dtype=image[0].dtype,
-                extra_tag="sam1_preprocess_v1",
+                dtype=image_encoder_dtype,
+                extra_tag="sam1_preprocess_v2_float_embed",
             )
         else:
             if ddp:
@@ -129,6 +155,10 @@ def sam_refiner(image,
                 else:
                     image_embeddings, interm_embeddings = sam.image_encoder(input_images)
                     interm_embeddings = interm_embeddings[0]  # early layer
+
+        image_embeddings = _validate_image_embeddings(
+            image_embeddings.to(device=sam.device, dtype=image_encoder_dtype)
+        )
 
     pred_mask_list = coarse_masks.to(torch.uint8)
 

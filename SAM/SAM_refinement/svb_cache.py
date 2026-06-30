@@ -45,7 +45,11 @@ class SAMImageEmbeddingCache:
         self.max_items = max(1, int(max_items))
         self.backend_tag = str(backend_tag)
         self.model_tag = str(model_tag)
-        self.cache_version = str(getattr(cfg, "sam_embedding_cache_version", "v1")) if cfg is not None else "v1"
+        self.cache_version = (
+            str(getattr(cfg, "sam_embedding_cache_version", "v2_float_embed"))
+            if cfg is not None
+            else "v2_float_embed"
+        )
 
         self.disk_enabled = bool(getattr(cfg, "sam_embedding_cache_disk", False)) if cfg is not None else False
         cache_dir = getattr(cfg, "sam_embedding_cache_dir", "./cache/sam_image_embeddings") if cfg is not None else "./cache/sam_image_embeddings"
@@ -252,6 +256,14 @@ class SAMImageEmbeddingCache:
 
     @staticmethod
     def _move(value: torch.Tensor, device=None, dtype=None) -> torch.Tensor:
+        if dtype is not None and value.is_floating_point():
+            requested_dtype = torch.empty((), dtype=dtype).dtype
+            if not torch.empty((), dtype=requested_dtype).is_floating_point():
+                raise TypeError(
+                    "SAM image embeddings must remain floating point; requested dtype is {}".format(
+                        requested_dtype
+                    )
+                )
         if device is None and dtype is None:
             return value
         return value.to(
@@ -547,9 +559,6 @@ class SVBPLRCache:
         prompt_pack = sam_aux.get("prompt_pack", {}) if isinstance(sam_aux, dict) else {}
         debug: Dict[str, Any] = {}
         if isinstance(selector_aux, dict):
-            best_expert = selector_aux.get("best_expert")
-            if isinstance(best_expert, (list, tuple)) and len(best_expert) > idx:
-                debug["best_expert"] = str(best_expert[idx])
             best_idx = selector_aux.get("best_candidate_index")
             if torch.is_tensor(best_idx) and best_idx.numel() > idx:
                 debug["best_candidate_index"] = int(best_idx.detach().cpu().reshape(-1)[idx].item())

@@ -11,7 +11,6 @@ from utils.log_control import should_log
 try:
     from .cbm_prompt_generator import CBMPromptGenerator
     from .conformal_sam_calibrator import ConformalSAMCalibrator
-    from .prompt_expert_selector import PromptExpertSelector
     from .sam_backend_adapter import ExistingSAMBackendAdapter
     from .sam_refine_visualizer import SamRefineVisualizer
     from .sam_reliability_filter import SAMCBMReliabilityFilter
@@ -20,7 +19,6 @@ try:
 except ImportError:
     from SAM.SAM_refinement.cbm_prompt_generator import CBMPromptGenerator
     from SAM.SAM_refinement.conformal_sam_calibrator import ConformalSAMCalibrator
-    from SAM.SAM_refinement.prompt_expert_selector import PromptExpertSelector
     from SAM.SAM_refinement.sam_backend_adapter import ExistingSAMBackendAdapter
     from SAM.SAM_refinement.sam_refine_visualizer import SamRefineVisualizer
     from SAM.SAM_refinement.sam_reliability_filter import SAMCBMReliabilityFilter
@@ -38,7 +36,6 @@ class SVBAblationPolicy:
     use_boundary_band: bool
     use_cbm_points: bool
     use_reliability: bool
-    use_prompt_expert: bool
     use_conformal: bool
     full_image_fusion: bool
 
@@ -52,12 +49,13 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
         return: p_ref [B,1,H,W], conf_ref [B,1,H,W], sam_aux dict
     """
 
+    SINGLE_PROMPT_CACHE_VERSION = "single_prompt_v1"
+
     DEFAULTS = {
         "use_svb_plr": False,
         "use_sam_refine_unlabeled": False,
         "sam_start_epoch": 16,
         "sam_refine_interval": 1,
-        "use_prompt_expert": True,
         "sam_use_conformal": True,
         "use_sam_cache": False,
         "use_svb_output_cache": False,
@@ -86,10 +84,8 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
 
         self.sam_backend = self._build_sam_backend(cfg, device, logger)
         self.prompt_generator = CBMPromptGenerator(cfg)
-        selector_cfg = self._config_overlay(use_prompt_expert=True)
         reliability_cfg = self._config_overlay(sam_use_conformal=self._conformal_enabled)
         calibrator_cfg = self._config_overlay(sam_use_conformal=True)
-        self.prompt_selector = PromptExpertSelector(selector_cfg) if self.ablation_policy.use_prompt_expert else None
         self.reliability_filter = SAMCBMReliabilityFilter(reliability_cfg)
         self.calibrator = ConformalSAMCalibrator(calibrator_cfg) if self._conformal_enabled else None
         self.cache = SVBPLRCache(cfg, logger=logger) if self._cfg_bool("use_svb_output_cache") else None
@@ -124,7 +120,7 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
                     p_t,
                     epoch=epoch,
                     backend=backend_name,
-                    prompt_mode=self.ablation_mode,
+                    prompt_mode=self._cache_prompt_mode(),
                 )
                 if self.cache is not None
                 else None
@@ -150,14 +146,9 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
 
             prompt_pack = self.prompt_generator(p_t, retrieval_aux or {})
             prompt_pack = self._apply_ablation_prompt(prompt_pack, p_t)
-            if self.ablation_policy.use_prompt_expert and self.prompt_selector is not None:
-                sam_mask, sam_score, selector_aux, backend_aux = self._run_prompt_experts(
-                    images, p_t, prompt_pack, epoch=epoch, step=step
-                )
-            else:
-                sam_mask, sam_score, selector_aux, backend_aux = self._run_default_prompt(
-                    images, p_t, prompt_pack, epoch=epoch, step=step
-                )
+            sam_mask, sam_score, selector_aux, backend_aux = self._run_single_prompt(
+                images, p_t, prompt_pack, epoch=epoch, step=step
+            )
 
             if self.ablation_policy.use_reliability:
                 p_ref, conf_ref, filter_aux = self.reliability_filter(
@@ -193,7 +184,7 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
                     teacher_prob=p_t,
                     epoch=epoch,
                     backend=backend_name,
-                    prompt_mode=self.ablation_mode,
+                    prompt_mode=self._cache_prompt_mode(),
                 )
             if self.visualizer is not None:
                 self.visualizer.save(
@@ -224,55 +215,7 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
             self._warn("[SVB-PLR] refinement fallback: {}".format(reason))
             return self._fallback_output(self._as_teacher_prob(teacher_prob), reason)
 
-    def _run_prompt_experts(
-        self,
-        images: torch.Tensor,
-        teacher_prob: torch.Tensor,
-        prompt_pack: Dict[str, Any],
-        epoch=None,
-        step=None,
-    ):
-        expert_prompts = self.prompt_selector.build_expert_prompts(prompt_pack)
-        sam_candidates: List[Dict[str, Any]] = []
-        backend_aux: Dict[str, Any] = {}
-        candidate_masks: List[torch.Tensor] = []
-
-        for prompt in expert_prompts:
-            expert = str(prompt.get("expert", "unknown"))
-            sam_out = self.sam_backend.predict(
-                images,
-                teacher_prob,
-                prompt_pack=prompt,
-                epoch=epoch,
-                step=step,
-            )
-            masks = self._as_bkhw_masks(sam_out.get("masks"), teacher_prob)
-            scores = self._as_bk_scores(sam_out.get("scores"), masks, teacher_prob) if masks is not None else None
-            valid_candidates = (
-                PromptExpertSelector._as_bk_valid(sam_out.get("valid_candidates"), masks, teacher_prob)
-                if masks is not None
-                else None
-            )
-            expert_backend_aux = sam_out.get("backend_aux", {})
-            candidate = {
-                "expert": expert,
-                "masks": masks,
-                "scores": scores,
-                "valid_candidates": valid_candidates,
-                "logits": sam_out.get("logits"),
-                "backend_aux": expert_backend_aux,
-            }
-            sam_candidates.append(candidate)
-            if masks is not None:
-                candidate_masks.append(masks)
-            backend_aux[expert] = expert_backend_aux
-
-        if candidate_masks:
-            prompt_pack["candidate_masks"] = torch.cat(candidate_masks, dim=1).detach()
-        sam_mask, sam_score, selector_aux = self.prompt_selector.select(sam_candidates, teacher_prob, prompt_pack)
-        return sam_mask, sam_score, selector_aux, backend_aux
-
-    def _run_default_prompt(
+    def _run_single_prompt(
         self,
         images: torch.Tensor,
         teacher_prob: torch.Tensor,
@@ -287,29 +230,27 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
             epoch=epoch,
             step=step,
         )
-        sam_mask, sam_score, selector_aux = self._default_select(sam_out, teacher_prob)
+        sam_mask, sam_score, selector_aux = self._select_best_candidate(sam_out, teacher_prob)
         masks = self._as_bkhw_masks(sam_out.get("masks"), teacher_prob)
         if masks is not None:
             prompt_pack["candidate_masks"] = masks.detach()
         return sam_mask, sam_score, selector_aux, sam_out.get("backend_aux", {})
 
-    def _default_select(self, sam_out: Dict[str, Any], teacher_prob: torch.Tensor):
+    def _select_best_candidate(self, sam_out: Dict[str, Any], teacher_prob: torch.Tensor):
         masks = self._as_bkhw_masks(sam_out.get("masks"), teacher_prob)
         if masks is None or masks.numel() == 0 or masks.size(1) == 0:
             raise SAMInferenceError(
-                "Default SAM prompt returned no candidate masks",
+                "Single SAM prompt returned no candidate masks",
                 sample_indices=list(range(teacher_prob.size(0))),
                 failures=[sam_out.get("backend_aux", {})],
             )
 
         scores = self._as_bk_scores(sam_out.get("scores"), masks, teacher_prob)
-        valid_candidates = PromptExpertSelector._as_bk_valid(
-            sam_out.get("valid_candidates"), masks, teacher_prob
-        )
+        valid_candidates = self._as_bk_valid(sam_out.get("valid_candidates"), masks, teacher_prob)
         invalid_samples = (~valid_candidates.any(dim=1)).nonzero(as_tuple=False).flatten().tolist()
         if invalid_samples:
             raise SAMInferenceError(
-                "Default SAM prompt has no valid candidates",
+                "Single SAM prompt has no valid candidates",
                 sample_indices=invalid_samples,
                 failures=[sam_out.get("backend_aux", {})],
             )
@@ -323,13 +264,9 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
         batch_idx = torch.arange(teacher_prob.size(0), device=teacher_prob.device)
         sam_mask = masks[batch_idx, best_idx].unsqueeze(1).clamp(0.0, 1.0)
         selector_aux = {
-            "use_prompt_expert": False,
             "used_fallback": False,
-            "best_expert": ["default"] * teacher_prob.size(0),
             "best_candidate_index": best_idx.detach(),
-            "expert_scores": {"default": scores.detach() if scores is not None else None},
-            "expert_components": {},
-            "selected_logits": None,
+            "candidate_scores": scores.detach() if scores is not None else None,
             "valid_candidates": valid_candidates.detach(),
             "valid_candidate_ratio": valid_candidates.float().mean().detach(),
         }
@@ -503,6 +440,42 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
         return scores[:, :num_candidates].clamp(0.0, 1.0)
 
     @staticmethod
+    def _as_bk_valid(value: Any, masks: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        batch_size, num_candidates = masks.shape[:2]
+        if value is None:
+            return torch.ones((batch_size, num_candidates), device=ref.device, dtype=torch.bool)
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(value, device=ref.device)
+        valid = value.detach().to(device=ref.device, dtype=torch.bool)
+        if valid.dim() == 0:
+            valid = valid.reshape(1, 1).expand(batch_size, num_candidates)
+        elif valid.dim() == 1:
+            if valid.numel() == num_candidates:
+                valid = valid.reshape(1, num_candidates).expand(batch_size, -1)
+            elif valid.numel() == batch_size:
+                valid = valid.reshape(batch_size, 1).expand(-1, num_candidates)
+            else:
+                raise SAMInferenceError(
+                    "valid_candidates has incompatible length {} for [{},{}]".format(
+                        valid.numel(), batch_size, num_candidates
+                    )
+                )
+        else:
+            valid = valid.reshape(valid.size(0), -1)
+        if valid.size(0) != batch_size:
+            if valid.size(0) == 1:
+                valid = valid.expand(batch_size, -1)
+            else:
+                raise SAMInferenceError(
+                    "valid_candidates batch {} does not match {}".format(valid.size(0), batch_size)
+                )
+        if valid.size(1) != num_candidates:
+            raise SAMInferenceError(
+                "valid_candidates count {} does not match {}".format(valid.size(1), num_candidates)
+            )
+        return valid
+
+    @staticmethod
     def _empty_points(ref: torch.Tensor) -> List[torch.Tensor]:
         return [ref.new_zeros((0, 2), dtype=torch.float32) for _ in range(ref.size(0))]
 
@@ -544,30 +517,31 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
     def _build_ablation_policy(self) -> SVBAblationPolicy:
         mode = self._normalize_ablation_mode(self._cfg("svb_ablation_mode"))
         if mode == "off":
-            return SVBAblationPolicy(mode, False, False, False, False, False, False, False)
+            return SVBAblationPolicy(mode, False, False, False, False, False, False)
         if mode == "teacher_sam_full":
-            return SVBAblationPolicy(mode, True, False, False, False, False, False, True)
+            return SVBAblationPolicy(mode, True, False, False, False, False, True)
         if mode == "boundary_only":
-            return SVBAblationPolicy(mode, True, True, False, False, False, False, False)
+            return SVBAblationPolicy(mode, True, True, False, False, False, False)
         if mode == "cbm_points":
-            return SVBAblationPolicy(mode, True, True, True, False, False, False, False)
+            return SVBAblationPolicy(mode, True, True, True, False, False, False)
         if mode == "reliability":
-            return SVBAblationPolicy(mode, True, True, True, True, False, False, False)
-        if mode == "prompt_expert":
-            return SVBAblationPolicy(mode, True, True, True, True, True, False, False)
+            return SVBAblationPolicy(mode, True, True, True, True, False, False)
         if mode == "conformal":
-            return SVBAblationPolicy(mode, True, True, True, True, False, True, False)
-        return SVBAblationPolicy("full", True, True, True, True, True, True, False)
+            return SVBAblationPolicy(mode, True, True, True, True, True, False)
+        return SVBAblationPolicy("full", True, True, True, True, True, False)
 
     def _normalize_ablation_mode(self, value) -> str:
         mode = str(value or "full").strip().lower()
+        if mode == "prompt_expert":
+            raise ValueError(
+                "svb_ablation_mode='prompt_expert' has been removed; use 'full' for single-prompt refinement"
+            )
         valid = {
             "off",
             "teacher_sam_full",
             "boundary_only",
             "cbm_points",
             "reliability",
-            "prompt_expert",
             "conformal",
             "full",
         }
@@ -575,6 +549,9 @@ class SAMVerifiedBoundaryPseudoLabelRefinement(nn.Module):
             self._warn("[SVB-PLR] unknown svb_ablation_mode='{}'; falling back to full.".format(mode))
             return "full"
         return mode
+
+    def _cache_prompt_mode(self) -> str:
+        return "{}_{}".format(self.ablation_mode, self.SINGLE_PROMPT_CACHE_VERSION)
 
     def _config_overlay(self, **overrides):
         return _ConfigOverlay(self.cfg, overrides)

@@ -18,6 +18,7 @@ from utils.solver_logging import (
     log_training_progress,
     record_cbm_aux,
     record_svb_aux,
+    should_log_training_progress,
 )
 from CBM.config.schedule import cbm_should_rebuild_memory, cbm_stage_epoch, cbm_stage_id, cbm_stage_name, cbm_unlabeled_enabled
 from CBM.diagnostics.visualization import save_pfi_binary_visualizations_v42
@@ -208,7 +209,7 @@ class SemiSupervisedTrainer:
                 self.logger,
                 self.svb_plr,
                 "[SVB-PLR] conformal state restored",
-                log_enabled=self._logging_enabled(),
+                log_enabled=self._module_logging_enabled(),
             )
         except Exception as exc:
             self._svb_conformal_state_loaded = True
@@ -395,7 +396,7 @@ class SemiSupervisedTrainer:
             cbm_aux,
             branch_name,
             logger=self.logger,
-            log_enabled=self._should_log(),
+            log_enabled=self._should_log_module(),
         )
         self._maybe_save_cbm_visualizations(cbm_aux, batch, branch_name)
 
@@ -475,6 +476,8 @@ class SemiSupervisedTrainer:
             self.pix_loss.lambdas_pix_last['iou'] *= 0.5
 
         for batch_idx, (sup_batch, unsup_batch) in enumerate(zip(self.labeled_dataloader, self.unlabeled_dataloader)):
+            log_base_progress = should_log_training_progress(batch_idx)
+            log_module_progress = self._should_log_module()
             if self.writer and (not self.config.distributed_train or get_rank() == 0):
                 if batch_idx < 25:
                     self.writer.add_image(
@@ -492,7 +495,7 @@ class SemiSupervisedTrainer:
                 enable_cbm_loss=enable_labeled_cbm_loss,
                 branch_name="Sup",
             )
-            if self._should_log():
+            if log_base_progress or log_module_progress:
                 log_training_progress(
                     logger=self.logger,
                     loss_dict=self.loss_dict,
@@ -504,6 +507,8 @@ class SemiSupervisedTrainer:
                     num_batches=len(self.labeled_dataloader),
                     step=self.global_step,
                     distributed_train=self.config.distributed_train,
+                    log_base=log_base_progress,
+                    log_modules=log_module_progress,
                 )
 
             if enable_unsup:
@@ -570,10 +575,10 @@ class SemiSupervisedTrainer:
                         p_ref,
                         conf_ref,
                         logger=self.logger,
-                        log_enabled=self._should_log(),
+                        log_enabled=log_module_progress,
                     )
 
-                if self._should_log():
+                if log_base_progress or log_module_progress:
                     log_training_progress(
                         logger=self.logger,
                         loss_dict=self.loss_dict,
@@ -585,8 +590,9 @@ class SemiSupervisedTrainer:
                         num_batches=len(self.unlabeled_dataloader),
                         step=self.global_step,
                         distributed_train=self.config.distributed_train,
-                        include_cbm_losses=False,
                         progress_label="Unsueprvised Training",
+                        log_base=log_base_progress,
+                        log_modules=log_module_progress,
                     )
 
             self.global_step += 1
@@ -618,7 +624,7 @@ class SemiSupervisedTrainer:
             self.cbm.state.stage_epoch = stage_epoch
             self.cbm.state.stage_name = stage_name
             self.cbm.state.memory_ready = self.cbm.memory.is_ready()
-            self._log_info(self.cbm.memory.diagnostic_string())
+            self._log_module_info(self.cbm.memory.diagnostic_string())
         ready = self.cbm.memory.is_ready()
         failed = getattr(self.cbm.state, "memory_build_failed", False)
         error = getattr(self.cbm.state, "memory_build_error", None)
@@ -628,7 +634,7 @@ class SemiSupervisedTrainer:
         )
         if error:
             info += f", fallback_reason={error}"
-        self._log_info(info)
+        self._log_module_info(info)
 
     def _sv_ume_logical_epoch(self, epoch):
         if self.sv_ume_manager is None:
@@ -806,8 +812,8 @@ class SemiSupervisedTrainer:
         return objects[0]
 
     def _log_sv_ume(self, message):
-        if self._is_main_process() and self._logging_enabled():
-            self._log_info(message)
+        if self._is_main_process() and self._module_logging_enabled():
+            self._log_module_info(message)
 
     def _prepare_svb_epoch(self, epoch):
         if self.svb_plr is None:
@@ -844,7 +850,7 @@ class SemiSupervisedTrainer:
                 self.logger,
                 self.svb_plr,
                 "[SVB-PLR] conformal calibrator state",
-                log_enabled=self._logging_enabled(),
+                log_enabled=self._module_logging_enabled(),
             )
         except Exception as exc:
             self._log_svb_info("[SVB-PLR] conformal calibrator fit skipped: {}".format(exc))
@@ -951,21 +957,21 @@ class SemiSupervisedTrainer:
             branch_name=branch_name,
         )
 
-    def _log_info(self, message):
-        if self._logging_enabled():
+    def _log_module_info(self, message):
+        if self._module_logging_enabled():
             log_info(self.logger, message)
 
-    def _logging_enabled(self):
+    def _module_logging_enabled(self):
         return log_enabled(self.config)
 
-    def _should_log(self, step=None):
+    def _should_log_module(self, step=None):
         if step is None:
             step = getattr(self, "global_step", None)
         return should_log(self.config, step)
 
     def _log_svb_info(self, message):
-        if self._logging_enabled():
-            self._log_info(message)
+        if self._module_logging_enabled():
+            self._log_module_info(message)
 
     def _should_evaluate_epoch(self, epoch):
         eval_start = int(getattr(self.config, "eval_epoch", 0))

@@ -25,7 +25,7 @@ def _generalised_geodesic2d(image_pt, mask, v, lamb, iterations):
 
 def prepare_image(image, transform, device):
     image = transform.apply_image(image)
-    image = torch.as_tensor(image, device=device) 
+    image = torch.as_tensor(image, device=device, dtype=torch.float32)
     return image.permute(2, 0, 1).contiguous()
 
 def gaussian_2d(shape, gamma_x=1, gamma_y=1):
