@@ -2,16 +2,16 @@ import os
 
 # Reuse the finetune-27 CBM-PFI run config first, then override only the
 # experiment output path and SVB-PLR / SV-UME switches below.
-with open(os.path.join("config", "finetune_27_cbm.py"), "r", encoding="utf-8") as _base_cfg:
+with open(os.path.join("config", "runs","finetune_27_cbm.py"), "r", encoding="utf-8") as _base_cfg:
     exec(_base_cfg.read())
 del _base_cfg
 
 
 # experiment settings
-ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM_SAM_ume__plr/CBM-PFI/works/fuuu"
+ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM_SAM_ume__plr/CBM-PFI/works/full_model"
 pred_save_root = ckpt_dir.rstrip("/\\") + "/training_preds"
 
-load_all = False
+load_all = True
 
 
 # learning-rate schedule
@@ -216,9 +216,9 @@ cache_prompt_debug = False
 
 # Frozen SAM image-encoder embeddings are teacher-independent.  Keep a small
 # CPU LRU and a bounded persistent disk layer for exact augmented-image views.
-use_sam_embedding_cache = True
+use_sam_embedding_cache = False
 sam_image_embedding_cache_size = 64
-sam_embedding_cache_disk = True
+sam_embedding_cache_disk = False
 sam_embedding_cache_dir = "./cache/sam_image_embeddings/sam2.1_hiera_large"
 sam_embedding_cache_max_gb = 32
 sam_embedding_cache_store_dtype = "float16"
