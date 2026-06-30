@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from CBM.boundary.query import build_pred_boundary
 from CBM.config.defaults import apply_cbm_defaults
+from CBM.config.labeled_memory import resolve_labeled_memory_profile
 from CBM.config.schedule import cbm_enabled_for_epoch, cbm_stage_epoch, cbm_stage_name
 from CBM.context.aggregator import ContextualBoundaryAggregator
 from CBM.core.outputs import build_fallback_aux, build_used_aux
@@ -39,11 +40,14 @@ class CBMPFIEngine(nn.Module):
         self.device = _normalize_device(device)
         self.logger = logger
         self.state = CBMState()
+        self.labeled_memory_profile = resolve_labeled_memory_profile(self.config)
+        setattr(self.config, "cbm_top_img_k", int(self.labeled_memory_profile.top_img_k))
         self.memory = DenseBoundaryMemory(
             mem_dim=int(getattr(self.config, "cbm_memory_dim", 128)),
             value_dim=int(getattr(self.config, "cbm_value_dim", 8)),
+            selection_config=self.labeled_memory_profile,
         )
-        self.builder = LabeledMemoryBuilder(self.memory, logger=logger)
+        self.builder = LabeledMemoryBuilder(self.memory, config=self.config, logger=logger)
 
         self.router: Optional[GlobalMemoryRouter] = None
         self.retriever: Optional[PointwiseBoundaryRetriever] = None
@@ -138,7 +142,7 @@ class CBMPFIEngine(nn.Module):
             top_img_ids, img_scores = self.router(
                 x3,
                 self.memory,
-                top_img_k=int(getattr(self.config, "cbm_top_img_k", 8)),
+                top_img_k=int(self.labeled_memory_profile.top_img_k),
             )
             K_mem, V_mem, meta = self.memory.get_sub_memory(top_img_ids, device=p3.device, dtype=p3.dtype)
             retrieval = self.retriever(
@@ -332,7 +336,7 @@ class CBMPFIEngine(nn.Module):
             self.router = GlobalMemoryRouter(
                 x3_channels=int(x3_channels),
                 memory_dim=int(getattr(self.config, "cbm_memory_dim", 128)),
-                top_img_k=int(getattr(self.config, "cbm_top_img_k", 8)),
+                top_img_k=int(self.labeled_memory_profile.top_img_k),
             )
             self._x3_channels = int(x3_channels)
         if (self.retriever is not None or self.correction is not None) and self._p3_channels != int(p3_channels):

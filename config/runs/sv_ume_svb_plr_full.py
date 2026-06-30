@@ -13,7 +13,7 @@ pred_save_root = ckpt_dir.rstrip("/\\") + "/training_preds"
 
 load_all = False
 
-# CBM / SVB-PLR / SV-UME logging only; baseline progress remains every 20 batches
+# Global CBM / SVB-PLR / SV-UME logging
 log_enable = True
 log_interval = 20
 
@@ -30,7 +30,7 @@ sam_refine_interval = 1
 # Disabled by default so existing CBM-PFI and SVB-PLR behavior is unchanged.
 
 # Main
-use_sv_ume = False
+use_sv_ume = True
 sv_ume_require_svb_plr = True
 
 # Stage

@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
 from utils.log_control import log_enabled
 
 
@@ -14,6 +14,89 @@ def collect_visualization_tensors(aux):
     aux = aux or {}
     keys = ("prob3", "B_query", "boundary_mask", "Y_map", "U_map", "cons_map", "gate3", "z_mem3", "p_main", "p_final")
     return {key: aux[key] for key in keys if aux.get(key) is not None}
+
+
+def save_memory_selection_visualizations(memory, snapshots, epoch: int, split, config) -> List[str]:
+    """Save seven-panel diagnostics for labeled core-memory selection."""
+    base_dir = getattr(config, "cbm_memory_vis_dir", None)
+    if not base_dir:
+        base_dir = os.path.join(str(getattr(config, "ckpt_dir", ".")), "cbm_memory_selection_vis")
+    split_name = _safe_name(split if split is not None else "manual")
+    output_dir = os.path.join(base_dir, split_name, f"epoch_{int(epoch):03d}")
+    os.makedirs(output_dir, exist_ok=True)
+    saved = []
+    region_colors = {
+        "fg_core": (0, 200, 0),
+        "fg_boundary": (255, 0, 0),
+        "bg_near": (255, 215, 0),
+        "bg_far": (0, 100, 255),
+    }
+    for image_id in sorted(snapshots):
+        image_tensor, gt_tensor = snapshots[image_id]
+        image = _denormalize_input_image(image_tensor)
+        gt = _mask_to_rgb(gt_tensor, image.size)
+        panels = [("original", image), ("GT", gt)]
+        for region in ("fg_core", "fg_boundary", "bg_near", "bg_far"):
+            panels.append(
+                (region, _memory_token_overlay(image, memory.meta.get(region, []), image_id, region_colors))
+            )
+        all_meta = []
+        for region in ("fg_core", "fg_boundary", "bg_near", "bg_far"):
+            all_meta.extend(memory.meta.get(region, []))
+        panels.append(("all", _memory_token_overlay(image, all_meta, image_id, region_colors)))
+        canvas = _compose_labeled_panels(panels)
+        path = os.path.join(output_dir, f"{_safe_name(image_id)}.png")
+        canvas.save(path)
+        saved.append(path)
+    return saved
+
+
+def _denormalize_input_image(value: torch.Tensor) -> Image.Image:
+    value = value.detach().cpu().float()
+    if value.dim() == 4:
+        value = value[0]
+    if value.dim() != 3:
+        raise ValueError(f"memory visualization image must be CHW, got {tuple(value.shape)}")
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    value = (value[:3] * std + mean).clamp(0.0, 1.0)
+    array = (value.permute(1, 2, 0).numpy() * 255.0).round().astype("uint8")
+    return Image.fromarray(array, mode="RGB")
+
+
+def _mask_to_rgb(value: torch.Tensor, size) -> Image.Image:
+    value = value.detach().cpu().float().squeeze()
+    array = (value.clamp(0.0, 1.0).numpy() * 255.0).round().astype("uint8")
+    return Image.fromarray(array, mode="L").resize(size, resample=Image.Resampling.NEAREST).convert("RGB")
+
+
+def _memory_token_overlay(image: Image.Image, metas, image_id: str, colors) -> Image.Image:
+    overlay = image.copy()
+    draw = ImageDraw.Draw(overlay)
+    for item in metas:
+        if str(item.get("image_id")) != str(image_id):
+            continue
+        height = max(1, int(item.get("height", 1)))
+        width = max(1, int(item.get("width", 1)))
+        h, w = item.get("coord", (0, 0))
+        x = (float(w) + 0.5) * overlay.width / width
+        y = (float(h) + 0.5) * overlay.height / height
+        radius = max(2, int(round(min(overlay.size) / 160)))
+        color = colors.get(str(item.get("region")), (255, 255, 255))
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color, outline=(0, 0, 0))
+    return overlay
+
+
+def _compose_labeled_panels(panels) -> Image.Image:
+    width, height = panels[0][1].size
+    header = 24
+    canvas = Image.new("RGB", (width * len(panels), height + header), color=(255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    for index, (label, panel) in enumerate(panels):
+        x = index * width
+        canvas.paste(panel, (x, header))
+        draw.text((x + 4, 4), str(label), fill=(0, 0, 0))
+    return canvas
 
 
 def save_pfi_binary_visualizations_v42(

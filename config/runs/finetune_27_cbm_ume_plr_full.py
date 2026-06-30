@@ -2,7 +2,7 @@ import os
 
 # Reuse the finetune-27 CBM-PFI run config first, then override only the
 # experiment output path and SVB-PLR / SV-UME switches below.
-with open(os.path.join("config", "runs", "finetune_27_cbm.py"), "r", encoding="utf-8") as _base_cfg:
+with open(os.path.join("config", "finetune_27_cbm.py"), "r", encoding="utf-8") as _base_cfg:
     exec(_base_cfg.read())
 del _base_cfg
 
@@ -12,6 +12,18 @@ ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM_SAM_ume__plr/CBM-PFI_ume_plr/works/fuuu
 pred_save_root = ckpt_dir.rstrip("/\\") + "/training_preds"
 
 load_all = False
+
+
+# learning-rate schedule
+# Cosine is the aggressive default; multistep remains as a fallback if needed.
+optimizer = "AdamW"
+lr = 1e-4
+scheduler_type = "cosine"
+scheduler_warmup_epochs = 1
+scheduler_warmup_start_factor = 0.2
+scheduler_t_max = 15 + 1
+scheduler_eta_min = 1e-5
+
 
 # CBM / SVB-PLR / SV-UME logging only; baseline progress remains every 20 batches
 log_enable = True
