@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -802,6 +803,52 @@ def _local_diversity_map(
     return output, finite
 
 
+TOKEN_SCORE_MODES = ("product", "geometric_mean", "weighted_sum")
+TOKEN_FACTOR_NAMES = (
+    "r_teacher",
+    "r_sam",
+    "r_cbm",
+    "r_context",
+    "r_density",
+    "r_temporal",
+    "r_diversity_local",
+)
+TOKEN_WEIGHTED_SUM_WEIGHTS = (0.20, 0.20, 0.20, 0.15, 0.15, 0.05, 0.05)
+
+
+def combine_token_reliability(
+    components: Mapping[str, torch.Tensor],
+    score_mode: str = "product",
+    eps: float = 1.0e-6,
+) -> torch.Tensor:
+    """Combine the seven reliability factors with an explicit scoring mode."""
+    mode = str(score_mode).strip().lower()
+    if mode not in TOKEN_SCORE_MODES:
+        raise ValueError(f"score_mode must be one of {TOKEN_SCORE_MODES}, got {score_mode!r}")
+    missing = [name for name in TOKEN_FACTOR_NAMES if name not in components]
+    if missing:
+        raise KeyError(f"token reliability components are missing: {missing}")
+    eps = float(eps)
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError("eps must be finite and positive")
+    factors = [components[name].clamp(0.0, 1.0) for name in TOKEN_FACTOR_NAMES]
+    reference_shape = tuple(factors[0].shape)
+    if any(tuple(value.shape) != reference_shape for value in factors[1:]):
+        raise ValueError("token reliability components must have identical shapes")
+    if mode == "product":
+        score = torch.ones_like(factors[0])
+        for value in factors:
+            score = score * value
+    elif mode == "geometric_mean":
+        stacked = torch.stack([value.clamp_min(eps) for value in factors], dim=0)
+        score = torch.exp(torch.log(stacked).mean(dim=0))
+    else:
+        score = torch.zeros_like(factors[0])
+        for weight, value in zip(TOKEN_WEIGHTED_SUM_WEIGHTS, factors):
+            score = score + float(weight) * value
+    return score.clamp(0.0, 1.0)
+
+
 @torch.no_grad()
 def compute_token_reliability(
     p_raw: torch.Tensor,
@@ -815,14 +862,23 @@ def compute_token_reliability(
     thresholds: Optional[Mapping[str, float]] = None,
     density_k: int = 16,
     cbm_logit_scale: float = DEFAULT_CBM_LOGIT_SCALE,
+    score_mode: str = "product",
+    context_floor: float = 0.30,
+    non_boundary_context: float = 0.80,
 ) -> Dict[str, Any]:
-    """Compute the seven-factor reliability product for every p3 token."""
+    """Compute configurable seven-factor reliability for every p3 token."""
 
     if int(density_k) <= 0:
         raise ValueError("density_k must be positive")
     cbm_logit_scale = float(cbm_logit_scale)
     if not bool(torch.isfinite(torch.tensor(cbm_logit_scale))) or cbm_logit_scale <= 0.0:
         raise ValueError("cbm_logit_scale must be finite and positive")
+    context_floor = float(context_floor)
+    non_boundary_context = float(non_boundary_context)
+    if not 0.0 <= context_floor <= 1.0:
+        raise ValueError("context_floor must be in [0, 1]")
+    if not 0.0 <= non_boundary_context <= 1.0:
+        raise ValueError("non_boundary_context must be in [0, 1]")
     token_thresholds = _merge_numeric_mapping(
         DEFAULT_TOKEN_THRESHOLDS, thresholds, "token thresholds", maximum=1.0
     )
@@ -846,8 +902,16 @@ def compute_token_reliability(
         region_density = _density_map(p3, pack["regions"][region], keys, int(density_k))
         r_density = torch.where(mask, region_density, r_density)
 
-    evidence_batch = evidence["evidence_valid"].reshape(-1, 1, 1, 1).to(dtype=reference.dtype)
-    r_context = evidence["cons_map"] * evidence["valid_map"] * evidence_batch
+    boundary_mask = (
+        (pack["regions"]["fg_boundary"] > 0.5)
+        | (pack["regions"]["bg_near"] > 0.5)
+    )
+    boundary_context = context_floor + (1.0 - context_floor) * evidence["cons_map"].clamp(0.0, 1.0)
+    r_context = torch.where(
+        boundary_mask,
+        boundary_context,
+        torch.full_like(reference, non_boundary_context),
+    )
 
     if p_ref_previous is None:
         r_temporal = torch.ones_like(reference)
@@ -861,15 +925,16 @@ def compute_token_reliability(
         temporal_source = "previous_p_ref"
 
     r_diversity, diversity_finite = _local_diversity_map(r_diversity_local, pack)
-    score = (
-        r_teacher
-        * r_sam
-        * r_cbm
-        * r_context
-        * r_density
-        * r_temporal
-        * r_diversity
-    ).clamp(0.0, 1.0)
+    components = {
+        "r_teacher": r_teacher,
+        "r_sam": r_sam,
+        "r_cbm": r_cbm,
+        "r_context": r_context,
+        "r_density": r_density,
+        "r_temporal": r_temporal,
+        "r_diversity_local": r_diversity,
+    }
+    score = combine_token_reliability(components, score_mode=score_mode)
 
     batch_valid = (
         pack["input_valid"]
@@ -884,30 +949,25 @@ def compute_token_reliability(
     batch_valid_map = batch_valid.reshape(-1, 1, 1, 1)
     allowed: Dict[str, torch.Tensor] = {}
     for region in REGION_NAMES:
-        allowed[region] = (
+        valid = (
             (pack["regions"][region] > 0.5)
             & structural_valid
-            & cbm_valid
             & batch_valid_map
-            & (score > token_thresholds[region])
-        ).detach()
+        )
+        if region in ("fg_boundary", "bg_near"):
+            valid = valid & cbm_valid
+        allowed[region] = (valid & (score > token_thresholds[region])).detach()
 
-    components = {
-        "r_teacher": r_teacher.detach(),
-        "r_sam": r_sam.detach(),
-        "r_cbm": r_cbm.detach(),
-        "r_context": r_context.detach(),
-        "r_density": r_density.detach(),
-        "r_temporal": r_temporal.detach(),
-        "r_diversity_local": r_diversity.detach(),
-    }
     return {
         "score": score.detach(),
-        "components": components,
+        "components": {name: value.detach() for name, value in components.items()},
         "allow": allowed,
         "structural_valid": structural_valid.detach(),
+        "cbm_valid": cbm_valid.detach(),
+        "batch_valid_map": batch_valid_map.detach(),
         "evidence_valid": batch_valid.detach(),
         "thresholds": dict(token_thresholds),
+        "score_mode": str(score_mode).strip().lower(),
         "memory_counts": memory_counts,
         "cbm_logit_scale": cbm_logit_scale,
         "temporal_source": temporal_source,
@@ -920,6 +980,10 @@ __all__ = [
     "DEFAULT_REGION_THRESHOLDS",
     "DEFAULT_TOKEN_THRESHOLDS",
     "DEFAULT_CBM_LOGIT_SCALE",
+    "TOKEN_SCORE_MODES",
+    "TOKEN_FACTOR_NAMES",
+    "TOKEN_WEIGHTED_SUM_WEIGHTS",
+    "combine_token_reliability",
     "parse_cbm_evidence",
     "compute_global_type_metadata",
     "compute_image_consistency",

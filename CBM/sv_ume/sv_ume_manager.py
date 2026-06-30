@@ -12,6 +12,7 @@ import torch
 from CBM.memory.labels import REGION_NAMES
 from CBM.sv_ume.schedules import (
     can_use_lagged_memory,
+    expected_unlabeled_source_epoch,
     should_build_after_epoch,
     sv_ume_enabled,
 )
@@ -117,6 +118,7 @@ class SVUMEManager:
         )
         memory = self.U_prev if usable else None
         source_epoch = self._u_prev_epoch if self.U_prev is not None else None
+        expected_epoch = expected_unlabeled_source_epoch(self.cfg, current_epoch)
         self.last_used_u_prev_epoch = source_epoch if usable else None
         self.epoch_stats.update(
             {
@@ -126,8 +128,13 @@ class SVUMEManager:
             }
         )
         self._info(
-            f"[SV-UME] epoch={current_epoch} "
-            f"U_prev={'ready' if usable else 'none'} source_epoch={source_epoch}"
+            f"[SV-UME][schedule] current_epoch={current_epoch} "
+            f"start_epoch={int(getattr(self.cfg, 'sv_ume_start_epoch', 21))} "
+            f"expected_U_prev_epoch={expected_epoch} actual_U_prev_epoch={source_epoch} "
+            f"can_use={usable} "
+            f"should_build={should_build_after_epoch(self.cfg, current_epoch)} "
+            f"build_after_epoch={bool(getattr(self.cfg, 'build_unlabeled_memory_after_epoch', True))} "
+            f"current_epoch_use={bool(getattr(self.cfg, 'use_unlabeled_memory_during_current_epoch', False))}"
         )
         return memory
 
@@ -179,6 +186,9 @@ class SVUMEManager:
                     device=device,
                 )
                 self._append_batch_candidates(batch_candidates)
+                self._accumulate_candidate_diagnostics(
+                    getattr(self.candidate_builder, "last_result", None)
+                )
         except Exception as exc:
             self.clear_candidate_pool()
             self.U_next = None
@@ -195,6 +205,17 @@ class SVUMEManager:
         self._info(
             f"[SV-UME] epoch={current_epoch} candidates="
             f"{self.epoch_stats['candidate_counts']}"
+        )
+        self._info(f"[SV-UME][reject] epoch={current_epoch} {self.epoch_stats['rejected']}")
+        self._info(
+            f"[SV-UME][stats] epoch={current_epoch} "
+            f"region_pixel_counts={self.epoch_stats['region_pixel_counts']} "
+            f"region_image_counts={self.epoch_stats['region_image_counts']} "
+            f"image_score={self.epoch_stats['image_score']} "
+            f"region_score_mean={self.epoch_stats['region_score_mean']} "
+            f"token_score={self.epoch_stats['token_score_quantiles']} "
+            f"cbm_valid_ratio={self.epoch_stats['cbm_valid_ratio']} "
+            f"global_type_counts={self.epoch_stats['global_type_counts']}"
         )
         return self.epoch_stats
 
@@ -326,7 +347,7 @@ class SVUMEManager:
             raise ValueError(f"unsupported SVUMEManager state version: {version}")
 
         raw_stats = state.get("epoch_stats", {})
-        self.epoch_stats = dict(raw_stats) if isinstance(raw_stats, Mapping) else {}
+        self.epoch_stats = self._restore_epoch_stats(raw_stats)
         raw_config = state.get("config_snapshot", {})
         self.loaded_config_snapshot = (
             copy.deepcopy(dict(raw_config)) if isinstance(raw_config, Mapping) else {}
@@ -400,6 +421,14 @@ class SVUMEManager:
         return self
 
     def _validate_enabled_config(self) -> None:
+        for name, default in (
+            ("use_aux_evidence_fusion", True),
+            ("use_aux_feature_fusion", True),
+            ("use_aux_source_penalty", False),
+            ("allow_aux_dominate", True),
+        ):
+            if not isinstance(getattr(self.cfg, name, default), bool):
+                raise TypeError(f"{name} must be a bool")
         checks = (
             (
                 not bool(getattr(self.cfg, "sv_ume_require_svb_plr", True))
@@ -448,25 +477,9 @@ class SVUMEManager:
                 "use_aux_evidence_fusion must be True",
             ),
             (
-                bool(getattr(self.cfg, "use_aux_feature_fusion", True)),
-                "use_aux_feature_fusion must be True",
-            ),
-            (
                 str(getattr(self.cfg, "aux_fusion_mode", ""))
                 == "quality_adaptive_symmetric",
                 "aux_fusion_mode must be 'quality_adaptive_symmetric'",
-            ),
-            (
-                math.isclose(float(getattr(self.cfg, "gamma_max_final", 1.0)), 1.0),
-                "gamma_max_final must be 1.0",
-            ),
-            (
-                not bool(getattr(self.cfg, "use_aux_source_penalty", False)),
-                "use_aux_source_penalty must be False",
-            ),
-            (
-                bool(getattr(self.cfg, "allow_aux_dominate", True)),
-                "allow_aux_dominate must be True",
             ),
             (
                 not bool(getattr(self.cfg, "use_fixed_matched_novel_ratio", False)),
@@ -480,6 +493,18 @@ class SVUMEManager:
         start_epoch = int(getattr(self.cfg, "sv_ume_start_epoch", 21))
         if start_epoch < 0:
             raise ValueError("sv_ume_start_epoch must be non-negative")
+        raw_gamma_max = getattr(self.cfg, "gamma_max_final", 1.0)
+        if isinstance(raw_gamma_max, bool):
+            raise TypeError("gamma_max_final must be numeric, not bool")
+        gamma_max = float(raw_gamma_max)
+        if not math.isfinite(gamma_max) or not 0.0 <= gamma_max <= 1.0:
+            raise ValueError("gamma_max_final must be finite and in [0, 1]")
+        raw_source_penalty = getattr(self.cfg, "aux_source_penalty_value", 0.0)
+        if isinstance(raw_source_penalty, bool):
+            raise TypeError("aux_source_penalty_value must be numeric, not bool")
+        source_penalty = float(raw_source_penalty)
+        if not math.isfinite(source_penalty) or source_penalty < 0.0:
+            raise ValueError("aux_source_penalty_value must be finite and non-negative")
         total_ratio = float(getattr(self.cfg, "unlabeled_to_labeled_ratio", 1.0))
         if not 0.0 <= total_ratio <= 1.0:
             raise ValueError("unlabeled_to_labeled_ratio must be in [0, 1]")
@@ -500,6 +525,89 @@ class SVUMEManager:
         missing = [method for method in method_names if not callable(getattr(dependency, method, None))]
         if missing:
             raise TypeError(f"{name} is missing required methods: {', '.join(missing)}")
+
+    def _accumulate_candidate_diagnostics(self, result) -> None:
+        if not isinstance(result, Mapping):
+            return
+        rejected = result.get("rejected", {})
+        if isinstance(rejected, Mapping):
+            for name, value in rejected.items():
+                self.epoch_stats["rejected"][str(name)] = (
+                    int(self.epoch_stats["rejected"].get(str(name), 0)) + int(value)
+                )
+        stats = result.get("stats", {})
+        if not isinstance(stats, Mapping):
+            return
+        self.epoch_stats["diagnostic_batches"] += 1
+        batch_size = max(1, int(stats.get("batch_size", 1)))
+        image_score = self.epoch_stats["image_score"]
+        previous_count = int(image_score["count"])
+        image_score["count"] += batch_size
+        image_score["sum"] += float(stats.get("image_score_mean", 0.0)) * batch_size
+        batch_min = float(stats.get("image_score_min", 0.0))
+        batch_max = float(stats.get("image_score_max", 0.0))
+        image_score["min"] = batch_min if previous_count == 0 else min(image_score["min"], batch_min)
+        image_score["max"] = batch_max if previous_count == 0 else max(image_score["max"], batch_max)
+        image_score["mean"] = image_score["sum"] / max(image_score["count"], 1)
+        for field in (
+            "region_pixel_counts",
+            "region_image_counts",
+            "raw_candidate_counts",
+            "global_type_counts",
+        ):
+            source_name = "candidate_counts" if field == "raw_candidate_counts" else field
+            source = stats.get(source_name, {})
+            if isinstance(source, Mapping):
+                for name, value in source.items():
+                    self.epoch_stats[field][str(name)] = int(
+                        self.epoch_stats[field].get(str(name), 0)
+                    ) + int(value)
+        source_region_scores = stats.get("region_score_mean", {})
+        if isinstance(source_region_scores, Mapping):
+            for region, value in source_region_scores.items():
+                self.epoch_stats["region_score_sum"][region] += float(value) * batch_size
+        self.epoch_stats["region_score_weight"] += batch_size
+        weight = max(self.epoch_stats["region_score_weight"], 1)
+        self.epoch_stats["region_score_mean"] = {
+            region: value / weight for region, value in self.epoch_stats["region_score_sum"].items()
+        }
+        for field in ("token_score_quantiles", "token_component_quantiles"):
+            source = stats.get(field, {})
+            if isinstance(source, Mapping):
+                for name, summary in source.items():
+                    self._merge_quantile_summary(self.epoch_stats[field], str(name), summary)
+        source_ratios = stats.get("cbm_valid_ratio", {})
+        source_quantiles = stats.get("token_score_quantiles", {})
+        if isinstance(source_ratios, Mapping):
+            for region, value in source_ratios.items():
+                summary = source_quantiles.get(region, {}) if isinstance(source_quantiles, Mapping) else {}
+                count = max(0, int(summary.get("count", 0))) if isinstance(summary, Mapping) else 0
+                target = self.epoch_stats["cbm_valid_ratio"].setdefault(
+                    str(region), {"count": 0, "sum": 0.0, "mean": 0.0}
+                )
+                target["count"] += count
+                target["sum"] += float(value) * count
+                target["mean"] = target["sum"] / max(target["count"], 1)
+
+    @staticmethod
+    def _merge_quantile_summary(target: Dict[str, Any], name: str, summary) -> None:
+        if not isinstance(summary, Mapping):
+            return
+        count = max(0, int(summary.get("count", 0)))
+        current = target.setdefault(
+            name,
+            {"count": 0, "mean": 0.0, "p50": 0.0, "p90": 0.0, "p99": 0.0, "max": 0.0},
+        )
+        old_count = int(current["count"])
+        total = old_count + count
+        if total <= 0:
+            return
+        for key in ("mean", "p50", "p90", "p99"):
+            current[key] = (
+                float(current[key]) * old_count + float(summary.get(key, 0.0)) * count
+            ) / total
+        current["max"] = max(float(current["max"]), float(summary.get("max", 0.0)))
+        current["count"] = total
 
     def _append_batch_candidates(self, batch_candidates) -> None:
         if not isinstance(batch_candidates, Mapping):
@@ -967,12 +1075,47 @@ class SVUMEManager:
             "epoch": epoch,
             "status": status,
             "batches_seen": 0,
+            "diagnostic_batches": 0,
             "candidate_counts": {region: 0 for region in REGION_NAMES},
+            "raw_candidate_counts": {region: 0 for region in REGION_NAMES},
+            "rejected": {},
+            "region_pixel_counts": {region: 0 for region in REGION_NAMES},
+            "region_image_counts": {region: 0 for region in REGION_NAMES},
+            "image_score": {
+                "count": 0,
+                "sum": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "max": 0.0,
+            },
+            "region_score_sum": {region: 0.0 for region in REGION_NAMES},
+            "region_score_mean": {region: 0.0 for region in REGION_NAMES},
+            "region_score_weight": 0,
+            "token_score_quantiles": {},
+            "token_component_quantiles": {},
+            "cbm_valid_ratio": {},
+            "global_type_counts": {},
             "region_capacities": {region: 0 for region in REGION_NAMES},
             "memory_counts": {region: 0 for region in REGION_NAMES},
             "u_prev_epoch": None,
             "error": None,
         }
+
+    @classmethod
+    def _restore_epoch_stats(cls, raw_stats: Any) -> Dict[str, Any]:
+        """Merge legacy checkpoint stats into the current diagnostic schema."""
+        if not isinstance(raw_stats, Mapping):
+            return cls._new_epoch_stats(epoch=None, status="state_restored")
+        restored = cls._new_epoch_stats(
+            epoch=raw_stats.get("epoch"),
+            status=str(raw_stats.get("status", "state_restored")),
+        )
+        for name, value in raw_stats.items():
+            if isinstance(restored.get(name), dict) and isinstance(value, Mapping):
+                restored[name].update(copy.deepcopy(dict(value)))
+            else:
+                restored[name] = copy.deepcopy(value)
+        return restored
 
     def _info(self, message: str) -> None:
         if not log_enabled(self.cfg):

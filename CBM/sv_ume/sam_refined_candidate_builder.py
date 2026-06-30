@@ -14,7 +14,6 @@ from CBM.sv_ume.ume_reliability import (
     compute_image_consistency,
     compute_region_consistency,
     compute_token_reliability,
-    parse_cbm_evidence,
 )
 from CBM.sv_ume.unlabeled_dense_memory import UnlabeledMemoryToken
 from SAM.SAM_refinement.cbm_aux_adapter import build_retrieval_aux_from_cbm_aux
@@ -129,6 +128,17 @@ class SAMRefinedCandidateBuilder:
     def __init__(self, cfg, logger=None) -> None:
         self.cfg = cfg
         self.logger = logger
+        raw_regions = getattr(cfg, "sv_ume_regions", REGION_NAMES)
+        if isinstance(raw_regions, (str, bytes)) or not isinstance(raw_regions, Sequence):
+            raise TypeError("sv_ume_regions must be a non-empty sequence of region names")
+        unknown_regions = set(raw_regions) - set(REGION_NAMES)
+        if unknown_regions:
+            raise ValueError(f"sv_ume_regions contains unknown regions: {sorted(unknown_regions)}")
+        self.enabled_regions = tuple(region for region in REGION_NAMES if region in raw_regions)
+        if not self.enabled_regions:
+            raise ValueError("sv_ume_regions must enable at least one region")
+        self.score_mode = str(getattr(cfg, "sv_ume_token_score_mode", "product")).strip().lower()
+        self.diagnostics_interval = max(1, int(getattr(cfg, "sv_ume_diagnostics_interval", 20)))
         self.cbm_logit_scale = float(
             getattr(cfg, "sv_ume_cbm_logit_scale", DEFAULT_CBM_LOGIT_SCALE)
         )
@@ -162,6 +172,11 @@ class SAMRefinedCandidateBuilder:
         image_ids = self._normalize_image_ids(img_id, batch_size)
         rejected = {reason: 0 for reason in REJECTION_REASONS}
         stats = self._base_stats(batch_size, epoch, step)
+        stats["enabled_regions"] = list(self.enabled_regions)
+        stats["disabled_regions"] = [
+            region for region in REGION_NAMES if region not in self.enabled_regions
+        ]
+        stats["token_score_mode"] = self.score_mode
 
         p_sam = sam_aux.get("sam_mask") if isinstance(sam_aux, Mapping) else None
         used_sam = bool(sam_aux.get("used_sam", p_sam is not None)) if isinstance(sam_aux, Mapping) else False
@@ -170,6 +185,8 @@ class SAMRefinedCandidateBuilder:
             stats["sam_used"] = False
             result = self._result(self._empty_pools(), rejected, stats)
             self.last_result = result
+            if (step + 1) % self.diagnostics_interval == 0:
+                self._log_diagnostics(result)
             return result
 
         target_size = tuple(p3.shape[-2:])
@@ -181,7 +198,6 @@ class SAMRefinedCandidateBuilder:
             p_sam=p_sam,
             retrieval_aux=retrieval_aux,
         )
-        parsed_evidence = parse_cbm_evidence(retrieval_aux, region_pack["p_ref3"])
         previous_p_ref = self._previous_p_ref_map(
             prev_unlabeled_memory,
             image_ids,
@@ -222,6 +238,9 @@ class SAMRefinedCandidateBuilder:
             p_ref_previous=previous_p_ref,
             thresholds=tau_token,
             cbm_logit_scale=self.cbm_logit_scale,
+            score_mode=self.score_mode,
+            context_floor=float(getattr(self.cfg, "sv_ume_context_floor", 0.30)),
+            non_boundary_context=float(getattr(self.cfg, "sv_ume_non_boundary_context", 0.80)),
         )
 
         memory_dim, value_dim = self._memory_dimensions(labeled_memory)
@@ -239,20 +258,60 @@ class SAMRefinedCandidateBuilder:
         similarities = image_result["global_metadata"]["sim_max"]
         region_masks = region_pack["regions"]
         structural_valid = region_pack["valid"] > 0.5
-        cbm_valid = parsed_evidence["valid_map"] > 0.5
+        cbm_valid = token_result["cbm_valid"]
+        batch_valid_map = token_result["batch_valid_map"]
         token_components = token_result["components"]
 
         stats["sam_used"] = True
         stats["target_size"] = target_size
         stats["global_type_counts"] = dict(Counter(global_types))
+        stats["enabled_regions"] = list(self.enabled_regions)
+        stats["disabled_regions"] = [
+            region for region in REGION_NAMES if region not in self.enabled_regions
+        ]
+        stats["token_score_mode"] = token_result["score_mode"]
         stats["region_pixel_counts"] = {
             region: int((region_masks[region] > 0.5).sum().item())
             for region in REGION_NAMES
         }
+        stats["region_image_counts"] = {
+            region: int(
+                (region_masks[region] > 0.5)
+                .reshape(batch_size, -1)
+                .any(dim=1)
+                .sum()
+                .item()
+            )
+            for region in REGION_NAMES
+        }
         stats["image_score_mean"] = float(image_result["score"].mean().item())
+        stats["image_score_min"] = float(image_result["score"].min().item())
+        stats["image_score_max"] = float(image_result["score"].max().item())
         stats["region_score_mean"] = {
             region: float(region_result["score"][region].mean().item())
             for region in REGION_NAMES
+        }
+        stats["cbm_valid_ratio"] = {}
+        stats["token_score_quantiles"] = {}
+        diagnostic_mask = torch.zeros_like(structural_valid)
+        for region in self.enabled_regions:
+            region_valid = (
+                (region_masks[region] > 0.5)
+                & structural_valid
+                & batch_valid_map
+            )
+            diagnostic_mask |= region_valid
+            stats["token_score_quantiles"][region] = self._summarize_tensor(
+                token_result["score"][region_valid]
+            )
+            stats["cbm_valid_ratio"][region] = (
+                float(cbm_valid[region_valid].float().mean().item())
+                if bool(region_valid.any())
+                else 0.0
+            )
+        stats["token_component_quantiles"] = {
+            name: self._summarize_tensor(value[diagnostic_mask])
+            for name, value in token_components.items()
         }
 
         token_score_sums = {region: 0.0 for region in REGION_NAMES}
@@ -269,7 +328,7 @@ class SAMRefinedCandidateBuilder:
             nearest_id = nearest_ids[batch_index]
             similarity = float(similarities[batch_index].item())
             c_img = float(image_result["score"][batch_index].item())
-            for region in REGION_NAMES:
+            for region in self.enabled_regions:
                 mask = region_masks[region][batch_index, 0] > 0.5
                 pixel_count = int(mask.sum().item())
                 if pixel_count == 0:
@@ -289,9 +348,11 @@ class SAMRefinedCandidateBuilder:
                     if not bool(structural_valid[batch_index, 0, row, col]):
                         rejected["token_structural_invalid"] += 1
                         continue
-                    if (
-                        not bool(token_result["evidence_valid"][batch_index])
-                        or not bool(cbm_valid[batch_index, 0, row, col])
+                    if not bool(batch_valid_map[batch_index, 0, row, col]):
+                        rejected["token_cbm_invalid"] += 1
+                        continue
+                    if region in ("fg_boundary", "bg_near") and not bool(
+                        cbm_valid[batch_index, 0, row, col]
                     ):
                         rejected["token_cbm_invalid"] += 1
                         continue
@@ -380,6 +441,8 @@ class SAMRefinedCandidateBuilder:
         stats["rejected_total"] = int(sum(rejected.values()))
         result = self._result(pools, rejected, stats)
         self.last_result = result
+        if (step + 1) % self.diagnostics_interval == 0:
+            self._log_diagnostics(result)
         return result
 
     @torch.no_grad()
@@ -686,10 +749,19 @@ class SAMRefinedCandidateBuilder:
             "sam_used": False,
             "target_size": None,
             "region_pixel_counts": {region: 0 for region in REGION_NAMES},
+            "region_image_counts": {region: 0 for region in REGION_NAMES},
             "candidate_counts": {region: 0 for region in REGION_NAMES},
             "image_score_mean": 0.0,
+            "image_score_min": 0.0,
+            "image_score_max": 0.0,
             "region_score_mean": {region: 0.0 for region in REGION_NAMES},
             "token_score_mean": {region: 0.0 for region in REGION_NAMES},
+            "token_score_quantiles": {region: {} for region in REGION_NAMES},
+            "token_component_quantiles": {},
+            "cbm_valid_ratio": {region: 0.0 for region in REGION_NAMES},
+            "enabled_regions": list(REGION_NAMES),
+            "disabled_regions": [],
+            "token_score_mode": "product",
             "accepted_total": 0,
             "rejected_total": 0,
             "novel_pending_candidates": 0,
@@ -705,6 +777,60 @@ class SAMRefinedCandidateBuilder:
                 ),
             },
         }
+
+    @staticmethod
+    def _summarize_tensor(value: torch.Tensor) -> Dict[str, float]:
+        value = value.detach().float().reshape(-1)
+        value = value[torch.isfinite(value)]
+        if value.numel() == 0:
+            return {
+                "count": 0,
+                "mean": 0.0,
+                "p50": 0.0,
+                "p90": 0.0,
+                "p99": 0.0,
+                "max": 0.0,
+            }
+        quantiles = torch.quantile(
+            value,
+            torch.tensor([0.50, 0.90, 0.99], device=value.device),
+        )
+        return {
+            "count": int(value.numel()),
+            "mean": float(value.mean().item()),
+            "p50": float(quantiles[0].item()),
+            "p90": float(quantiles[1].item()),
+            "p99": float(quantiles[2].item()),
+            "max": float(value.max().item()),
+        }
+
+    def _log_diagnostics(self, result: Mapping[str, Any]) -> None:
+        if self.logger is None:
+            return
+        stats = result.get("stats", {})
+        rejected = result.get("rejected", {})
+        lines = (
+            f"[SV-UME][reject][step={stats.get('step')}] {rejected}",
+            f"[SV-UME][stats][step={stats.get('step')}] "
+            f"image_score=({stats.get('image_score_min', 0.0):.4f},"
+            f"{stats.get('image_score_mean', 0.0):.4f},"
+            f"{stats.get('image_score_max', 0.0):.4f}) "
+            f"region_pixels={stats.get('region_pixel_counts')} "
+            f"region_images={stats.get('region_image_counts')} "
+            f"region_scores={stats.get('region_score_mean')} "
+            f"cbm_valid_ratio={stats.get('cbm_valid_ratio')} "
+            f"candidate_counts={stats.get('candidate_counts')} "
+            f"enabled={stats.get('enabled_regions')} disabled={stats.get('disabled_regions')}",
+            f"[SV-UME][token][step={stats.get('step')}] "
+            f"score={stats.get('token_score_quantiles')} "
+            f"components={stats.get('token_component_quantiles')}",
+        )
+        for line in lines:
+            for name in ("info", "key_info", "success_info"):
+                log_fn = getattr(self.logger, name, None)
+                if callable(log_fn):
+                    log_fn(line)
+                    break
 
     def _result(self, pools, rejected, stats) -> Dict[str, Any]:
         stats["cbm_logit_scale"] = float(self.cbm_logit_scale)

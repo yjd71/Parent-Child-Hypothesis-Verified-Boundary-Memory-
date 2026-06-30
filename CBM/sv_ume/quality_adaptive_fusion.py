@@ -44,24 +44,36 @@ class QualityAdaptiveSourceFusion(nn.Module):
             getattr(cfg, "fusion_score_unc_weight", DEFAULT_UNC_WEIGHT),
             "fusion_score_unc_weight",
         )
-        self.use_evidence_fusion = bool(
-            getattr(cfg, "use_aux_evidence_fusion", True)
-        )
-        self.use_feature_fusion = bool(
-            getattr(cfg, "use_aux_feature_fusion", True)
-        )
-
-        if not math.isclose(
-            float(getattr(cfg, "gamma_max_final", 1.0)),
-            1.0,
-            rel_tol=0.0,
-            abs_tol=1.0e-8,
+        for name, default in (
+            ("use_aux_evidence_fusion", True),
+            ("use_aux_feature_fusion", True),
+            ("use_aux_source_penalty", False),
+            ("allow_aux_dominate", True),
         ):
-            raise ValueError("gamma_max_final must be 1.0")
-        if bool(getattr(cfg, "use_aux_source_penalty", False)):
-            raise ValueError("use_aux_source_penalty must be False")
-        if not bool(getattr(cfg, "allow_aux_dominate", True)):
-            raise ValueError("allow_aux_dominate must be True")
+            if not isinstance(getattr(cfg, name, default), bool):
+                raise TypeError(f"{name} must be a bool")
+        self.use_evidence_fusion = getattr(cfg, "use_aux_evidence_fusion", True)
+        self.use_feature_fusion = getattr(cfg, "use_aux_feature_fusion", True)
+        raw_gamma_max = getattr(cfg, "gamma_max_final", 1.0)
+        if isinstance(raw_gamma_max, bool):
+            raise TypeError("gamma_max_final must be numeric, not bool")
+        self.gamma_max_final = float(raw_gamma_max)
+        if (
+            not math.isfinite(self.gamma_max_final)
+            or not 0.0 <= self.gamma_max_final <= 1.0
+        ):
+            raise ValueError("gamma_max_final must be finite and in [0, 1]")
+        self.use_aux_source_penalty = getattr(cfg, "use_aux_source_penalty", False)
+        raw_source_penalty = getattr(cfg, "aux_source_penalty_value", 0.0)
+        if isinstance(raw_source_penalty, bool):
+            raise TypeError("aux_source_penalty_value must be numeric, not bool")
+        self.aux_source_penalty_value = float(raw_source_penalty)
+        if (
+            not math.isfinite(self.aux_source_penalty_value)
+            or self.aux_source_penalty_value < 0.0
+        ):
+            raise ValueError("aux_source_penalty_value must be finite and non-negative")
+        self.allow_aux_dominate = getattr(cfg, "allow_aux_dominate", True)
 
     def compute_score(
         self,
@@ -138,6 +150,8 @@ class QualityAdaptiveSourceFusion(nn.Module):
             self._validate_y_r_pair(y_u, r_u, "ret_u")
             self._validate_source_shapes(y_l, y_u, r_l, r_u)
             score_u = self.compute_score(ret_u, y_l)
+            if self.use_aux_source_penalty:
+                score_u = score_u - self.aux_source_penalty_value
             valid_u = self._valid_map(ret_u, y_l, "ret_u.valid_map")
             w_l, w_u = self._source_weights(
                 score_l,
@@ -219,6 +233,11 @@ class QualityAdaptiveSourceFusion(nn.Module):
             torch.where(only_u_valid, zeros, ones),
         )
         w_u = ones - w_l
+        max_aux_weight = self.gamma_max_final
+        if not self.allow_aux_dominate:
+            max_aux_weight = min(max_aux_weight, 0.5)
+        w_u = w_u.clamp(max=max_aux_weight)
+        w_l = ones - w_u
         return w_l, w_u
 
     def _source_entropy(

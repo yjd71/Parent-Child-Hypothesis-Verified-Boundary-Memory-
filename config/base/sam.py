@@ -79,6 +79,14 @@ tau_token = {
     "bg_far": 0.85,
 }
 
+# Token reliability / candidate diagnostics.  Keep legacy behavior unless a
+# run config explicitly opts into the debug or stable alternatives.
+sv_ume_token_score_mode = "product"  # product | geometric_mean | weighted_sum
+sv_ume_regions = ["fg_core", "fg_boundary", "bg_near", "bg_far"]
+sv_ume_diagnostics_interval = 20
+sv_ume_context_floor = 0.30
+sv_ume_non_boundary_context = 0.80
+
 # Diversity
 use_diversity_selection = True
 lambda_diversity = 0.2
@@ -106,6 +114,7 @@ use_aux_feature_fusion = True
 aux_fusion_mode = "quality_adaptive_symmetric"
 gamma_max_final = 1.0
 use_aux_source_penalty = False
+aux_source_penalty_value = 0.0
 allow_aux_dominate = True
 
 # Quality score weights

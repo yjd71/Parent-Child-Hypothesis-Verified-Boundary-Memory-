@@ -10,12 +10,13 @@ del _base_cfg
 # experiment settings
 ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM_SAM_ume__plr/CBM-PFI/works/sv_ume_svb_plr_full"
 pred_save_root = ckpt_dir.rstrip("/\\") + "/training_preds"
+tot_epochs = 35
 
 load_all = False
 
 # Global CBM / SVB-PLR / SV-UME logging
 log_enable = True
-log_interval = 20
+log_interval = 600
 
 # SVB-PLR main switches
 use_svb_plr = True
@@ -64,19 +65,22 @@ sample_per_image_unlabeled = {
 }
 
 # Image / region / token thresholds
-tau_image = 0.80
+tau_image = 0.50
 tau_region = {
-    "fg_core": 0.85,
-    "fg_boundary": 0.92,
-    "bg_near": 0.94,
-    "bg_far": 0.85,
+    "fg_core": 0.50,
+    "fg_boundary": 0.60,
+    "bg_near": 0.65,
+    "bg_far": 0.50,
 }
 tau_token = {
-    "fg_core": 0.85,
-    "fg_boundary": 0.92,
-    "bg_near": 0.94,
-    "bg_far": 0.85,
+    "fg_core": 0.20,
+    "fg_boundary": 0.25,
+    "bg_near": 0.30,
+    "bg_far": 0.20,
 }
+sv_ume_token_score_mode = "weighted_sum"
+sv_ume_regions = ["fg_boundary", "bg_near"]
+sv_ume_diagnostics_interval = 20
 
 # Diversity
 use_diversity_selection = True
@@ -101,11 +105,12 @@ novel_min_temporal_stability = 0.85
 # Retrieval fusion
 retrieve_labeled_and_unlabeled_separately = True
 use_aux_evidence_fusion = True
-use_aux_feature_fusion = True
+use_aux_feature_fusion = False
 aux_fusion_mode = "quality_adaptive_symmetric"
-gamma_max_final = 1.0
-use_aux_source_penalty = False
-allow_aux_dominate = True
+gamma_max_final = 0.25
+use_aux_source_penalty = True
+aux_source_penalty_value = 0.25
+allow_aux_dominate = False
 
 # Quality score weights
 fusion_score_sim_weight = 1.0
@@ -119,9 +124,9 @@ use_unlabeled_memory_ema_refresh = False
 unlabeled_memory_momentum = 0.99
 
 # Losses
-use_ume_evidence_loss = False
+use_ume_evidence_loss = True
 use_source_consistency_loss = False
-lambda_ume_evi = 0.05
+lambda_ume_evi = 0.02
 lambda_source_cons = 0.02
 source_consistency_tau = 0.70
 
@@ -139,7 +144,7 @@ sam_pseudo_threshold = 0.5
 sam_pseudo_iters = 1
 sam_pseudo_use_point = True
 sam_pseudo_use_box = True
-sam_pseudo_use_mask = True
+sam_pseudo_use_mask = False
 sam_pseudo_add_neg = True
 sam_pseudo_margin = 0.0
 sam_pseudo_gamma = 4.0
@@ -154,7 +159,7 @@ sam2_use_bfloat16 = True
 # Prompt generation
 sam_use_box_prompt = True
 sam_use_point_prompt = True
-sam_use_mask_prompt = True
+sam_use_mask_prompt = False
 sam_use_boundary_points = True
 sam_num_pos_points = 8
 sam_num_neg_points = 8
@@ -177,7 +182,7 @@ sam_gate_weight = 0.5
 sam_use_teacher_agreement = True
 sam_use_cbm_agreement = True
 sam_use_stability = True
-sam_use_conformal = True
+sam_use_conformal = False
 sam_min_reliability = 0.3
 sam_teacher_agree_weight = 0.25
 sam_cbm_agree_weight = 0.20
@@ -198,7 +203,7 @@ sam_lambda_decay = False
 # low reuse and unbounded disk growth.
 use_sam_cache = False
 use_svb_output_cache = False
-sam_cache_dir = "./cache/sam_refined_pseudo/sv_ume_svb_plr_full"
+sam_cache_dir = "./cache/sam_refined_pseudo/finetune_27_sv_ume_svb_plr_full"
 cache_refined_masks = False
 cache_prompt_debug = False
 
@@ -217,7 +222,7 @@ sam_embedding_cache_version = "sam2.1_hiera_large"
 # Visualization
 vis_sam_refinement = True
 vis_sam_refine_interval = 20
-vis_sam_refine_max_samples = 100
+vis_sam_refine_max_samples = 10
 sam_refine_vis_dir = ckpt_dir.rstrip("/\\") + "/sv_ume_svb_plr_visualization"
 
 
@@ -236,6 +241,9 @@ others = {
     "svb_plr_start_epoch": svb_plr_start_epoch,
     "sv_ume_require_svb_plr": sv_ume_require_svb_plr,
     "sv_ume_start_epoch": sv_ume_start_epoch,
+    "sv_ume_token_score_mode": sv_ume_token_score_mode,
+    "sv_ume_regions": list(sv_ume_regions),
+    "total_epoch": tot_epochs,
     "sam_backend": sam_pseudo_backend,
     "sam_start_epoch": sam_start_epoch,
     "sam_use_conformal": sam_use_conformal,
@@ -243,4 +251,5 @@ others = {
 }
 
 
-# python -m scripts.train --config config/runs/sv_ume_svb_plr_full.py
+# Resume model-28 so logical epoch 29 collects U_29 and epoch 30 can consume it.
+# python -m scripts.train --config config/runs/sv_ume_svb_plr_full.py --resume /home/zhangqing/YJD/SCOD/CBM_SAM_ume__plr/CBM-PFI/works/sv_ume_svb_plr_full/split0.05_model_28.pth

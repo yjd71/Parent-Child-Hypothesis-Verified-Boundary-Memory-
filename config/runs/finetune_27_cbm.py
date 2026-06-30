@@ -44,6 +44,7 @@ cxt = lateral_channels_in_collection[1:][::-1][-cxt_num:] if cxt_num else []
 # data settings
 load_all = True
 batch_size = 6
+batch_size_valid = 6
 data_split = [0.05]  # [0.01, 0.05, 0.1]
 
 # ⚠️ 重要：使用随机生成的索引文件
@@ -82,7 +83,7 @@ cbm_unlabeled_start_epoch = 6  # stage 3: labeled + unlabeled CBM
 cbm_memory_dim = 512
 cbm_value_dim = 8
 cbm_top_img_k = 32
-cbm_topk_token = 64
+cbm_topk_token = 128
 
 # CBM correction strength
 cbm_lambda_feat = 0.1

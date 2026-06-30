@@ -8,7 +8,7 @@ del _base_cfg
 
 
 # experiment settings
-ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM_SAM_ume__plr/CBM-PFI_ume_plr/works/fuuu"
+ckpt_dir = "/home/zhangqing/YJD/SCOD/CBM_SAM_ume__plr/CBM-PFI/works/fuuu"
 pred_save_root = ckpt_dir.rstrip("/\\") + "/training_preds"
 
 load_all = False
@@ -27,7 +27,7 @@ scheduler_eta_min = 1e-5
 
 # CBM / SVB-PLR / SV-UME logging only; baseline progress remains every 20 batches
 log_enable = True
-log_interval = 20
+log_interval = 600
 
 # SVB-PLR main switches
 use_svb_plr = True

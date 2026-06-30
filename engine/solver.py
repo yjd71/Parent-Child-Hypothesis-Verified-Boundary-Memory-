@@ -235,6 +235,7 @@ class SemiSupervisedTrainer:
         self.current_memory_t = None
         self.current_u_prev = None
         self.current_sv_ume_epoch = None
+        self._log_sv_ume_config_snapshot()
         if not bool(getattr(self.config, "use_sv_ume", False)):
             return
         if not bool(getattr(self.config, "use_svb_plr", False)):
@@ -262,6 +263,53 @@ class SemiSupervisedTrainer:
             candidate_builder=candidate_builder,
             memory_builder=self.sv_ume_memory_builder,
             logger=manager_logger,
+        )
+
+    def _log_sv_ume_config_snapshot(self):
+        cfg = self.config
+        tau_region = getattr(cfg, "tau_region", {})
+        tau_token = getattr(cfg, "tau_token", {})
+        self._log_sv_ume(
+            "[CFG][SV-UME] enabled={} start_epoch={} tot_epochs={} "
+            "lagged_use={} build_after_epoch={} current_epoch_use={} "
+            "score_mode={} regions={} image_tau={} "
+            "region_tau=({}/{}/{}/{}) token_tau=({}/{}/{}/{}) "
+            "evidence_fusion={} feature_fusion={} gamma_max={} "
+            "source_penalty={}:{} allow_aux_dominate={} "
+            "ume_evidence_loss={}:{} source_consistency={} "
+            "mask_prompt={} pseudo_mask={} embedding_cache={} disk_cache={} conformal={}".format(
+                bool(getattr(cfg, "use_sv_ume", False)),
+                int(getattr(cfg, "sv_ume_start_epoch", 21)),
+                int(getattr(cfg, "tot_epochs", 0)),
+                bool(getattr(cfg, "use_lagged_unlabeled_memory", True)),
+                bool(getattr(cfg, "build_unlabeled_memory_after_epoch", True)),
+                bool(getattr(cfg, "use_unlabeled_memory_during_current_epoch", False)),
+                getattr(cfg, "sv_ume_token_score_mode", "product"),
+                list(getattr(cfg, "sv_ume_regions", ())),
+                float(getattr(cfg, "tau_image", 0.0)),
+                float(tau_region.get("fg_core", 0.0)),
+                float(tau_region.get("fg_boundary", 0.0)),
+                float(tau_region.get("bg_near", 0.0)),
+                float(tau_region.get("bg_far", 0.0)),
+                float(tau_token.get("fg_core", 0.0)),
+                float(tau_token.get("fg_boundary", 0.0)),
+                float(tau_token.get("bg_near", 0.0)),
+                float(tau_token.get("bg_far", 0.0)),
+                bool(getattr(cfg, "use_aux_evidence_fusion", False)),
+                bool(getattr(cfg, "use_aux_feature_fusion", False)),
+                float(getattr(cfg, "gamma_max_final", 1.0)),
+                bool(getattr(cfg, "use_aux_source_penalty", False)),
+                float(getattr(cfg, "aux_source_penalty_value", 0.0)),
+                bool(getattr(cfg, "allow_aux_dominate", False)),
+                bool(getattr(cfg, "use_ume_evidence_loss", False)),
+                float(getattr(cfg, "lambda_ume_evi", 0.0)),
+                bool(getattr(cfg, "use_source_consistency_loss", False)),
+                bool(getattr(cfg, "sam_use_mask_prompt", False)),
+                bool(getattr(cfg, "sam_pseudo_use_mask", False)),
+                bool(getattr(cfg, "use_sam_embedding_cache", False)),
+                bool(getattr(cfg, "sam_embedding_cache_disk", False)),
+                bool(getattr(cfg, "sam_use_conformal", False)),
+            )
         )
 
     def _restore_sv_ume_state(self):
