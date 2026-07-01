@@ -41,7 +41,13 @@ class SAMImageEmbeddingCache:
             enabled = bool(getattr(cfg, "use_sam_embedding_cache", legacy_enabled)) if cfg is not None else True
         self.enabled = bool(enabled)
         if max_items is None:
-            max_items = getattr(cfg, "sam_image_embedding_cache_size", 128) if cfg is not None else 128
+            size_name = (
+                "sam2_image_embedding_cache_size"
+                if str(backend_tag).lower() == "sam2"
+                else "sam_image_embedding_cache_size"
+            )
+            fallback_size = getattr(cfg, "sam_image_embedding_cache_size", 128) if cfg is not None else 128
+            max_items = getattr(cfg, size_name, fallback_size) if cfg is not None else fallback_size
         self.max_items = max(1, int(max_items))
         self.backend_tag = str(backend_tag)
         self.model_tag = str(model_tag)
@@ -57,55 +63,88 @@ class SAMImageEmbeddingCache:
         max_disk_gb = float(getattr(cfg, "sam_embedding_cache_max_gb", 32.0)) if cfg is not None else 32.0
         self.max_disk_bytes = max(0, int(max_disk_gb * (1024 ** 3)))
         self.prune_interval = max(1, int(getattr(cfg, "sam_embedding_cache_prune_interval", 256))) if cfg is not None else 256
-        store_dtype = getattr(cfg, "sam_embedding_cache_store_dtype", "float16") if cfg is not None else "float16"
+        store_dtype_name = (
+            "sam2_embedding_cache_store_dtype"
+            if self.backend_tag.lower() == "sam2"
+            else "sam_embedding_cache_store_dtype"
+        )
+        fallback_store_dtype = (
+            getattr(cfg, "sam_embedding_cache_store_dtype", "float16")
+            if cfg is not None
+            else "float16"
+        )
+        store_dtype = (
+            getattr(cfg, store_dtype_name, fallback_store_dtype)
+            if cfg is not None
+            else fallback_store_dtype
+        )
         self.store_dtype = self._parse_store_dtype(store_dtype)
 
-        self._entries: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self._entries: OrderedDict[str, Any] = OrderedDict()
         self.hits = 0
         self.memory_hits = 0
         self.disk_hits = 0
         self.misses = 0
         self.disk_writes = 0
         self.disk_errors = 0
+        self.invalid_entries = 0
+        self.recomputes = 0
         self._disk_pruned_once = False
 
     def get_or_compute(
         self,
         image,
-        compute_fn: Callable[[], torch.Tensor],
+        compute_fn: Callable[[], Any],
         device=None,
         dtype=None,
         extra_tag: str = "",
-    ) -> Tuple[torch.Tensor, bool]:
-        """Return an embedding and whether it came from memory or disk cache."""
+        validator: Optional[Callable[[Any], Any]] = None,
+    ) -> Tuple[Any, bool]:
+        """Return a cached payload and whether it came from memory or disk.
+
+        Tensor payloads retain the original SAM1 behavior.  SAM2 may cache a
+        nested dict/list/tuple predictor state.  ``validator`` is executed on
+        the restored payload; invalid cached entries are deleted and encoded
+        again, while an invalid freshly encoded value is surfaced immediately.
+        """
         if not self.enabled:
-            value = self._ensure_tensor(compute_fn())
-            return self._move(value, device=device, dtype=dtype), False
+            value = self._ensure_payload(compute_fn())
+            restored = self._move(value, device=device, dtype=dtype)
+            self._validate(restored, validator)
+            return restored, False
 
         key = self.make_key(image, extra_tag=extra_tag)
         cached = self._entries.get(key)
         if cached is not None:
-            self.hits += 1
-            self.memory_hits += 1
-            self._entries.move_to_end(key)
-            return self._move(cached, device=device, dtype=dtype), True
+            restored = self._move(cached, device=device, dtype=dtype)
+            if self._is_valid(restored, validator):
+                self.hits += 1
+                self.memory_hits += 1
+                self._entries.move_to_end(key)
+                return restored, True
+            self._invalidate_cached(key)
 
         cached = self._load_disk(key) if self.disk_enabled else None
         if cached is not None:
-            self.hits += 1
-            self.disk_hits += 1
-            self._remember(key, cached)
-            return self._move(cached, device=device, dtype=dtype), True
+            restored = self._move(cached, device=device, dtype=dtype)
+            if self._is_valid(restored, validator):
+                self.hits += 1
+                self.disk_hits += 1
+                self._remember(key, cached)
+                return restored, True
+            self._invalidate_cached(key)
 
         self.misses += 1
-        value = self._ensure_tensor(compute_fn())
+        value = self._ensure_payload(compute_fn())
         stored = self._for_storage(value)
+        restored = self._move(stored, device=device, dtype=dtype)
+        self._validate(restored, validator)
         self._remember(key, stored)
         if self.disk_enabled:
             self._write_disk(key, stored)
         # Return the stored representation on the first miss as well.  When
         # fp16 storage is selected this keeps miss/hit decoder inputs identical.
-        return self._move(stored, device=device, dtype=dtype), False
+        return restored, False
 
     def make_key(self, image, extra_tag: str = "") -> str:
         array = self._as_contiguous_array(image)
@@ -116,6 +155,7 @@ class SAMImageEmbeddingCache:
                 self.backend_tag,
                 self.model_tag,
                 str(extra_tag),
+                self._store_dtype_tag(),
                 str(array.dtype),
                 str(array.shape),
                 digest,
@@ -128,6 +168,8 @@ class SAMImageEmbeddingCache:
         self.memory_hits = 0
         self.disk_hits = 0
         self.misses = 0
+        self.invalid_entries = 0
+        self.recomputes = 0
         if clear_disk and self.cache_dir.is_dir():
             for path in self.cache_dir.rglob("*.pt"):
                 try:
@@ -151,10 +193,13 @@ class SAMImageEmbeddingCache:
             "misses": self.misses,
             "disk_writes": self.disk_writes,
             "disk_errors": self.disk_errors,
+            "invalid_entries": self.invalid_entries,
+            "recomputes": self.recomputes,
+            "store_dtype": self._store_dtype_tag(),
         }
 
-    def _remember(self, key: str, value: torch.Tensor) -> None:
-        self._entries[key] = value.detach().cpu()
+    def _remember(self, key: str, value: Any) -> None:
+        self._entries[key] = self._detach_cpu(value)
         self._entries.move_to_end(key)
         while len(self._entries) > self.max_items:
             self._entries.popitem(last=False)
@@ -163,34 +208,39 @@ class SAMImageEmbeddingCache:
         digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
         return self.cache_dir / digest[:2] / "{}.pt".format(digest)
 
-    def _load_disk(self, key: str) -> Optional[torch.Tensor]:
+    def _load_disk(self, key: str) -> Optional[Any]:
         path = self._path_for_key(key)
         if not path.is_file():
             return None
         try:
             payload = self._torch_load(path)
             if not isinstance(payload, dict) or payload.get("cache_key") != key:
+                self._invalidate_disk_entry(path)
                 return None
-            value = payload.get("embedding")
-            if not torch.is_tensor(value):
+            value = payload.get("payload", payload.get("embedding"))
+            try:
+                value = self._ensure_payload(value)
+            except (TypeError, ValueError):
+                self._invalidate_disk_entry(path)
                 return None
             try:
                 path.touch()
             except OSError:
                 pass
-            return value.detach().cpu()
+            return self._detach_cpu(value)
         except Exception:
             self.disk_errors += 1
+            self._invalidate_disk_entry(path)
             return None
 
-    def _write_disk(self, key: str, value: torch.Tensor) -> None:
+    def _write_disk(self, key: str, value: Any) -> None:
         path = self._path_for_key(key)
         if path.is_file():
             return
         tmp_path = path.with_name(".{}.{}.{}.tmp".format(path.name, os.getpid(), threading.get_ident()))
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"cache_key": key, "embedding": value.detach().cpu()}, str(tmp_path))
+            torch.save({"cache_key": key, "payload": self._detach_cpu(value)}, str(tmp_path))
             os.replace(str(tmp_path), str(path))
             self.disk_writes += 1
             if not self._disk_pruned_once or self.disk_writes % self.prune_interval == 0:
@@ -229,11 +279,19 @@ class SAMImageEmbeddingCache:
         except OSError:
             self.disk_errors += 1
 
-    def _for_storage(self, value: torch.Tensor) -> torch.Tensor:
-        stored = value.detach().cpu().contiguous()
-        if self.store_dtype is not None and stored.is_floating_point():
-            stored = stored.to(dtype=self.store_dtype)
-        return stored
+    def _for_storage(self, value: Any) -> Any:
+        if torch.is_tensor(value):
+            stored = value.detach().cpu().contiguous()
+            if self.store_dtype is not None and stored.is_floating_point():
+                stored = stored.to(dtype=self.store_dtype)
+            return stored
+        if isinstance(value, dict):
+            return {key: self._for_storage(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._for_storage(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._for_storage(item) for item in value)
+        return value
 
     @staticmethod
     def _parse_store_dtype(value) -> Optional[torch.dtype]:
@@ -248,15 +306,29 @@ class SAMImageEmbeddingCache:
             return None
         raise ValueError("Unsupported sam_embedding_cache_store_dtype '{}'".format(value))
 
-    @staticmethod
-    def _ensure_tensor(value) -> torch.Tensor:
-        if not torch.is_tensor(value):
-            raise TypeError("SAM image embedding cache only supports torch.Tensor values")
-        return value.detach()
+    @classmethod
+    def _ensure_payload(cls, value) -> Any:
+        if torch.is_tensor(value):
+            return value.detach()
+        if isinstance(value, dict):
+            if not all(isinstance(key, str) for key in value):
+                raise TypeError("SAM image embedding cache dict keys must be strings")
+            return {key: cls._ensure_payload(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._ensure_payload(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._ensure_payload(item) for item in value)
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        raise TypeError(
+            "SAM image embedding cache supports tensors and nested dict/list/tuple payloads, got {}".format(
+                type(value).__name__
+            )
+        )
 
-    @staticmethod
-    def _move(value: torch.Tensor, device=None, dtype=None) -> torch.Tensor:
-        if dtype is not None and value.is_floating_point():
+    @classmethod
+    def _move(cls, value: Any, device=None, dtype=None) -> Any:
+        if torch.is_tensor(value) and dtype is not None and value.is_floating_point():
             requested_dtype = torch.empty((), dtype=dtype).dtype
             if not torch.empty((), dtype=requested_dtype).is_floating_point():
                 raise TypeError(
@@ -264,12 +336,70 @@ class SAMImageEmbeddingCache:
                         requested_dtype
                     )
                 )
-        if device is None and dtype is None:
+        if torch.is_tensor(value):
+            if device is None and dtype is None:
+                return value
+            target_dtype = dtype if dtype is not None and value.is_floating_point() else value.dtype
+            return value.to(
+                device=device if device is not None else value.device,
+                dtype=target_dtype,
+            )
+        if isinstance(value, dict):
+            return {key: cls._move(item, device=device, dtype=dtype) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._move(item, device=device, dtype=dtype) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._move(item, device=device, dtype=dtype) for item in value)
+        return value
+
+    @classmethod
+    def _detach_cpu(cls, value: Any) -> Any:
+        if torch.is_tensor(value):
+            return value.detach().cpu()
+        if isinstance(value, dict):
+            return {key: cls._detach_cpu(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._detach_cpu(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._detach_cpu(item) for item in value)
+        return value
+
+    @staticmethod
+    def _validate(value: Any, validator: Optional[Callable[[Any], Any]]) -> None:
+        if validator is None:
             return value
-        return value.to(
-            device=device if device is not None else value.device,
-            dtype=dtype if dtype is not None else value.dtype,
-        )
+        result = validator(value)
+        if result is False:
+            raise ValueError("SAM image embedding cache payload validation failed")
+
+    @classmethod
+    def _is_valid(cls, value: Any, validator: Optional[Callable[[Any], Any]]) -> bool:
+        try:
+            cls._validate(value, validator)
+            return True
+        except (TypeError, ValueError, RuntimeError, AssertionError):
+            return False
+
+    def _invalidate_cached(self, key: str) -> None:
+        self.invalid_entries += 1
+        self.recomputes += 1
+        self._entries.pop(key, None)
+        self._remove_disk_path(self._path_for_key(key))
+
+    def _invalidate_disk_entry(self, path: Path) -> None:
+        self.invalid_entries += 1
+        self.recomputes += 1
+        self._remove_disk_path(path)
+
+    def _remove_disk_path(self, path: Path) -> None:
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            self.disk_errors += 1
+
+    def _store_dtype_tag(self) -> str:
+        return str(self.store_dtype).replace("torch.", "") if self.store_dtype is not None else "native"
 
     @staticmethod
     def _as_contiguous_array(image) -> np.ndarray:

@@ -207,16 +207,18 @@ sam_cache_dir = "./cache/sam_refined_pseudo/finetune_27_sv_ume_svb_plr_full"
 cache_refined_masks = False
 cache_prompt_debug = False
 
-# Frozen SAM image-encoder embeddings are teacher-independent.  Keep a small
-# CPU LRU and a bounded persistent disk layer for exact augmented-image views.
+# Frozen SAM2 predictor states are teacher-independent.  Keep a small CPU LRU
+# and a bounded persistent disk layer for exact augmented-image views.
 use_sam_embedding_cache = True
-sam_image_embedding_cache_size = 64
+sam_image_embedding_cache_size = 64  # SAM1 compatibility
+sam2_image_embedding_cache_size = 16
 sam_embedding_cache_disk = True
 sam_embedding_cache_dir = "./cache/sam_image_embeddings/sam2.1_hiera_large"
 sam_embedding_cache_max_gb = 32
-sam_embedding_cache_store_dtype = "float16"
+sam_embedding_cache_store_dtype = "float16"  # SAM1 compatibility
+sam2_embedding_cache_store_dtype = "float32"
 sam_embedding_cache_prune_interval = 256
-sam_embedding_cache_version = "sam2.1_hiera_large"
+sam_embedding_cache_version = "sam2.1_hiera_large_state_v1_fp32"
 
 
 # Visualization

@@ -277,6 +277,9 @@ class ExistingSAMBackendAdapter(nn.Module):
         sample_logits: List[Optional[torch.Tensor]] = []
         failed: List[Tuple[int, str]] = []
         coordinate_stats: List[Dict[str, Any]] = []
+        embedding_cache_hits = 0
+        embedding_cache_misses = 0
+        embedding_stats: List[Dict[str, Any]] = []
 
         for idx, image_np in enumerate(image_np_list):
             try:
@@ -293,7 +296,22 @@ class ExistingSAMBackendAdapter(nn.Module):
                 if not any(value is not None for value in prompt_args.values()):
                     raise ValueError("empty_external_prompt")
 
-                sam2_refiner.predictor.set_image(image_np)
+                state_stats = sam2_refiner.set_image(image_np)
+                state_stats.update(
+                    {
+                        "sample_index": idx,
+                        "dtype": state_stats["feature_dtype"],
+                        "min": state_stats["feature_min"],
+                        "max": state_stats["feature_max"],
+                        "mean": state_stats["feature_mean"],
+                        "std": state_stats["feature_std"],
+                    }
+                )
+                embedding_stats.append(state_stats)
+                if state_stats["cache_hit"]:
+                    embedding_cache_hits += 1
+                else:
+                    embedding_cache_misses += 1
                 prompt_calls = self._sam2_prompt_calls(prompt_args)
                 if not prompt_calls:
                     raise ValueError("empty_external_prompt")
@@ -341,6 +359,15 @@ class ExistingSAMBackendAdapter(nn.Module):
                 "used_fallback": bool(failed),
                 "fallback_samples": failed,
                 "path": "sam2_external_prompt",
+                "embedding_cache_hits": embedding_cache_hits,
+                "embedding_cache_misses": embedding_cache_misses,
+                "embedding_cache_info": (
+                    sam2_refiner.embedding_cache.cache_info()
+                    if sam2_refiner.embedding_cache is not None
+                    else None
+                ),
+                "embedding_stats": embedding_stats,
+                **self._summarize_embedding_stats(embedding_stats),
                 "prompt_coordinate_stats": coordinate_stats,
                 **self._summarize_coordinate_stats(coordinate_stats),
             },

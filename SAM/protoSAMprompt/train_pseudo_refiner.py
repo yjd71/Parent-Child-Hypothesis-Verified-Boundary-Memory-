@@ -280,6 +280,7 @@ class Sam2PseudoLabelRefiner(_BaseSamPseudoLabelRefiner):
             device=self.device,
             multimask_output=bool(getattr(config, "sam2_multimask_output", True)),
             use_bfloat16=bool(getattr(config, "sam2_use_bfloat16", True)),
+            embedding_cache=self.embedding_cache,
         )
         self._log_init()
 
