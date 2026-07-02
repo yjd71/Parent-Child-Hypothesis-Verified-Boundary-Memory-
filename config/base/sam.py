@@ -92,6 +92,17 @@ use_diversity_selection = True
 lambda_diversity = 0.2
 spatial_nms_distance = 2
 feature_dup_sim_threshold = 0.95
+sv_ume_target_fill_ratio = 0.95
+sv_ume_relaxed_fill = False
+sv_ume_feature_nms_scope = "global"  # global | same_image
+sv_ume_relaxed_spatial_nms_distance = 1
+sv_ume_relaxed_feature_dup_sim_threshold = 0.995
+sv_ume_region_gate_relaxation = {
+    "fg_core": 0.0,
+    "fg_boundary": 0.0,
+    "bg_near": 0.0,
+    "bg_far": 0.0,
+}
 
 # Global type metadata
 use_global_type_metadata = True

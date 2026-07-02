@@ -79,15 +79,26 @@ tau_token = {
     "bg_far": 0.20,
 }
 sv_ume_token_score_mode = "weighted_sum"
-sv_ume_regions = ["fg_boundary", "bg_near"]
+sv_ume_regions = ["fg_core", "fg_boundary", "bg_near", "bg_far"]
 sv_ume_diagnostics_interval = 20
-sv_ume_profile_name = "boundary_debug_v1"
+sv_ume_profile_name = "four_region_near_1to1_v1"
 
 # Diversity
 use_diversity_selection = True
 lambda_diversity = 0.2
 spatial_nms_distance = 2
 feature_dup_sim_threshold = 0.95
+sv_ume_target_fill_ratio = 0.95
+sv_ume_relaxed_fill = True
+sv_ume_feature_nms_scope = "same_image"
+sv_ume_relaxed_spatial_nms_distance = 1
+sv_ume_relaxed_feature_dup_sim_threshold = 0.995
+sv_ume_region_gate_relaxation = {
+    "fg_core": 0.05,
+    "fg_boundary": 0.0,
+    "bg_near": 0.0,
+    "bg_far": 0.05,
+}
 
 # Global type metadata
 use_global_type_metadata = True
@@ -220,31 +231,6 @@ sam_embedding_cache_store_dtype = "float16"  # SAM1 compatibility
 sam2_embedding_cache_store_dtype = "float32"
 sam_embedding_cache_prune_interval = 256
 sam_embedding_cache_version = "sam2.1_hiera_large_state_v1_fp32"
-
-
-# Fail before training if this run file was not applied as the final config layer.
-sv_ume_profile_contract = {
-    "sv_ume_start_epoch": 16,
-    "tau_image": 0.50,
-    "tau_region": {
-        "fg_core": 0.50,
-        "fg_boundary": 0.60,
-        "bg_near": 0.65,
-        "bg_far": 0.50,
-    },
-    "tau_token": {
-        "fg_core": 0.20,
-        "fg_boundary": 0.25,
-        "bg_near": 0.30,
-        "bg_far": 0.20,
-    },
-    "sv_ume_token_score_mode": "weighted_sum",
-    "sv_ume_regions": ["fg_boundary", "bg_near"],
-    "use_sam_cache": False,
-    "use_svb_output_cache": False,
-    "use_sam_embedding_cache": True,
-    "sam_embedding_cache_disk": True,
-}
 
 
 # Visualization

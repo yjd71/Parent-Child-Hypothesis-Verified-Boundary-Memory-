@@ -146,23 +146,35 @@ def prepare_dataloader(dataset: data.Dataset, batch_size: int, num_workers: int,
         dataset.set_unlabeled_data(indices)
     if to_be_distributed:
         if indices is None:
-            sampler = data.DistributedSampler(dataset)
+            sampler = data.DistributedSampler(
+                dataset,
+                shuffle=is_train,
+                drop_last=is_train,
+            )
         else:
             dataset = data.Subset(dataset, indices)
             logger.key_info("[+] Subset of dataset has been created, length: {}".format(len(dataset)))
-            sampler = data.DistributedSampler(dataset)
+            sampler = data.DistributedSampler(
+                dataset,
+                shuffle=is_train,
+                drop_last=is_train,
+            )
         return data.DataLoader(
             dataset=dataset, batch_size=batch_size, num_workers=min(num_workers, batch_size), pin_memory=True,
-            shuffle=False, sampler=sampler, drop_last=True
+            shuffle=False, sampler=sampler, drop_last=is_train
         )
     else:
-        if indices is None or len(indices) == 0 :
+        if not is_train:
+            if indices is not None:
+                dataset = data.Subset(dataset, indices)
+            sampler = data.SequentialSampler(dataset)
+        elif indices is None or len(indices) == 0:
             sampler = data.RandomSampler(dataset)
         else:
             sampler = data.SubsetRandomSampler(indices)
         return data.DataLoader(
             dataset = dataset, batch_size = batch_size, num_workers=min(num_workers, batch_size, 0), pin_memory=True,
-            sampler = sampler, drop_last=True
+            sampler = sampler, drop_last=is_train
         )
 
 

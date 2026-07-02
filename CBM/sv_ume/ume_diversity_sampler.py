@@ -26,6 +26,7 @@ class _PreparedCandidate:
     image_id: str
     coord: Tuple[int, int]
     global_type: str
+    region_gate_mode: str
     normalized_key: torch.Tensor
     normalized_global_key: torch.Tensor
     d_img: float = 0.0
@@ -57,6 +58,19 @@ class UMEDiversitySampler:
                 DEFAULT_FEATURE_DUP_SIM_THRESHOLD,
             )
         )
+        self.target_fill_ratio = float(
+            getattr(cfg, "sv_ume_target_fill_ratio", 0.95)
+        )
+        self.relaxed_fill = bool(getattr(cfg, "sv_ume_relaxed_fill", False))
+        self.feature_nms_scope = str(
+            getattr(cfg, "sv_ume_feature_nms_scope", "global")
+        ).strip().lower()
+        self.relaxed_spatial_nms_distance = float(
+            getattr(cfg, "sv_ume_relaxed_spatial_nms_distance", 1.0)
+        )
+        self.relaxed_feature_dup_sim_threshold = float(
+            getattr(cfg, "sv_ume_relaxed_feature_dup_sim_threshold", 0.995)
+        )
         self.sample_per_image = self._region_config(
             getattr(cfg, "sample_per_image_unlabeled", DEFAULT_SAMPLE_PER_IMAGE),
             "sample_per_image_unlabeled",
@@ -81,6 +95,22 @@ class UMEDiversitySampler:
             or not -1.0 <= self.feature_dup_sim_threshold <= 1.0
         ):
             raise ValueError("feature_dup_sim_threshold must be in [-1, 1]")
+        if not math.isfinite(self.target_fill_ratio) or not 0.0 <= self.target_fill_ratio <= 1.0:
+            raise ValueError("sv_ume_target_fill_ratio must be in [0, 1]")
+        if self.feature_nms_scope not in {"global", "same_image"}:
+            raise ValueError("sv_ume_feature_nms_scope must be 'global' or 'same_image'")
+        if (
+            not math.isfinite(self.relaxed_spatial_nms_distance)
+            or self.relaxed_spatial_nms_distance < 0.0
+        ):
+            raise ValueError("sv_ume_relaxed_spatial_nms_distance must be non-negative")
+        if (
+            not math.isfinite(self.relaxed_feature_dup_sim_threshold)
+            or not -1.0 <= self.relaxed_feature_dup_sim_threshold <= 1.0
+        ):
+            raise ValueError(
+                "sv_ume_relaxed_feature_dup_sim_threshold must be in [-1, 1]"
+            )
         for region in self.regions:
             if self.sample_per_image[region] < 0:
                 raise ValueError(
@@ -205,6 +235,9 @@ class UMEDiversitySampler:
                 "lambda_diversity": self.lambda_diversity,
                 "spatial_nms_distance": self.spatial_nms_distance,
                 "feature_dup_sim_threshold": self.feature_dup_sim_threshold,
+                "target_fill_ratio": self.target_fill_ratio,
+                "relaxed_fill": self.relaxed_fill,
+                "feature_nms_scope": self.feature_nms_scope,
                 "input_tokens": sum(
                     item["input_tokens"] for item in region_stats.values()
                 ),
@@ -295,45 +328,85 @@ class UMEDiversitySampler:
         per_image_limit: int,
     ):
         selected: List[_PreparedCandidate] = []
+        selected_input_indices = set()
+        selected_by_image: Dict[str, List[_PreparedCandidate]] = defaultdict(list)
         per_image_counts: Counter[str] = Counter()
         rejected: Counter[str] = Counter()
+        stage_counts: Counter[str] = Counter()
         min_spatial_distance: Optional[float] = None
         max_feature_similarity: Optional[float] = None
-        min_distance_sq = self.spatial_nms_distance * self.spatial_nms_distance
+        target_count = min(
+            int(capacity),
+            int(math.ceil(float(capacity) * self.target_fill_ratio)),
+        )
 
-        for position, candidate in enumerate(ranked):
-            if len(selected) >= capacity:
-                rejected["capacity"] += len(ranked) - position
-                break
-            if per_image_counts[candidate.image_id] >= per_image_limit:
-                rejected["per_image_limit"] += 1
-                continue
+        strict_candidates = [item for item in ranked if item.region_gate_mode == "strict"]
+        relaxed_candidates = [item for item in ranked if item.region_gate_mode == "relaxed"]
 
-            if self.use_diversity_selection:
-                same_image_distances = [
-                    self._distance_sq(candidate.coord, item.coord)
-                    for item in selected
-                    if item.image_id == candidate.image_id
-                ]
-                if same_image_distances:
-                    nearest_sq = min(same_image_distances)
-                    if nearest_sq <= min_distance_sq:
-                        rejected["spatial_nms"] += 1
-                        continue
-                else:
-                    nearest_sq = None
+        def add_with_stage(candidate: _PreparedCandidate, stage: str) -> None:
+            metadata = self._detach_metadata(candidate.token.meta)
+            metadata["selection_stage"] = stage
+            staged = replace(
+                candidate,
+                token=replace(candidate.token, meta=metadata),
+            )
+            selected.append(staged)
+            selected_input_indices.add(candidate.input_index)
+            selected_by_image[candidate.image_id].append(staged)
+            per_image_counts[candidate.image_id] += 1
+            stage_counts[stage] += 1
 
-                similarities = [
-                    float(torch.dot(candidate.normalized_key, item.normalized_key).item())
-                    for item in selected
-                ]
-                if similarities:
-                    nearest_similarity = max(similarities)
-                    if nearest_similarity >= self.feature_dup_sim_threshold:
-                        rejected["feature_duplicate"] += 1
-                        continue
-                else:
-                    nearest_similarity = None
+        def run_pass(
+            candidates: Sequence[_PreparedCandidate],
+            *,
+            stage: str,
+            stop_count: int,
+            use_nms: bool,
+            spatial_distance: float,
+            feature_threshold: float,
+        ) -> None:
+            nonlocal min_spatial_distance, max_feature_similarity
+            min_distance_sq = spatial_distance * spatial_distance
+            for candidate in candidates:
+                if len(selected) >= stop_count:
+                    return
+                if candidate.input_index in selected_input_indices:
+                    continue
+                if per_image_counts[candidate.image_id] >= per_image_limit:
+                    rejected[f"{stage}_per_image_limit"] += 1
+                    continue
+
+                nearest_sq = None
+                nearest_similarity = None
+                if use_nms and self.use_diversity_selection:
+                    same_image_selected = selected_by_image[candidate.image_id]
+                    if same_image_selected:
+                        nearest_sq = min(
+                            self._distance_sq(candidate.coord, item.coord)
+                            for item in same_image_selected
+                        )
+                        if nearest_sq <= min_distance_sq:
+                            rejected[f"{stage}_spatial_nms"] += 1
+                            continue
+
+                    feature_reference = (
+                        same_image_selected
+                        if self.feature_nms_scope == "same_image"
+                        else selected
+                    )
+                    if feature_reference:
+                        reference_keys = torch.stack(
+                            [item.normalized_key for item in feature_reference],
+                            dim=0,
+                        )
+                        nearest_similarity = float(
+                            torch.mv(reference_keys, candidate.normalized_key)
+                            .max()
+                            .item()
+                        )
+                        if nearest_similarity >= feature_threshold:
+                            rejected[f"{stage}_feature_duplicate"] += 1
+                            continue
 
                 if nearest_sq is not None:
                     nearest_distance = math.sqrt(nearest_sq)
@@ -348,14 +421,81 @@ class UMEDiversitySampler:
                         if max_feature_similarity is None
                         else max(max_feature_similarity, nearest_similarity)
                     )
+                add_with_stage(candidate, stage)
 
-            selected.append(candidate)
-            per_image_counts[candidate.image_id] += 1
+        if not self.relaxed_fill:
+            run_pass(
+                ranked,
+                stage="strict",
+                stop_count=capacity,
+                use_nms=True,
+                spatial_distance=self.spatial_nms_distance,
+                feature_threshold=self.feature_dup_sim_threshold,
+            )
+        else:
+            run_pass(
+                strict_candidates,
+                stage="strict",
+                stop_count=capacity,
+                use_nms=True,
+                spatial_distance=self.spatial_nms_distance,
+                feature_threshold=self.feature_dup_sim_threshold,
+            )
+            if len(selected) < target_count:
+                run_pass(
+                    strict_candidates,
+                    stage="relaxed_nms",
+                    stop_count=target_count,
+                    use_nms=True,
+                    spatial_distance=self.relaxed_spatial_nms_distance,
+                    feature_threshold=self.relaxed_feature_dup_sim_threshold,
+                )
+            if len(selected) < target_count:
+                run_pass(
+                    strict_candidates,
+                    stage="strict_fill",
+                    stop_count=target_count,
+                    use_nms=False,
+                    spatial_distance=0.0,
+                    feature_threshold=1.0,
+                )
+            if len(selected) < target_count:
+                run_pass(
+                    relaxed_candidates,
+                    stage="relaxed_gate_fill",
+                    stop_count=target_count,
+                    use_nms=False,
+                    spatial_distance=0.0,
+                    feature_threshold=1.0,
+                )
+
+        maximum_selectable = sum(
+            min(count, per_image_limit)
+            for count in Counter(item.image_id for item in ranked).values()
+        )
+        if len(selected) >= target_count:
+            underfill_reason = None
+        elif len(ranked) < target_count:
+            underfill_reason = "candidate_shortage"
+        elif maximum_selectable < target_count:
+            underfill_reason = "per_image_limit"
+        elif not self.relaxed_fill:
+            underfill_reason = "strict_diversity"
+        else:
+            underfill_reason = "selection_exhausted"
 
         return selected, rejected, {
             "selected_per_image": dict(per_image_counts),
+            "selected_unique_images": len(per_image_counts),
             "min_same_image_spatial_distance": min_spatial_distance,
             "max_selected_feature_similarity": max_feature_similarity,
+            "target_count": target_count,
+            "target_reached": len(selected) >= target_count,
+            "fill_ratio": float(len(selected) / capacity) if capacity > 0 else 1.0,
+            "strict_candidates": len(strict_candidates),
+            "relaxed_candidates": len(relaxed_candidates),
+            "selection_stage_counts": dict(stage_counts),
+            "underfill_reason": underfill_reason,
         }
 
     def _prepare_candidate(
@@ -395,6 +535,11 @@ class UMEDiversitySampler:
         global_type = str(token.meta["global_type"])
         if global_type not in {"matched", "expanded", "novel_pending"}:
             raise ValueError(f"unsupported global_type: {global_type!r}")
+        region_gate_mode = str(token.meta.get("region_gate_mode", "strict"))
+        if region_gate_mode not in {"strict", "relaxed"}:
+            raise ValueError(
+                f"unsupported region_gate_mode: {region_gate_mode!r}"
+            )
 
         reliability = float(token.reliability)
         if not math.isfinite(reliability) or not 0.0 <= reliability <= 1.0:
@@ -412,6 +557,7 @@ class UMEDiversitySampler:
             image_id=image_id,
             coord=coord,
             global_type=global_type,
+            region_gate_mode=region_gate_mode,
             normalized_key=self._normalize_vector(key),
             normalized_global_key=self._normalize_vector(global_key),
         )
@@ -475,6 +621,12 @@ class UMEDiversitySampler:
             "input_global_type_counts": dict(input_types),
             "selected_global_type_counts": dict(
                 Counter(item.global_type for item in selected)
+            ),
+            "input_region_gate_counts": dict(
+                Counter(item.region_gate_mode for item in eligible)
+            ),
+            "selected_region_gate_counts": dict(
+                Counter(item.region_gate_mode for item in selected)
             ),
             "eligible_mean_D_img": self._mean([item.d_img for item in eligible]),
             "eligible_mean_D_region": self._mean(
@@ -651,10 +803,28 @@ class UMEDiversitySampler:
             f"input={stats['input_tokens']} eligible={stats['eligible_tokens']} "
             f"selected={stats['selected_tokens']}"
         )
-        if hasattr(self.logger, "info"):
-            self.logger.info(message)
-        elif callable(self.logger):
-            self.logger(message)
+        messages = [message]
+        for region, region_stats in stats.get("regions", {}).items():
+            messages.append(
+                f"[SV-UME][select][region={region}] "
+                f"input={region_stats['input_tokens']} "
+                f"eligible={region_stats['eligible_tokens']} "
+                f"strict={region_stats.get('strict_candidates', 0)} "
+                f"relaxed={region_stats.get('relaxed_candidates', 0)} "
+                f"capacity={region_stats['capacity']} "
+                f"target={region_stats.get('target_count', region_stats['capacity'])} "
+                f"selected={region_stats['selected_tokens']} "
+                f"fill_ratio={region_stats.get('fill_ratio', 0.0):.4f} "
+                f"unique_images={region_stats.get('selected_unique_images', 0)} "
+                f"stages={region_stats.get('selection_stage_counts', {})} "
+                f"rejected={region_stats.get('rejected', {})} "
+                f"underfill={region_stats.get('underfill_reason')}"
+            )
+        for current in messages:
+            if hasattr(self.logger, "info"):
+                self.logger.info(current)
+            elif callable(self.logger):
+                self.logger(current)
 
     @staticmethod
     def _detach_metadata(value):

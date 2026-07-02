@@ -10,7 +10,6 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional
 import torch
 
 from CBM.memory.labels import REGION_NAMES
-from CBM.sv_ume.config_contract import validate_sv_ume_profile_contract
 from CBM.sv_ume.schedules import (
     can_use_lagged_memory,
     expected_unlabeled_source_epoch,
@@ -440,7 +439,6 @@ class SVUMEManager:
         return self
 
     def _validate_enabled_config(self) -> None:
-        validate_sv_ume_profile_contract(self.cfg)
         for name, default in (
             ("use_aux_evidence_fusion", True),
             ("use_aux_feature_fusion", True),

@@ -946,7 +946,10 @@ def compute_token_reliability(
     )
     structural_valid = pack["valid"] > 0.5
     cbm_valid = evidence["valid_map"] > 0.5
-    batch_valid_map = batch_valid.reshape(-1, 1, 1, 1)
+    # Expose batch-level validity as a spatial map because downstream
+    # diagnostics and candidate collection index it with p3 coordinates.
+    # ``expand_as`` keeps this broadcast-only and does not allocate H x W data.
+    batch_valid_map = batch_valid.reshape(-1, 1, 1, 1).expand_as(structural_valid)
     allowed: Dict[str, torch.Tensor] = {}
     for region in REGION_NAMES:
         valid = (

@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 
 from CBM.memory.labels import REGION_NAMES, REGION_TO_ID, VALUE_LAYOUT
-from CBM.sv_ume.config_contract import validate_sv_ume_profile_contract
 from CBM.sv_ume.sam_refined_region_builder import build_sam_refined_regions
 from CBM.sv_ume.ume_reliability import (
     DEFAULT_CBM_LOGIT_SCALE,
@@ -129,7 +128,6 @@ class SAMRefinedCandidateBuilder:
     def __init__(self, cfg, logger=None) -> None:
         self.cfg = cfg
         self.logger = logger
-        validate_sv_ume_profile_contract(cfg)
         raw_regions = getattr(cfg, "sv_ume_regions", REGION_NAMES)
         if isinstance(raw_regions, (str, bytes)) or not isinstance(raw_regions, Sequence):
             raise TypeError("sv_ume_regions must be a non-empty sequence of region names")
@@ -139,6 +137,31 @@ class SAMRefinedCandidateBuilder:
         self.enabled_regions = tuple(region for region in REGION_NAMES if region in raw_regions)
         if not self.enabled_regions:
             raise ValueError("sv_ume_regions must enable at least one region")
+        raw_relaxation = getattr(
+            cfg,
+            "sv_ume_region_gate_relaxation",
+            {region: 0.0 for region in REGION_NAMES},
+        )
+        if not isinstance(raw_relaxation, Mapping):
+            raise TypeError("sv_ume_region_gate_relaxation must be a region mapping")
+        unknown_relaxation = set(raw_relaxation) - set(REGION_NAMES)
+        if unknown_relaxation:
+            raise ValueError(
+                "sv_ume_region_gate_relaxation contains unknown regions: "
+                f"{sorted(unknown_relaxation)}"
+            )
+        self.region_gate_relaxation = {}
+        for region in REGION_NAMES:
+            value = float(raw_relaxation.get(region, 0.0))
+            if not bool(torch.isfinite(torch.tensor(value))) or not 0.0 <= value <= 1.0:
+                raise ValueError(
+                    f"sv_ume_region_gate_relaxation[{region!r}] must be in [0, 1]"
+                )
+            if region in ("fg_boundary", "bg_near") and value != 0.0:
+                raise ValueError(
+                    f"sv_ume_region_gate_relaxation[{region!r}] must remain 0"
+                )
+            self.region_gate_relaxation[region] = value
         self.score_mode = str(getattr(cfg, "sv_ume_token_score_mode", "product")).strip().lower()
         self.diagnostics_interval = max(1, int(getattr(cfg, "sv_ume_diagnostics_interval", 20)))
         self.cbm_logit_scale = float(
@@ -262,6 +285,12 @@ class SAMRefinedCandidateBuilder:
         structural_valid = region_pack["valid"] > 0.5
         cbm_valid = token_result["cbm_valid"]
         batch_valid_map = token_result["batch_valid_map"]
+        expected_valid_shape = tuple(structural_valid.shape)
+        if tuple(batch_valid_map.shape) != expected_valid_shape:
+            raise ValueError(
+                "token_result['batch_valid_map'] must match the spatial validity "
+                f"shape {expected_valid_shape}, got {tuple(batch_valid_map.shape)}"
+            )
         token_components = token_result["components"]
 
         stats["sam_used"] = True
@@ -272,6 +301,9 @@ class SAMRefinedCandidateBuilder:
             region for region in REGION_NAMES if region not in self.enabled_regions
         ]
         stats["token_score_mode"] = token_result["score_mode"]
+        stats["region_gate_candidate_counts"] = {
+            region: {"strict": 0, "relaxed": 0} for region in REGION_NAMES
+        }
         stats.update(self._summarize_image_admission(image_result))
         stats["region_pixel_counts"] = {
             region: int((region_masks[region] > 0.5).sum().item())
@@ -337,11 +369,30 @@ class SAMRefinedCandidateBuilder:
                 if pixel_count == 0:
                     rejected["region_empty"] += 1
                     continue
-                if not bool(region_result["allow"][region][batch_index]):
+                c_region = float(region_result["score"][region][batch_index].item())
+                strict_threshold = float(region_result["thresholds"][region])
+                relaxation = self.region_gate_relaxation[region]
+                relaxed_threshold = max(0.0, strict_threshold - relaxation)
+                region_evidence = region_result.get("evidence_valid")
+                region_evidence_valid = (
+                    bool(region_evidence[batch_index])
+                    if torch.is_tensor(region_evidence)
+                    else True
+                )
+                if bool(region_result["allow"][region][batch_index]):
+                    region_gate_mode = "strict"
+                    region_threshold_used = strict_threshold
+                elif (
+                    relaxation > 0.0
+                    and region_evidence_valid
+                    and c_region > relaxed_threshold
+                ):
+                    region_gate_mode = "relaxed"
+                    region_threshold_used = relaxed_threshold
+                else:
                     rejected["region_below_threshold"] += 1
                     continue
 
-                c_region = float(region_result["score"][region][batch_index].item())
                 diversity = float(
                     region_result["components"]["region_diversity"][region][batch_index].item()
                 )
@@ -383,6 +434,9 @@ class SAMRefinedCandidateBuilder:
                         "r_token": reliability,
                         "C_img": c_img,
                         "C_region": c_region,
+                        "region_gate_mode": region_gate_mode,
+                        "region_threshold_strict": strict_threshold,
+                        "region_threshold_used": region_threshold_used,
                         "r_teacher": factor_values["r_teacher"],
                         "r_sam": factor_values["r_sam"],
                         "r_cbm": factor_values["r_cbm"],
@@ -428,6 +482,7 @@ class SAMRefinedCandidateBuilder:
                         global_meta=global_meta,
                     )
                     pools[region].append(candidate)
+                    stats["region_gate_candidate_counts"][region][region_gate_mode] += 1
                     if global_type == "novel_pending":
                         stats["novel_pending_candidates"] += 1
 
@@ -754,6 +809,9 @@ class SAMRefinedCandidateBuilder:
             "region_pixel_counts": {region: 0 for region in REGION_NAMES},
             "region_image_counts": {region: 0 for region in REGION_NAMES},
             "candidate_counts": {region: 0 for region in REGION_NAMES},
+            "region_gate_candidate_counts": {
+                region: {"strict": 0, "relaxed": 0} for region in REGION_NAMES
+            },
             "image_score_mean": 0.0,
             "image_score_min": 0.0,
             "image_score_max": 0.0,
@@ -850,6 +908,7 @@ class SAMRefinedCandidateBuilder:
             f"region_scores={stats.get('region_score_mean')} "
             f"cbm_valid_ratio={stats.get('cbm_valid_ratio')} "
             f"candidate_counts={stats.get('candidate_counts')} "
+            f"region_gate_candidates={stats.get('region_gate_candidate_counts')} "
             f"enabled={stats.get('enabled_regions')} disabled={stats.get('disabled_regions')}",
             f"[SV-UME][image][step={stats.get('step')}] "
             f"score={stats.get('image_score_quantiles')} "

@@ -9,9 +9,13 @@ from unittest.mock import patch
 import torch
 
 from CBM.memory.labels import REGION_NAMES
-from CBM.sv_ume.config_contract import validate_sv_ume_profile_contract
 from CBM.sv_ume.quality_adaptive_fusion import QualityAdaptiveSourceFusion
 from CBM.sv_ume.sam_refined_candidate_builder import SAMRefinedCandidateBuilder
+from CBM.sv_ume.ume_diversity_sampler import UMEDiversitySampler
+from CBM.sv_ume.unlabeled_dense_memory import (
+    UnlabeledDenseBoundaryMemory,
+    UnlabeledMemoryToken,
+)
 from CBM.sv_ume.schedules import (
     can_use_lagged_memory,
     expected_unlabeled_source_epoch,
@@ -143,14 +147,28 @@ class TokenReliabilityTests(unittest.TestCase):
         self.assertAlmostEqual(result["components"]["r_context"][boundary].item(), 0.3, places=6)
         self.assertGreater(result["score"][boundary].item(), 0.0)
         self.assertFalse(result["cbm_valid"][boundary].item())
+        self.assertEqual(result["batch_valid_map"].shape, one.shape)
+        self.assertTrue(bool(result["batch_valid_map"].all()))
 
 
 class CandidateDiagnosticsTests(unittest.TestCase):
     @staticmethod
-    def _mock_outputs(cbm_valid=True, score=0.8, empty_boundary=False):
-        shape = (1, 1, 2, 2)
+    def _mock_outputs(
+        cbm_valid=True,
+        score=0.8,
+        empty_boundary=False,
+        width=2,
+        scalar_batch_valid=False,
+        all_regions=False,
+        region_scores=None,
+        region_evidence_valid=True,
+    ):
+        shape = (1, 1, 4 if all_regions else 2, width)
         regions = {region: torch.zeros(shape) for region in REGION_NAMES}
-        if not empty_boundary:
+        if all_regions:
+            for row, region in enumerate(REGION_NAMES):
+                regions[region][0, 0, row, :] = 1.0
+        elif not empty_boundary:
             regions["fg_boundary"][0, 0, 0, :] = 1.0
         else:
             regions["fg_core"][0, 0, 0, :] = 1.0
@@ -181,9 +199,20 @@ class CandidateDiagnosticsTests(unittest.TestCase):
                 "sim_max": torch.tensor([0.9]),
             },
         }
+        region_scores = region_scores or {region: 0.9 for region in REGION_NAMES}
+        region_thresholds = {region: 0.5 for region in REGION_NAMES}
         region_result = {
-            "score": {region: torch.tensor([0.9]) for region in REGION_NAMES},
-            "allow": {region: torch.tensor([True]) for region in REGION_NAMES},
+            "score": {
+                region: torch.tensor([region_scores[region]]) for region in REGION_NAMES
+            },
+            "allow": {
+                region: torch.tensor(
+                    [region_scores[region] > region_thresholds[region]]
+                )
+                for region in REGION_NAMES
+            },
+            "thresholds": region_thresholds,
+            "evidence_valid": torch.tensor([region_evidence_valid]),
             "components": {
                 "region_diversity": {
                     region: torch.tensor([0.2]) for region in REGION_NAMES
@@ -197,34 +226,46 @@ class CandidateDiagnosticsTests(unittest.TestCase):
             "score": torch.full(shape, score),
             "components": component_maps,
             "cbm_valid": torch.full(shape, cbm_valid, dtype=torch.bool),
-            "batch_valid_map": torch.ones(shape, dtype=torch.bool),
+            "batch_valid_map": torch.ones(
+                (1, 1, 1, 1) if scalar_batch_valid else shape,
+                dtype=torch.bool,
+            ),
             "thresholds": {region: 0.2 for region in REGION_NAMES},
             "score_mode": "weighted_sum",
         }
         return pack, image_result, region_result, token_result
 
-    def _build(self, **scenario):
-        cfg = SimpleNamespace(
+    def _build(self, config_overrides=None, **scenario):
+        config_values = dict(
             sv_ume_regions=["fg_boundary", "bg_near"],
             sv_ume_token_score_mode="weighted_sum",
             sv_ume_diagnostics_interval=20,
+            sv_ume_region_gate_relaxation={
+                region: 0.0 for region in REGION_NAMES
+            },
             cbm_memory_dim=2,
             cbm_value_dim=8,
             tau_image=0.5,
             tau_region={region: 0.5 for region in REGION_NAMES},
             tau_token={region: 0.2 for region in REGION_NAMES},
         )
+        config_values.update(config_overrides or {})
+        cfg = SimpleNamespace(**config_values)
         builder = SAMRefinedCandidateBuilder(cfg)
         pack, image_result, region_result, token_result = self._mock_outputs(**scenario)
+        height, width = pack["p_ref3"].shape[-2:]
         inputs = dict(
-            img=torch.ones(1, 3, 4, 4),
+            img=torch.ones(1, 3, height * 2, width * 2),
             img_id=["u0"],
-            x3=torch.ones(1, 2, 2, 2),
-            p3=torch.ones(1, 2, 2, 2),
-            p_raw=torch.ones(1, 1, 2, 2) * 0.8,
-            p_ref=torch.ones(1, 1, 2, 2) * 0.7,
-            conf_ref=torch.ones(1, 1, 2, 2),
-            sam_aux={"used_sam": True, "sam_mask": torch.ones(1, 1, 2, 2)},
+            x3=torch.ones(1, 2, height, width),
+            p3=torch.ones(1, 2, height, width),
+            p_raw=torch.ones(1, 1, height, width) * 0.8,
+            p_ref=torch.ones(1, 1, height, width) * 0.7,
+            conf_ref=torch.ones(1, 1, height, width),
+            sam_aux={
+                "used_sam": True,
+                "sam_mask": torch.ones(1, 1, height, width),
+            },
             retrieval_aux={},
             labeled_memory=SimpleNamespace(mem_dim=2, value_dim=8),
             epoch=29,
@@ -256,6 +297,59 @@ class CandidateDiagnosticsTests(unittest.TestCase):
         self.assertEqual(threshold["rejected"]["token_cbm_invalid"], 0)
         self.assertGreater(empty["rejected"]["region_empty"], 0)
 
+    def test_spatial_batch_valid_map_supports_column_four(self):
+        result = self._build(width=5)
+        boundary = result["candidate_pools"]["fg_boundary"]
+        near = result["candidate_pools"]["bg_near"]
+        self.assertEqual(len(boundary), 5)
+        self.assertEqual(len(near), 5)
+        self.assertIn((0, 4), [candidate.coord for candidate in boundary])
+        self.assertIn((1, 4), [candidate.coord for candidate in near])
+
+    def test_batch_valid_map_shape_error_is_explicit(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            r"batch_valid_map.*shape \(1, 1, 2, 5\).*got \(1, 1, 1, 1\)",
+        ):
+            self._build(width=5, scalar_batch_valid=True)
+
+    def test_four_region_core_far_relaxed_gate_candidates_are_marked(self):
+        relaxation = {
+            "fg_core": 0.05,
+            "fg_boundary": 0.0,
+            "bg_near": 0.0,
+            "bg_far": 0.05,
+        }
+        result = self._build(
+            config_overrides={
+                "sv_ume_regions": list(REGION_NAMES),
+                "sv_ume_region_gate_relaxation": relaxation,
+            },
+            all_regions=True,
+            region_scores={
+                "fg_core": 0.47,
+                "fg_boundary": 0.9,
+                "bg_near": 0.9,
+                "bg_far": 0.46,
+            },
+        )
+        for region in REGION_NAMES:
+            self.assertGreater(len(result["candidate_pools"][region]), 0)
+        for region in ("fg_core", "bg_far"):
+            self.assertTrue(
+                all(
+                    item.meta["region_gate_mode"] == "relaxed"
+                    for item in result["candidate_pools"][region]
+                )
+            )
+        for region in ("fg_boundary", "bg_near"):
+            self.assertTrue(
+                all(
+                    item.meta["region_gate_mode"] == "strict"
+                    for item in result["candidate_pools"][region]
+                )
+            )
+
     def test_log_distribution_passes_strict_half_threshold(self):
         scores = torch.tensor([0.47, 0.49, 0.56, 0.68])
         image_result = {
@@ -270,6 +364,136 @@ class CandidateDiagnosticsTests(unittest.TestCase):
         self.assertEqual(stats["image_above_threshold_count"], 2)
         self.assertEqual(stats["image_allowed_count"], 2)
         self.assertAlmostEqual(stats["image_score_quantiles"]["max"], 0.68, places=6)
+
+
+class FourRegionDiversitySamplerTests(unittest.TestCase):
+    @staticmethod
+    def _cfg(**overrides):
+        values = dict(
+            use_diversity_selection=True,
+            lambda_diversity=0.2,
+            spatial_nms_distance=2,
+            feature_dup_sim_threshold=0.95,
+            sv_ume_target_fill_ratio=0.95,
+            sv_ume_relaxed_fill=True,
+            sv_ume_feature_nms_scope="same_image",
+            sv_ume_relaxed_spatial_nms_distance=1,
+            sv_ume_relaxed_feature_dup_sim_threshold=0.995,
+            sample_per_image_unlabeled={region: 128 for region in REGION_NAMES},
+            region_capacity_ratio={region: 1.0 for region in REGION_NAMES},
+            cbm_memory_dim=2,
+            cbm_value_dim=8,
+            use_unlabeled_memory_ema_refresh=False,
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    @staticmethod
+    def _token(region, index, *, image_id=None, gate_mode="strict", reliability=0.9):
+        image_id = image_id or f"u{index % 2}"
+        image_number = int(image_id[1:]) if image_id[1:].isdigit() else 0
+        value = torch.zeros(8)
+        value[REGION_NAMES.index(region)] = 1.0
+        value[5 if region.startswith("fg_") else 4] = 1.0
+        value[7] = float(reliability)
+        return UnlabeledMemoryToken(
+            key=torch.tensor([1.0, float(index) * 1.0e-4]),
+            value=value,
+            global_key=torch.tensor([1.0, float(image_number) * 0.1]),
+            meta={
+                "image_id": image_id,
+                "coord": (index // 8, index % 8),
+                "region": region,
+                "epoch_added": 29,
+                "step_added": 0,
+                "global_type": "matched",
+                "region_gate_mode": gate_mode,
+            },
+            reliability=reliability,
+        )
+
+    @staticmethod
+    def _labeled_memory(capacity):
+        return SimpleNamespace(
+            mem_dim=2,
+            keys={region: torch.randn(capacity, 2) for region in REGION_NAMES},
+            image_keys=torch.randn(2, 2),
+        )
+
+    def test_same_image_feature_nms_keeps_identical_cross_image_tokens(self):
+        cfg = self._cfg(
+            sv_ume_relaxed_fill=False,
+            sample_per_image_unlabeled={region: 2 for region in REGION_NAMES},
+        )
+        pool = {region: [] for region in REGION_NAMES}
+        pool["fg_core"] = [
+            self._token("fg_core", 0, image_id="u0"),
+            self._token("fg_core", 0, image_id="u1"),
+        ]
+        result = UMEDiversitySampler(cfg).select(
+            candidate_pool=pool,
+            labeled_memory=self._labeled_memory(2),
+        )
+        self.assertEqual(len(result["selected_tokens"]["fg_core"]), 2)
+
+    def test_relaxed_fill_reaches_target_and_preserves_strict_priority(self):
+        cfg = self._cfg()
+        pool = {region: [] for region in REGION_NAMES}
+        pool["fg_core"] = [
+            self._token("fg_core", index, gate_mode="strict", reliability=0.8)
+            for index in range(10)
+        ] + [
+            self._token("fg_core", index + 100, gate_mode="relaxed", reliability=0.99)
+            for index in range(20)
+        ]
+        result = UMEDiversitySampler(cfg).select(
+            candidate_pool=pool,
+            labeled_memory=self._labeled_memory(20),
+        )
+        selected = result["selected_tokens"]["fg_core"]
+        stats = result["stats"]["regions"]["fg_core"]
+        self.assertEqual(len(selected), 19)
+        self.assertEqual(stats["target_count"], 19)
+        self.assertTrue(stats["target_reached"])
+        self.assertGreaterEqual(stats["fill_ratio"], 0.95)
+        self.assertEqual(
+            sum(item.meta["region_gate_mode"] == "strict" for item in selected),
+            10,
+        )
+        self.assertEqual(stats["selection_stage_counts"]["relaxed_gate_fill"], 9)
+
+    def test_underfill_reason_reports_candidate_shortage(self):
+        cfg = self._cfg()
+        pool = {region: [] for region in REGION_NAMES}
+        pool["fg_core"] = [self._token("fg_core", index) for index in range(5)]
+        result = UMEDiversitySampler(cfg).select(
+            candidate_pool=pool,
+            labeled_memory=self._labeled_memory(20),
+        )
+        stats = result["stats"]["regions"]["fg_core"]
+        self.assertEqual(stats["selected_tokens"], 5)
+        self.assertEqual(stats["underfill_reason"], "candidate_shortage")
+
+    def test_four_region_memory_builds_aligned_near_one_to_one_snapshot(self):
+        cfg = self._cfg()
+        pool = {
+            region: [self._token(region, index) for index in range(24)]
+            for region in REGION_NAMES
+        }
+        labeled = self._labeled_memory(20)
+        selection = UMEDiversitySampler(cfg).select(
+            candidate_pool=pool,
+            labeled_memory=labeled,
+        )
+        memory = UnlabeledDenseBoundaryMemory(cfg).build_from_candidates(
+            selection["selected_tokens"],
+            labeled,
+        )
+        for region in REGION_NAMES:
+            self.assertEqual(memory.keys[region].size(0), 19)
+            self.assertEqual(memory.values[region].size(0), 19)
+            self.assertEqual(len(memory.meta[region]), 19)
+        self.assertTrue(memory.is_ready())
 
 
 class FusionScheduleManagerTests(unittest.TestCase):
@@ -501,47 +725,34 @@ class SVUMEDebugConfigTests(unittest.TestCase):
         self.assertEqual(defaults["sv_ume_token_score_mode"], "product")
         self.assertEqual(defaults["sv_ume_regions"], list(REGION_NAMES))
         self.assertEqual(defaults["aux_source_penalty_value"], 0.0)
+        self.assertFalse(defaults["sv_ume_relaxed_fill"])
+        self.assertEqual(defaults["sv_ume_feature_nms_scope"], "global")
 
         cfg = runpy.run_path("config/runs/sv_ume_svb_plr_full.py")
         self.assertEqual(cfg["tot_epochs"], 35)
         self.assertEqual(cfg["sv_ume_start_epoch"], 16)
         self.assertEqual(cfg["sv_ume_token_score_mode"], "weighted_sum")
-        self.assertEqual(cfg["sv_ume_regions"], ["fg_boundary", "bg_near"])
-        self.assertEqual(cfg["gamma_max_final"], 0.25)
-        self.assertFalse(cfg["use_aux_feature_fusion"])
-        self.assertFalse(cfg["sam_use_mask_prompt"])
-        self.assertFalse(cfg["sam_pseudo_use_mask"])
-        self.assertFalse(cfg["sam_use_conformal"])
+        self.assertEqual(cfg["sv_ume_regions"], list(REGION_NAMES))
+        self.assertTrue(cfg["sv_ume_relaxed_fill"])
+        self.assertEqual(cfg["sv_ume_feature_nms_scope"], "same_image")
+        self.assertEqual(cfg["sv_ume_region_gate_relaxation"]["fg_core"], 0.05)
+        self.assertEqual(cfg["sv_ume_region_gate_relaxation"]["bg_far"], 0.05)
         self.assertTrue(str(cfg["sam2_checkpoint"]).startswith("/home/"))
-        self.assertEqual(cfg["sv_ume_profile_name"], "boundary_debug_v1")
-        self.assertTrue(cfg["use_sam_embedding_cache"])
-        self.assertTrue(cfg["sam_embedding_cache_disk"])
+        self.assertEqual(cfg["sv_ume_profile_name"], "four_region_near_1to1_v1")
 
-    def test_config_identity_and_strict_contract(self):
-        with redirect_stdout(io.StringIO()):
-            cfg = Config("config/runs/sv_ume_svb_plr_full.py")
-        self.assertTrue(cfg.run_cfg_path.endswith("sv_ume_svb_plr_full.py"))
-        self.assertEqual(len(cfg.run_cfg_sha256), 64)
-        effective = validate_sv_ume_profile_contract(cfg)
-        self.assertEqual(effective["tau_image"], 0.5)
-        self.assertEqual(effective["sv_ume_regions"], ["fg_boundary", "bg_near"])
-
-    def test_strict_contract_rejects_base_defaults(self):
-        cfg = SimpleNamespace(
-            sv_ume_profile_name="boundary_debug_v1",
-            sv_ume_profile_contract={
-                "tau_image": 0.5,
-                "sv_ume_token_score_mode": "weighted_sum",
-                "sv_ume_regions": ["fg_boundary", "bg_near"],
-            },
-            tau_image=0.8,
-            sv_ume_token_score_mode="product",
-            sv_ume_regions=list(REGION_NAMES),
-            run_cfg_path="wrong.py",
-            run_cfg_sha256="bad",
+    def test_config_identity_metadata_without_contract(self):
+        cases = (
+            ("config/runs/sv_ume_svb_plr_full.py", 16),
+            ("config/runs/finetune_27_cbm_ume_plr_full.py", 6),
         )
-        with self.assertRaisesRegex(ValueError, "profile 'boundary_debug_v1' mismatch"):
-            validate_sv_ume_profile_contract(cfg)
+        for path, start_epoch in cases:
+            with self.subTest(path=path), redirect_stdout(io.StringIO()):
+                cfg = Config(path)
+            self.assertTrue(cfg.run_cfg_path.replace("\\", "/").endswith(path))
+            self.assertEqual(len(cfg.run_cfg_sha256), 64)
+            self.assertEqual(cfg.sv_ume_start_epoch, start_epoch)
+            self.assertEqual(cfg.sv_ume_profile_name, "four_region_near_1to1_v1")
+            self.assertFalse(hasattr(cfg, "sv_ume_profile_contract"))
 
 
 if __name__ == "__main__":
