@@ -35,6 +35,11 @@ except ImportError:
     build_retrieval_aux_from_cbm_aux = None
     SAMVerifiedBoundaryPseudoLabelRefinement = None
     binary_reliability = None
+
+try:
+    from SAM.protoSAMprompt.train_pseudo_refiner import build_sam_pseudo_label_refiner
+except ImportError:
+    build_sam_pseudo_label_refiner = None
 from .evaluator import Evaluator
 
 
@@ -122,6 +127,7 @@ class SemiSupervisedTrainer:
         self.cbm = None
         self.cbm_stage = 0
         self.svb_plr = None
+        self.legacy_sam_refiner = None
         self._svb_plr_import_error_logged = False
         self._svb_same_view_warned = False
         self._svb_conformal_fitted = False
@@ -134,6 +140,7 @@ class SemiSupervisedTrainer:
         self.current_u_prev = None
         self.current_sv_ume_epoch = None
         self._init_svb_plr()
+        self._init_legacy_sam_refiner()
         self._init_sv_ume_manager()
 
     def _destory_model(self):
@@ -149,8 +156,53 @@ class SemiSupervisedTrainer:
         self.current_labeled_indices = labeled_indices
         self.cbm = self._get_model_cbm()
         self._init_svb_plr()
+        self._init_legacy_sam_refiner()
         self._init_sv_ume_manager()
         self._restore_sv_ume_state()
+
+    def _init_legacy_sam_refiner(self):
+        mode = str(getattr(self.config, "sam_refine_mode", "off")).strip().lower()
+        if mode != "legacy_auto":
+            self.legacy_sam_refiner = None
+            return
+        if self.svb_plr is not None:
+            raise RuntimeError("legacy_auto and svb refiners cannot be active together")
+        if self.legacy_sam_refiner is not None:
+            return
+        if build_sam_pseudo_label_refiner is None:
+            raise RuntimeError("Legacy SAM pseudo-label refiner is unavailable")
+
+        self.legacy_sam_refiner = build_sam_pseudo_label_refiner(
+            self.config,
+            self.device,
+            logger=self.logger,
+        )
+        inner = getattr(self.legacy_sam_refiner, "refiner", self.legacy_sam_refiner)
+        sam_modules = [
+            getattr(inner, "sam", None),
+            getattr(getattr(inner, "sam2_refiner", None), "model", None),
+        ]
+        for module in sam_modules:
+            if module is None:
+                continue
+            module.eval()
+            for param in module.parameters():
+                param.requires_grad_(False)
+        self._log_module_info(
+            "[SAM-Legacy] backend={} start_epoch={} interval={}".format(
+                getattr(self.config, "sam_pseudo_backend", "sam1"),
+                int(getattr(self.config, "sam_start_epoch", 0)),
+                max(1, int(getattr(self.config, "sam_refine_interval", 1))),
+            )
+        )
+
+    def _legacy_sam_enabled_for_epoch(self, epoch):
+        if self.legacy_sam_refiner is None:
+            return False
+        epoch_value = int(epoch)
+        start_epoch = int(getattr(self.config, "sam_start_epoch", 0))
+        interval = max(1, int(getattr(self.config, "sam_refine_interval", 1)))
+        return epoch_value >= start_epoch and epoch_value % interval == 0
 
     def _init_svb_plr(self):
         svb_mode = str(getattr(self.config, "svb_ablation_mode", "full")).strip().lower()
@@ -517,6 +569,7 @@ class SemiSupervisedTrainer:
         enable_labeled_cbm_loss = use_memory
         enable_unsup = self._unlabeled_enabled(epoch)
         use_svb_plr = self.svb_plr is not None
+        use_legacy_sam = self._legacy_sam_enabled_for_epoch(logical_epoch)
         if self.sv_ume_manager is not None:
             use_svb_plr = use_svb_plr and logical_epoch >= int(
                 getattr(self.config, "svb_plr_start_epoch", 16)
@@ -580,9 +633,24 @@ class SemiSupervisedTrainer:
                         if memory_t is not None:
                             teacher_kwargs["memory_t"] = memory_t
                         teacher_preds = self.model(img_u_w, **teacher_kwargs)
-                        pseudo_s = teacher_preds[-1].sigmoid()
+                        teacher_pseudo = teacher_preds[-1].sigmoid()
+                        if use_legacy_sam:
+                            pseudo_w = self._run_legacy_sam_refiner(
+                                img_u_w,
+                                teacher_pseudo,
+                                epoch=logical_epoch,
+                                step=batch_idx,
+                                image_ids=image_ids,
+                            )
+                        else:
+                            pseudo_w = teacher_pseudo
+                    pseudo_s = (
+                        self._align_legacy_pseudo_to_strong(pseudo_w, geom)
+                        if use_legacy_sam
+                        else pseudo_w.detach()
+                    )
                     conf_s = None
-                    sam_aux = {"used_sam": False}
+                    sam_aux = None if use_legacy_sam else {"used_sam": False}
                 else:
                     with torch.no_grad():
                         teacher_kwargs = {
@@ -945,6 +1013,22 @@ class SemiSupervisedTrainer:
         if isinstance(preds, tuple) and len(preds) == 2:
             preds = preds[1]
         return preds[-1].sigmoid().detach()
+
+    def _align_legacy_pseudo_to_strong(self, pseudo_prob, geom):
+        if geom is None:
+            return pseudo_prob.detach()
+        return self._apply_geom(pseudo_prob, geom).detach()
+
+    def _run_legacy_sam_refiner(self, images, teacher_prob, epoch, step, image_ids=None):
+        if self.legacy_sam_refiner is None:
+            raise RuntimeError("Legacy SAM refiner is not initialized")
+        return self.legacy_sam_refiner(
+            images,
+            teacher_prob,
+            epoch=epoch,
+            step=step,
+            image_ids=image_ids,
+        )
 
     def _align_weak_to_strong(self, p_ref, conf_ref, geom):
         if geom is None:

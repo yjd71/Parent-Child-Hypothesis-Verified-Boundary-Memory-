@@ -45,6 +45,7 @@ lr_decay_rate = 0.5
 
 
 # SVB-PLR main switches
+sam_refine_mode = "svb"
 use_svb_plr = True
 use_sam_refine_unlabeled = True
 svb_ablation_mode = "full"

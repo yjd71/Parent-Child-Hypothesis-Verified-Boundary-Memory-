@@ -9,6 +9,8 @@ tot_epochs = 15
 
 sup_only_train_epoch = 5
 distributed_train = False
+sam_refine_mode = "off"
+
 device_map = {
     'model': '*'
 }  # Only available for non distributed training

@@ -19,7 +19,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 class SamRefineVisualizer:
-    """Save SVB-PLR 3x4 diagnostic panels.
+    """Save SAM refinement 3x4 diagnostic panels for SVB and legacy paths.
 
     Shape:
         images: [B, 3, H_img, W_img]
@@ -36,7 +36,7 @@ class SamRefineVisualizer:
         "S_bg",
         "M_bd",
         "refine_band",
-        "points",
+        "prompt_points_boxes",
         "R_sam",
         "conf_ref",
         "sam_teacher_diff",
@@ -92,7 +92,7 @@ class SamRefineVisualizer:
                 panel_image = self._compose_grid(panels, Image, ImageDraw)
                 panel_image.save(str(save_root / "{}.png".format(self._safe_name(image_id))))
         except Exception as exc:
-            self._warn("[SVB-PLR] visualization save failed: {}".format(exc))
+            self._warn("[SAM-Refine] visualization save failed: {}".format(exc))
 
     def _build_panels(
         self,
@@ -117,7 +117,7 @@ class SamRefineVisualizer:
         sbg_rgb = self._map_panel(self._map_from(evidence, "S_bg_up", ref), idx, ref)
         mbd_rgb = self._signed_map_panel(self._map_from(evidence, "M_bd_up", ref), idx, ref)
         band_rgb = self._prob_map_panel(sam_aux.get("refine_band"), idx, ref)
-        points_rgb = self._points_panel(image_rgb, prompt_pack, idx, ref)
+        prompts_rgb = self._prompt_points_boxes_panel(image_rgb, prompt_pack, idx, ref)
         rsam_rgb = self._prob_map_panel(sam_aux.get("R_sam"), idx, ref)
         conf_rgb = self._prob_map_panel(conf_ref, idx, ref)
         diff_rgb = self._sam_teacher_diff_panel(sam_mask, ref, idx)
@@ -134,7 +134,7 @@ class SamRefineVisualizer:
                     sbg_rgb,
                     mbd_rgb,
                     band_rgb,
-                    points_rgb,
+                    prompts_rgb,
                     rsam_rgb,
                     conf_rgb,
                     diff_rgb,
@@ -181,7 +181,7 @@ class SamRefineVisualizer:
         green = 1.0 - (red + blue).clamp(0.0, 1.0)
         return self._rgb_tensor_to_uint8(torch.stack((red, green, blue), dim=0))
 
-    def _points_panel(self, image_rgb, prompt_pack, idx: int, ref: torch.Tensor):
+    def _prompt_points_boxes_panel(self, image_rgb, prompt_pack, idx: int, ref: torch.Tensor):
         try:
             from PIL import Image, ImageDraw
         except Exception:
@@ -189,6 +189,7 @@ class SamRefineVisualizer:
         image = Image.fromarray(image_rgb.copy())
         draw = ImageDraw.Draw(image)
         radius = max(2, min(ref.shape[-2:]) // 80)
+        self._draw_box_list(draw, self._boxes_for(prompt_pack, idx), (0, 200, 255), radius)
         self._draw_point_list(draw, self._points_for(prompt_pack, "pos_points", idx), radius, (0, 255, 0))
         self._draw_point_list(draw, self._points_for(prompt_pack, "neg_points", idx), radius, (255, 0, 0))
         self._draw_point_list(draw, self._points_for(prompt_pack, "boundary_points", idx), radius, (255, 255, 0))
@@ -206,6 +207,13 @@ class SamRefineVisualizer:
             draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=color, width=max(1, radius // 2))
 
     @staticmethod
+    def _draw_box_list(draw, boxes: torch.Tensor, color, radius: int) -> None:
+        if not torch.is_tensor(boxes) or boxes.numel() == 0:
+            return
+        for x0, y0, x1, y1 in boxes.detach().cpu().float().reshape(-1, 4).tolist():
+            draw.rectangle((x0, y0, x1, y1), outline=color, width=max(2, radius // 2))
+
+    @staticmethod
     def _points_for(prompt_pack, key: str, idx: int) -> torch.Tensor:
         if not isinstance(prompt_pack, Mapping):
             return torch.empty(0, 2)
@@ -213,6 +221,20 @@ class SamRefineVisualizer:
         if isinstance(value, Sequence) and not torch.is_tensor(value) and len(value) > idx and torch.is_tensor(value[idx]):
             return value[idx]
         return torch.empty(0, 2)
+
+    @staticmethod
+    def _boxes_for(prompt_pack, idx: int) -> torch.Tensor:
+        if not isinstance(prompt_pack, Mapping):
+            return torch.empty(0, 4)
+        value = prompt_pack.get("boxes")
+        if torch.is_tensor(value):
+            if value.dim() == 2 and idx == 0:
+                return value.reshape(-1, 4)
+            if value.dim() == 3 and value.size(0) > idx:
+                return value[idx].reshape(-1, 4)
+        if isinstance(value, Sequence) and len(value) > idx and torch.is_tensor(value[idx]):
+            return value[idx].reshape(-1, 4)
+        return torch.empty(0, 4)
 
     @staticmethod
     def _map_from(mapping, key: str, ref: torch.Tensor):

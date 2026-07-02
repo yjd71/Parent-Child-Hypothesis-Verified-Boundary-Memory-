@@ -335,16 +335,19 @@ class Sam2PromptRefiner:
         gamma=4.0,
         strength=30,
         coarse_threshold=0.5,
+        return_prompt_debug=False,
     ):
         masks_tensor = self._prepare_masks(coarse_masks, coarse_threshold)
         pred_masks = masks_tensor.detach().cpu().numpy().astype(np.uint8)
         low_res_logits = [None for _ in range(len(pred_masks))]
 
         self.set_image(image)
+        final_prompt_debug = []
         with torch.inference_mode():
             for _ in range(max(1, int(iters))):
                 next_masks = []
                 next_logits = []
+                iteration_prompt_debug = []
                 current_tensor = torch.as_tensor(pred_masks, device=self.device, dtype=torch.uint8)
 
                 for idx, pred_mask in enumerate(pred_masks):
@@ -364,6 +367,22 @@ class Sam2PromptRefiner:
                             mask_input = self._mask_to_logits(pred_mask, strength)
                     else:
                         mask_input = None
+
+                    iteration_prompt_debug.append(
+                        {
+                            "boxes": None if box is None else np.asarray(box, dtype=np.float32).copy(),
+                            "point_coords": (
+                                None
+                                if point_coords is None
+                                else np.asarray(point_coords, dtype=np.float32).copy()
+                            ),
+                            "point_labels": (
+                                None
+                                if point_labels is None
+                                else np.asarray(point_labels, dtype=np.int32).copy()
+                            ),
+                        }
+                    )
 
                     if box is None and point_coords is None and mask_input is None:
                         next_masks.append(pred_mask.astype(np.uint8))
@@ -387,5 +406,8 @@ class Sam2PromptRefiner:
 
                 pred_masks = np.stack(next_masks, axis=0).astype(np.uint8)
                 low_res_logits = next_logits
+                final_prompt_debug = iteration_prompt_debug
 
+        if return_prompt_debug:
+            return pred_masks, low_res_logits, final_prompt_debug
         return pred_masks, low_res_logits

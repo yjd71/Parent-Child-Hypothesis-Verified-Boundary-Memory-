@@ -13,6 +13,7 @@ pred_save_root = ckpt_dir.rstrip("/\\") + "/training_preds"
 
 
 # SVB-PLR main switches
+sam_refine_mode = "svb"
 use_svb_plr = True
 use_sam_refine_unlabeled = True
 svb_ablation_mode = "full"  # off | teacher_sam_full | boundary_only | cbm_points | reliability | conformal | full

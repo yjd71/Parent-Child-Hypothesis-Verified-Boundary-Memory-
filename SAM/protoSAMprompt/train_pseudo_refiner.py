@@ -6,14 +6,16 @@ import torch.nn.functional as F
 
 try:
     from ..SAM_refinement.sam_image_cache import SAMImageEmbeddingCache
+    from ..SAM_refinement.sam_refine_visualizer import SamRefineVisualizer
 except ImportError:
     from SAM.SAM_refinement.sam_image_cache import SAMImageEmbeddingCache
+    from SAM.SAM_refinement.sam_refine_visualizer import SamRefineVisualizer
 
 from utils.sam_pseudo_logging import SamPseudoRefineLogger
 
 
 class _NoOpPseudoLabelRefiner:
-    def __call__(self, images, pseudo_probs, epoch=None, step=None):
+    def __call__(self, images, pseudo_probs, epoch=None, step=None, image_ids=None):
         return pseudo_probs
 
 
@@ -44,9 +46,17 @@ class _BaseSamPseudoLabelRefiner:
         )
         self.refine_logger = SamPseudoRefineLogger(
             logger=logger,
-            enabled=getattr(config, "sam_pseudo_log_enable", True),
-            interval=getattr(config, "sam_pseudo_log_interval", 20),
+            enabled=getattr(config, "log_enable", True),
+            interval=getattr(config, "log_interval", 200),
         )
+        self.visualizer = None
+        mode = str(getattr(config, "sam_refine_mode", "off")).strip().lower()
+        if mode == "legacy_auto" and bool(getattr(config, "vis_sam_refinement", True)):
+            self.visualizer = SamRefineVisualizer(config, logger=logger)
+            legacy_vis_dir = getattr(config, "legacy_sam_refine_vis_dir", None)
+            if not legacy_vis_dir:
+                legacy_vis_dir = Path(getattr(config, "ckpt_dir", ".")) / "legacy_sam_refinement_vis"
+            self.visualizer.save_dir = Path(legacy_vis_dir)
 
         self.total_refined = 0
         self.total_skipped = 0
@@ -128,7 +138,10 @@ class _BaseSamPseudoLabelRefiner:
     def _refine_one(self, image_np, coarse_mask):
         raise NotImplementedError
 
-    def __call__(self, images, pseudo_probs, epoch=None, step=None):
+    def _refine_one_with_debug(self, image_np, coarse_mask):
+        return self._refine_one(image_np, coarse_mask), {}
+
+    def __call__(self, images, pseudo_probs, epoch=None, step=None, image_ids=None):
         if images is None or pseudo_probs is None:
             return pseudo_probs
         if pseudo_probs.ndim != 4 or pseudo_probs.shape[1] != 1:
@@ -147,6 +160,8 @@ class _BaseSamPseudoLabelRefiner:
         pseudo_hw = pseudo_probs.shape[-2:]
         batch_stats = self.refine_logger.new_batch_stats(pseudo_probs.shape[0], image_hw, pseudo_hw)
         change_sums = self.refine_logger.new_change_sums()
+        sam_masks_for_vis = pseudo_probs.detach().clone()
+        prompt_debug_for_vis = [{} for _ in range(pseudo_probs.shape[0])]
 
         if pseudo_hw != image_hw:
             pseudo_for_sam = F.interpolate(
@@ -168,7 +183,9 @@ class _BaseSamPseudoLabelRefiner:
 
                 try:
                     image_np = self._denormalize_image(images[idx])
-                    sam_mask = self._refine_one(image_np, coarse_mask.cpu().numpy())
+                    sam_mask, prompt_debug = self._refine_one_with_debug(
+                        image_np, coarse_mask.cpu().numpy()
+                    )
                     sam_mask = sam_mask.to(device=original_device, dtype=output.dtype).view(1, 1, *image_hw)
                     if pseudo_hw != image_hw:
                         sam_mask = F.interpolate(
@@ -176,6 +193,10 @@ class _BaseSamPseudoLabelRefiner:
                             size=pseudo_hw,
                             mode="nearest",
                         ).to(dtype=output.dtype)
+                    sam_masks_for_vis[idx:idx + 1] = sam_mask
+                    prompt_debug_for_vis[idx] = self._normalize_prompt_debug(
+                        prompt_debug, image_hw, pseudo_hw
+                    )
                     teacher_prob = pseudo_probs[idx:idx + 1].detach()
                     fused = alpha * sam_mask + (1.0 - alpha) * teacher_prob
                     output[idx:idx + 1] = fused.clamp(0, 1).to(dtype=output.dtype)
@@ -195,7 +216,82 @@ class _BaseSamPseudoLabelRefiner:
                     self.refine_logger.warn_once("exception", "[!] SAM pseudo refine skipped for at least one sample: {}".format(exc))
 
         self.refine_logger.log_batch(epoch, step, batch_stats, change_sums, self.total_refined, self.total_skipped)
+        self._save_visualization(
+            images=images,
+            teacher_prob=pseudo_probs,
+            sam_mask=sam_masks_for_vis,
+            p_ref=output,
+            prompt_debug=prompt_debug_for_vis,
+            image_ids=image_ids,
+            epoch=epoch,
+            step=step,
+        )
         return output.to(device=original_device, dtype=original_dtype)
+
+    @staticmethod
+    def _normalize_prompt_debug(prompt_debug, source_hw, target_hw):
+        if not isinstance(prompt_debug, dict):
+            return {}
+        scale_y = float(target_hw[0]) / max(1.0, float(source_hw[0]))
+        scale_x = float(target_hw[1]) / max(1.0, float(source_hw[1]))
+
+        def _scaled(value, width):
+            if value is None:
+                return torch.empty((0, width), dtype=torch.float32)
+            tensor = torch.as_tensor(value).detach().cpu().float().reshape(-1, width)
+            if tensor.numel() == 0:
+                return tensor
+            tensor[:, 0::2] *= scale_x
+            tensor[:, 1::2] *= scale_y
+            return tensor
+
+        coords = _scaled(prompt_debug.get("point_coords"), 2)
+        labels_value = prompt_debug.get("point_labels")
+        labels = (
+            torch.as_tensor(labels_value).detach().cpu().reshape(-1)
+            if labels_value is not None
+            else torch.empty(0, dtype=torch.int64)
+        )
+        count = min(coords.size(0), labels.numel())
+        coords = coords[:count]
+        labels = labels[:count]
+        return {
+            "pos_points": coords[labels > 0],
+            "neg_points": coords[labels <= 0],
+            "boxes": _scaled(prompt_debug.get("boxes"), 4),
+        }
+
+    def _save_visualization(
+        self,
+        images,
+        teacher_prob,
+        sam_mask,
+        p_ref,
+        prompt_debug,
+        image_ids,
+        epoch,
+        step,
+    ):
+        if self.visualizer is None:
+            return
+        empty = [torch.empty(0, 2) for _ in prompt_debug]
+        prompt_pack = {
+            "pos_points": [item.get("pos_points", empty[idx]) for idx, item in enumerate(prompt_debug)],
+            "neg_points": [item.get("neg_points", empty[idx]) for idx, item in enumerate(prompt_debug)],
+            "boundary_points": empty,
+            "boxes": [item.get("boxes", torch.empty(0, 4)) for item in prompt_debug],
+        }
+        self.visualizer.save(
+            images=images,
+            teacher_prob=teacher_prob,
+            sam_mask=sam_mask,
+            p_ref=p_ref,
+            conf_ref=None,
+            sam_aux={"prompt_pack": prompt_pack},
+            image_ids=image_ids,
+            epoch=epoch,
+            step=step,
+        )
 
 
 class Sam1PseudoLabelRefiner(_BaseSamPseudoLabelRefiner):
@@ -234,9 +330,13 @@ class Sam1PseudoLabelRefiner(_BaseSamPseudoLabelRefiner):
         return sam_model_registry, sam_refiner
 
     def _refine_one(self, image_np, coarse_mask):
+        refined, _ = self._refine_one_with_debug(image_np, coarse_mask)
+        return refined
+
+    def _refine_one_with_debug(self, image_np, coarse_mask):
         if coarse_mask.ndim == 2:
             coarse_mask = coarse_mask[None, ...]
-        refined_masks, _ = self.sam_refiner(
+        refined_masks, _, prompt_debug = self.sam_refiner(
             image_np,
             coarse_mask,
             self.sam,
@@ -253,8 +353,19 @@ class Sam1PseudoLabelRefiner(_BaseSamPseudoLabelRefiner):
             is_train=False,
             coarse_threshold=self.threshold,
             embedding_cache=self.embedding_cache,
+            return_prompt_debug=True,
         )
-        return torch.from_numpy(refined_masks[0]).float()
+        boxes = prompt_debug.get("boxes")
+        sample_debug = {
+            "boxes": (
+                boxes[0:1]
+                if torch.is_tensor(boxes) and boxes.numel() > 0
+                else torch.empty(0, 4)
+            ),
+            "point_coords": prompt_debug.get("point_coords", torch.empty(1, 0, 2))[0],
+            "point_labels": prompt_debug.get("point_labels", torch.empty(1, 0))[0],
+        }
+        return torch.from_numpy(refined_masks[0]).float(), sample_debug
 
 
 class Sam2PseudoLabelRefiner(_BaseSamPseudoLabelRefiner):
@@ -294,9 +405,13 @@ class Sam2PseudoLabelRefiner(_BaseSamPseudoLabelRefiner):
         return name
 
     def _refine_one(self, image_np, coarse_mask):
+        refined, _ = self._refine_one_with_debug(image_np, coarse_mask)
+        return refined
+
+    def _refine_one_with_debug(self, image_np, coarse_mask):
         if coarse_mask.ndim == 2:
             coarse_mask = coarse_mask[None, ...]
-        refined_masks, _ = self.sam2_refiner(
+        refined_masks, _, prompt_debug = self.sam2_refiner(
             image_np,
             coarse_mask,
             use_point=self.use_point,
@@ -307,16 +422,24 @@ class Sam2PseudoLabelRefiner(_BaseSamPseudoLabelRefiner):
             gamma=self.gamma,
             strength=self.strength,
             coarse_threshold=self.threshold,
+            return_prompt_debug=True,
         )
-        return torch.from_numpy(refined_masks[0]).float()
+        sample_debug = prompt_debug[0] if prompt_debug else {}
+        return torch.from_numpy(refined_masks[0]).float(), sample_debug
 
 
 class SamPseudoLabelRefiner:
     def __init__(self, config, device, logger=None):
         self.refiner = _build_enabled_refiner(config=config, device=device, logger=logger)
 
-    def __call__(self, images, pseudo_probs, epoch=None, step=None):
-        return self.refiner(images, pseudo_probs, epoch=epoch, step=step)
+    def __call__(self, images, pseudo_probs, epoch=None, step=None, image_ids=None):
+        return self.refiner(
+            images,
+            pseudo_probs,
+            epoch=epoch,
+            step=step,
+            image_ids=image_ids,
+        )
 
 
 def _build_enabled_refiner(config, device, logger=None):
@@ -329,6 +452,4 @@ def _build_enabled_refiner(config, device, logger=None):
 
 
 def build_sam_pseudo_label_refiner(config, device, logger=None):
-    if not bool(getattr(config, "use_sam_pseudo_refine", False)):
-        return _NoOpPseudoLabelRefiner()
     return SamPseudoLabelRefiner(config=config, device=device, logger=logger)

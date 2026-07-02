@@ -45,6 +45,7 @@ def sam_input_prepare(image, pred_masks, image_embeddings=None, resize_transform
 
     target_size = image.shape[1:]
     expand_list = torch.zeros((len(pred_masks))).to(image.device)
+    bboxes = pred_masks.new_empty((0, 4), dtype=torch.float32)
     if use_box:
         bboxes, box_masks, areas, expand_list = extract_bboxes_expand(image_embeddings, pred_masks, margin=margin)
         input_dict['boxes'] = resize_transform.apply_boxes_torch(bboxes, ori_size)
@@ -59,7 +60,20 @@ def sam_input_prepare(image, pred_masks, image_embeddings=None, resize_transform
     if use_mask:
         input_dict['mask_inputs'] = extract_mask(pred_masks, gaus_dt, target_size, is01=True, strength=strength, device=image.device, expand_list=expand_list)
 
-    return input_dict,point_coords
+    prompt_debug = {
+        "boxes": bboxes.detach(),
+        "point_coords": (
+            point_coords.detach()
+            if use_point
+            else point_coords.new_empty((len(pred_masks), 0, 2))
+        ),
+        "point_labels": (
+            point_labels.detach()
+            if use_point
+            else point_labels.new_empty((len(pred_masks), 0))
+        ),
+    }
+    return input_dict, prompt_debug
 
 
 def sam_refiner(image,
@@ -78,7 +92,8 @@ def sam_refiner(image,
                 ddp=False,
                 is_train=False,
                 coarse_threshold=0.5,
-                embedding_cache=None):
+                embedding_cache=None,
+                return_prompt_debug=False):
     """
     SAMRefiner refines coarse masks from an image by generating noise-tolerant prompts for SAM.
 
@@ -162,8 +177,9 @@ def sam_refiner(image,
 
     pred_mask_list = coarse_masks.to(torch.uint8)
 
+    final_prompt_debug = {}
     for _ in range(iters):
-        input_dict, point_coords = sam_input_prepare(image[0],
+        input_dict, final_prompt_debug = sam_input_prepare(image[0],
                                                      pred_mask_list,
                                                      image_embeddings,
                                                      resize_transform,
@@ -216,4 +232,6 @@ def sam_refiner(image,
 
     refined_masks = pred_mask_list.cpu().numpy().astype(np.uint8)
     assert len(refined_masks) == len(coarse_masks)
+    if return_prompt_debug:
+        return refined_masks, sam_masks_logits, final_prompt_debug
     return refined_masks, sam_masks_logits

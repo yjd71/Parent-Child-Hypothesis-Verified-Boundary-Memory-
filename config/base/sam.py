@@ -1,8 +1,10 @@
 # SAM backend settings reused by SVB-PLR.
+sam_refine_mode = "off"  # off | legacy_auto | svb
 sam_pseudo_backend = "sam1"  # sam1 | sam2
 sam_pseudo_checkpoint = "SAM/sam_hq_vit_h.pth"
 sam_pseudo_model_type = "vit_h"
 sam_pseudo_threshold = 0.5
+sam_pseudo_fusion_alpha = 0.5
 sam_pseudo_iters = 1
 sam_pseudo_use_point = True
 sam_pseudo_use_box = True
@@ -217,6 +219,7 @@ vis_sam_refinement = True
 vis_sam_refine_interval = 200
 vis_sam_refine_max_samples = 2
 sam_refine_vis_dir = "outputs/svb_plr_visualization"
+legacy_sam_refine_vis_dir = None  # defaults to <ckpt_dir>/legacy_sam_refinement_vis
 
 # Loss
 use_svb_weighted_unsup_loss = True

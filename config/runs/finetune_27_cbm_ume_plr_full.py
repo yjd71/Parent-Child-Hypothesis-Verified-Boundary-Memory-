@@ -30,6 +30,7 @@ log_enable = True
 log_interval = 600
 
 # SVB-PLR main switches
+sam_refine_mode = "svb"
 use_svb_plr = True
 use_sam_refine_unlabeled = True
 svb_ablation_mode = "full"  # off | teacher_sam_full | boundary_only | cbm_points | reliability | conformal | full
@@ -91,7 +92,7 @@ tau_token = {
 }
 sv_ume_token_score_mode = "weighted_sum"
 sv_ume_regions = ["fg_core", "fg_boundary", "bg_near", "bg_far"]
-sv_ume_diagnostics_interval = 20
+sv_ume_diagnostics_interval = 600
 sv_ume_profile_name = "four_region_near_1to1_v1"
 
 # Diversity
@@ -133,7 +134,7 @@ aux_fusion_mode = "quality_adaptive_symmetric"
 gamma_max_final = 1
 use_aux_source_penalty = True
 aux_source_penalty_value = 0.25
-allow_aux_dominate = False
+allow_aux_dominate = True
 
 # Quality score weights
 fusion_score_sim_weight = 1.0
