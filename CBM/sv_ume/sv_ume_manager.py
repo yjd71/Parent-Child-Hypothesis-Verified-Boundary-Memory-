@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional
 import torch
 
 from CBM.memory.labels import REGION_NAMES
+from CBM.sv_ume.config_contract import validate_sv_ume_profile_contract
 from CBM.sv_ume.schedules import (
     can_use_lagged_memory,
     expected_unlabeled_source_epoch,
@@ -22,6 +23,10 @@ from utils.log_control import log_enabled
 LOGGER = logging.getLogger(__name__)
 STATE_VERSION = 2
 LEGACY_STATE_VERSION = 1
+
+
+class SVUMEZeroCandidatesError(RuntimeError):
+    """Raised when a complete collection pass admits no memory candidates."""
 
 
 class SVUMEManager:
@@ -212,11 +217,23 @@ class SVUMEManager:
             f"region_pixel_counts={self.epoch_stats['region_pixel_counts']} "
             f"region_image_counts={self.epoch_stats['region_image_counts']} "
             f"image_score={self.epoch_stats['image_score']} "
+            f"image_threshold={self.epoch_stats['image_threshold']} "
+            f"image_valid={self.epoch_stats['image_evidence_valid_count']} "
+            f"image_above={self.epoch_stats['image_above_threshold_count']} "
+            f"image_allowed={self.epoch_stats['image_allowed_count']} "
+            f"image_quantiles={self.epoch_stats['image_score_quantiles']} "
+            f"image_components={self.epoch_stats['image_component_quantiles']} "
             f"region_score_mean={self.epoch_stats['region_score_mean']} "
             f"token_score={self.epoch_stats['token_score_quantiles']} "
             f"cbm_valid_ratio={self.epoch_stats['cbm_valid_ratio']} "
             f"global_type_counts={self.epoch_stats['global_type_counts']}"
         )
+        if sum(self.epoch_stats["candidate_counts"].values()) == 0:
+            message = self._zero_candidate_message(current_epoch)
+            self.epoch_stats["status"] = "zero_candidates"
+            self.epoch_stats["error"] = message
+            self._error(message)
+            raise SVUMEZeroCandidatesError(message)
         return self.epoch_stats
 
     def build_next_memory(self, labeled_memory, epoch: int):
@@ -229,6 +246,8 @@ class SVUMEManager:
                 f"candidate pool belongs to epoch {self._candidate_epoch}, "
                 f"cannot build U_{current_epoch}"
             )
+        if sum(self._candidate_counts().values()) == 0:
+            raise SVUMEZeroCandidatesError(self._zero_candidate_message(current_epoch))
         if labeled_memory is None:
             raise ValueError("labeled_memory is required to enforce U:L capacity")
 
@@ -421,6 +440,7 @@ class SVUMEManager:
         return self
 
     def _validate_enabled_config(self) -> None:
+        validate_sv_ume_profile_contract(self.cfg)
         for name, default in (
             ("use_aux_evidence_fusion", True),
             ("use_aux_feature_fusion", True),
@@ -549,6 +569,38 @@ class SVUMEManager:
         image_score["min"] = batch_min if previous_count == 0 else min(image_score["min"], batch_min)
         image_score["max"] = batch_max if previous_count == 0 else max(image_score["max"], batch_max)
         image_score["mean"] = image_score["sum"] / max(image_score["count"], 1)
+        batch_threshold = stats.get("image_threshold")
+        if batch_threshold is not None:
+            batch_threshold = float(batch_threshold)
+            epoch_threshold = self.epoch_stats["image_threshold"]
+            if epoch_threshold is None:
+                self.epoch_stats["image_threshold"] = batch_threshold
+            elif not math.isclose(
+                float(epoch_threshold), batch_threshold, rel_tol=0.0, abs_tol=1.0e-8
+            ):
+                raise RuntimeError(
+                    f"image threshold changed within collection: "
+                    f"{epoch_threshold} -> {batch_threshold}"
+                )
+        for name in (
+            "image_evidence_valid_count",
+            "image_above_threshold_count",
+            "image_allowed_count",
+        ):
+            self.epoch_stats[name] += int(stats.get(name, 0))
+        self._merge_quantile_summary(
+            self.epoch_stats["image_score_quantiles"],
+            "score",
+            stats.get("image_score_quantiles", {}),
+        )
+        source_image_components = stats.get("image_component_quantiles", {})
+        if isinstance(source_image_components, Mapping):
+            for name, summary in source_image_components.items():
+                self._merge_quantile_summary(
+                    self.epoch_stats["image_component_quantiles"],
+                    str(name),
+                    summary,
+                )
         for field in (
             "region_pixel_counts",
             "region_image_counts",
@@ -588,6 +640,22 @@ class SVUMEManager:
                 target["count"] += count
                 target["sum"] += float(value) * count
                 target["mean"] = target["sum"] / max(target["count"], 1)
+
+    def _zero_candidate_message(self, epoch: int) -> str:
+        return (
+            f"[SV-UME][zero-candidates] epoch={epoch} profile="
+            f"{getattr(self.cfg, 'sv_ume_profile_name', 'unversioned')} "
+            f"config={getattr(self.cfg, 'run_cfg_path', '<unknown>')} "
+            f"sha256={getattr(self.cfg, 'run_cfg_sha256', '<unknown>')} "
+            f"image_threshold={self.epoch_stats.get('image_threshold')} "
+            f"image_valid={self.epoch_stats.get('image_evidence_valid_count', 0)} "
+            f"image_above={self.epoch_stats.get('image_above_threshold_count', 0)} "
+            f"image_allowed={self.epoch_stats.get('image_allowed_count', 0)} "
+            f"image_score={self.epoch_stats.get('image_score_quantiles', {})} "
+            f"image_components={self.epoch_stats.get('image_component_quantiles', {})} "
+            f"rejected={self.epoch_stats.get('rejected', {})} "
+            f"token_score={self.epoch_stats.get('token_score_quantiles', {})}"
+        )
 
     @staticmethod
     def _merge_quantile_summary(target: Dict[str, Any], name: str, summary) -> None:
@@ -1088,6 +1156,12 @@ class SVUMEManager:
                 "min": 0.0,
                 "max": 0.0,
             },
+            "image_threshold": None,
+            "image_evidence_valid_count": 0,
+            "image_above_threshold_count": 0,
+            "image_allowed_count": 0,
+            "image_score_quantiles": {},
+            "image_component_quantiles": {},
             "region_score_sum": {region: 0.0 for region in REGION_NAMES},
             "region_score_mean": {region: 0.0 for region in REGION_NAMES},
             "region_score_weight": 0,
@@ -1143,4 +1217,4 @@ class SVUMEManager:
             log_fn(message)
 
 
-__all__ = ["SVUMEManager"]
+__all__ = ["SVUMEManager", "SVUMEZeroCandidatesError"]

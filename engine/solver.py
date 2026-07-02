@@ -270,7 +270,8 @@ class SemiSupervisedTrainer:
         tau_region = getattr(cfg, "tau_region", {})
         tau_token = getattr(cfg, "tau_token", {})
         self._log_sv_ume(
-            "[CFG][SV-UME] enabled={} start_epoch={} tot_epochs={} "
+            "[CFG][SV-UME] profile={} config={} sha256={} "
+            "enabled={} start_epoch={} tot_epochs={} "
             "lagged_use={} build_after_epoch={} current_epoch_use={} "
             "score_mode={} regions={} image_tau={} "
             "region_tau=({}/{}/{}/{}) token_tau=({}/{}/{}/{}) "
@@ -278,6 +279,9 @@ class SemiSupervisedTrainer:
             "source_penalty={}:{} allow_aux_dominate={} "
             "ume_evidence_loss={}:{} source_consistency={} "
             "mask_prompt={} pseudo_mask={} embedding_cache={} disk_cache={} conformal={}".format(
+                getattr(cfg, "sv_ume_profile_name", "unversioned"),
+                getattr(cfg, "run_cfg_path", "<unknown>"),
+                getattr(cfg, "run_cfg_sha256", "<unknown>"),
                 bool(getattr(cfg, "use_sv_ume", False)),
                 int(getattr(cfg, "sv_ume_start_epoch", 21)),
                 int(getattr(cfg, "tot_epochs", 0)),

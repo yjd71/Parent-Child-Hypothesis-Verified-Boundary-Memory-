@@ -76,19 +76,23 @@ sample_per_image_unlabeled = {
 }
 
 # Image / region / token thresholds
-tau_image = 0.80
+tau_image = 0.50
 tau_region = {
-    "fg_core": 0.85,
-    "fg_boundary": 0.92,
-    "bg_near": 0.94,
-    "bg_far": 0.85,
+    "fg_core": 0.50,
+    "fg_boundary": 0.60,
+    "bg_near": 0.65,
+    "bg_far": 0.50,
 }
 tau_token = {
-    "fg_core": 0.85,
-    "fg_boundary": 0.92,
-    "bg_near": 0.94,
-    "bg_far": 0.85,
+    "fg_core": 0.20,
+    "fg_boundary": 0.25,
+    "bg_near": 0.30,
+    "bg_far": 0.20,
 }
+sv_ume_token_score_mode = "weighted_sum"
+sv_ume_regions = ["fg_boundary", "bg_near"]
+sv_ume_diagnostics_interval = 20
+sv_ume_profile_name = "boundary_debug_v1"
 
 # Diversity
 use_diversity_selection = True
@@ -115,9 +119,10 @@ retrieve_labeled_and_unlabeled_separately = True
 use_aux_evidence_fusion = True
 use_aux_feature_fusion = True
 aux_fusion_mode = "quality_adaptive_symmetric"
-gamma_max_final = 1.0
-use_aux_source_penalty = False
-allow_aux_dominate = True
+gamma_max_final = 1
+use_aux_source_penalty = True
+aux_source_penalty_value = 0.25
+allow_aux_dominate = False
 
 # Quality score weights
 fusion_score_sim_weight = 1.0
@@ -131,8 +136,8 @@ use_unlabeled_memory_ema_refresh = False
 unlabeled_memory_momentum = 0.99
 
 # Losses
-use_ume_evidence_loss = False
-use_source_consistency_loss = False
+use_ume_evidence_loss = True
+use_source_consistency_loss = True
 lambda_ume_evi = 0.05
 lambda_source_cons = 0.02
 source_consistency_tau = 0.70
@@ -216,16 +221,40 @@ cache_prompt_debug = False
 
 # Frozen SAM2 predictor states are teacher-independent.  Keep a small CPU LRU
 # and a bounded persistent disk layer for exact augmented-image views.
-use_sam_embedding_cache = False
+use_sam_embedding_cache = True
 sam_image_embedding_cache_size = 64  # SAM1 compatibility
 sam2_image_embedding_cache_size = 16
-sam_embedding_cache_disk = False
+sam_embedding_cache_disk = True
 sam_embedding_cache_dir = "./cache/sam_image_embeddings/sam2.1_hiera_large"
 sam_embedding_cache_max_gb = 32
 sam_embedding_cache_store_dtype = "float16"  # SAM1 compatibility
 sam2_embedding_cache_store_dtype = "float32"
 sam_embedding_cache_prune_interval = 256
 sam_embedding_cache_version = "sam2.1_hiera_large_state_v1_fp32"
+
+# Fail before training if this run file was not applied as the final config layer.
+sv_ume_profile_contract = {
+    "sv_ume_start_epoch": 16,
+    "tau_image": 0.50,
+    "tau_region": {
+        "fg_core": 0.50,
+        "fg_boundary": 0.60,
+        "bg_near": 0.65,
+        "bg_far": 0.50,
+    },
+    "tau_token": {
+        "fg_core": 0.20,
+        "fg_boundary": 0.25,
+        "bg_near": 0.30,
+        "bg_far": 0.20,
+    },
+    "sv_ume_token_score_mode": "weighted_sum",
+    "sv_ume_regions": ["fg_boundary", "bg_near"],
+    "use_sam_cache": False,
+    "use_svb_output_cache": False,
+    "use_sam_embedding_cache": True,
+    "sam_embedding_cache_disk": True,
+}
 
 
 # Visualization

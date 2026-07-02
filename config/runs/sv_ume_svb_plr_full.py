@@ -81,6 +81,7 @@ tau_token = {
 sv_ume_token_score_mode = "weighted_sum"
 sv_ume_regions = ["fg_boundary", "bg_near"]
 sv_ume_diagnostics_interval = 20
+sv_ume_profile_name = "boundary_debug_v1"
 
 # Diversity
 use_diversity_selection = True
@@ -105,9 +106,9 @@ novel_min_temporal_stability = 0.85
 # Retrieval fusion
 retrieve_labeled_and_unlabeled_separately = True
 use_aux_evidence_fusion = True
-use_aux_feature_fusion = False
+use_aux_feature_fusion = True
 aux_fusion_mode = "quality_adaptive_symmetric"
-gamma_max_final = 0.25
+gamma_max_final = 1
 use_aux_source_penalty = True
 aux_source_penalty_value = 0.25
 allow_aux_dominate = False
@@ -125,8 +126,8 @@ unlabeled_memory_momentum = 0.99
 
 # Losses
 use_ume_evidence_loss = True
-use_source_consistency_loss = False
-lambda_ume_evi = 0.02
+use_source_consistency_loss = True
+lambda_ume_evi = 0.05
 lambda_source_cons = 0.02
 source_consistency_tau = 0.70
 
@@ -144,7 +145,7 @@ sam_pseudo_threshold = 0.5
 sam_pseudo_iters = 1
 sam_pseudo_use_point = True
 sam_pseudo_use_box = True
-sam_pseudo_use_mask = False
+sam_pseudo_use_mask = True
 sam_pseudo_add_neg = True
 sam_pseudo_margin = 0.0
 sam_pseudo_gamma = 4.0
@@ -182,7 +183,7 @@ sam_gate_weight = 0.5
 sam_use_teacher_agreement = True
 sam_use_cbm_agreement = True
 sam_use_stability = True
-sam_use_conformal = False
+sam_use_conformal = True
 sam_min_reliability = 0.3
 sam_teacher_agree_weight = 0.25
 sam_cbm_agree_weight = 0.20
@@ -219,6 +220,31 @@ sam_embedding_cache_store_dtype = "float16"  # SAM1 compatibility
 sam2_embedding_cache_store_dtype = "float32"
 sam_embedding_cache_prune_interval = 256
 sam_embedding_cache_version = "sam2.1_hiera_large_state_v1_fp32"
+
+
+# Fail before training if this run file was not applied as the final config layer.
+sv_ume_profile_contract = {
+    "sv_ume_start_epoch": 16,
+    "tau_image": 0.50,
+    "tau_region": {
+        "fg_core": 0.50,
+        "fg_boundary": 0.60,
+        "bg_near": 0.65,
+        "bg_far": 0.50,
+    },
+    "tau_token": {
+        "fg_core": 0.20,
+        "fg_boundary": 0.25,
+        "bg_near": 0.30,
+        "bg_far": 0.20,
+    },
+    "sv_ume_token_score_mode": "weighted_sum",
+    "sv_ume_regions": ["fg_boundary", "bg_near"],
+    "use_sam_cache": False,
+    "use_svb_output_cache": False,
+    "use_sam_embedding_cache": True,
+    "sam_embedding_cache_disk": True,
+}
 
 
 # Visualization

@@ -67,12 +67,12 @@ def calculate(gt_paths, pred_paths, metrics=['S', 'MAE', 'E', 'F', 'WF'], verbos
         gt = gt_paths[idx_sample]
         pred = pred_paths[idx_sample]
 
-        pred = pred[:-4] + '.png'
-        if os.path.exists(pred):
-            pred_ary = cv2.imread(pred, cv2.IMREAD_GRAYSCALE)
-        else:
-            pred_ary = cv2.imread(pred.replace('.png', '.jpg'), cv2.IMREAD_GRAYSCALE)
+        pred_ary = cv2.imread(pred, cv2.IMREAD_GRAYSCALE)
         gt_ary = cv2.imread(gt, cv2.IMREAD_GRAYSCALE)
+        if pred_ary is None:
+            raise FileNotFoundError(f"prediction image cannot be read: {pred}")
+        if gt_ary is None:
+            raise FileNotFoundError(f"GT image cannot be read: {gt}")
         pred_ary = cv2.resize(pred_ary, (gt_ary.shape[1], gt_ary.shape[0]))
 
         if 'E' in metrics:

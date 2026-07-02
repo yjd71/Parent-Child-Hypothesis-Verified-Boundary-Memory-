@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from CBM.memory.labels import REGION_NAMES, REGION_TO_ID, VALUE_LAYOUT
+from CBM.sv_ume.config_contract import validate_sv_ume_profile_contract
 from CBM.sv_ume.sam_refined_region_builder import build_sam_refined_regions
 from CBM.sv_ume.ume_reliability import (
     DEFAULT_CBM_LOGIT_SCALE,
@@ -128,6 +129,7 @@ class SAMRefinedCandidateBuilder:
     def __init__(self, cfg, logger=None) -> None:
         self.cfg = cfg
         self.logger = logger
+        validate_sv_ume_profile_contract(cfg)
         raw_regions = getattr(cfg, "sv_ume_regions", REGION_NAMES)
         if isinstance(raw_regions, (str, bytes)) or not isinstance(raw_regions, Sequence):
             raise TypeError("sv_ume_regions must be a non-empty sequence of region names")
@@ -270,6 +272,7 @@ class SAMRefinedCandidateBuilder:
             region for region in REGION_NAMES if region not in self.enabled_regions
         ]
         stats["token_score_mode"] = token_result["score_mode"]
+        stats.update(self._summarize_image_admission(image_result))
         stats["region_pixel_counts"] = {
             region: int((region_masks[region] > 0.5).sum().item())
             for region in REGION_NAMES
@@ -754,6 +757,12 @@ class SAMRefinedCandidateBuilder:
             "image_score_mean": 0.0,
             "image_score_min": 0.0,
             "image_score_max": 0.0,
+            "image_threshold": None,
+            "image_evidence_valid_count": 0,
+            "image_above_threshold_count": 0,
+            "image_allowed_count": 0,
+            "image_score_quantiles": {},
+            "image_component_quantiles": {},
             "region_score_mean": {region: 0.0 for region in REGION_NAMES},
             "token_score_mean": {region: 0.0 for region in REGION_NAMES},
             "token_score_quantiles": {region: {} for region in REGION_NAMES},
@@ -804,6 +813,23 @@ class SAMRefinedCandidateBuilder:
             "max": float(value.max().item()),
         }
 
+    @classmethod
+    def _summarize_image_admission(cls, image_result: Mapping[str, Any]) -> Dict[str, Any]:
+        scores = image_result["score"]
+        evidence_valid = image_result["evidence_valid"].bool()
+        threshold = float(image_result["threshold"])
+        return {
+            "image_threshold": threshold,
+            "image_evidence_valid_count": int(evidence_valid.sum().item()),
+            "image_above_threshold_count": int((scores > threshold).sum().item()),
+            "image_allowed_count": int(image_result["allow_image"].sum().item()),
+            "image_score_quantiles": cls._summarize_tensor(scores[evidence_valid]),
+            "image_component_quantiles": {
+                name: cls._summarize_tensor(value[evidence_valid])
+                for name, value in image_result["components"].items()
+            },
+        }
+
     def _log_diagnostics(self, result: Mapping[str, Any]) -> None:
         if self.logger is None:
             return
@@ -815,12 +841,19 @@ class SAMRefinedCandidateBuilder:
             f"image_score=({stats.get('image_score_min', 0.0):.4f},"
             f"{stats.get('image_score_mean', 0.0):.4f},"
             f"{stats.get('image_score_max', 0.0):.4f}) "
+            f"image_threshold={stats.get('image_threshold')} "
+            f"image_valid={stats.get('image_evidence_valid_count')} "
+            f"image_above={stats.get('image_above_threshold_count')} "
+            f"image_allowed={stats.get('image_allowed_count')} "
             f"region_pixels={stats.get('region_pixel_counts')} "
             f"region_images={stats.get('region_image_counts')} "
             f"region_scores={stats.get('region_score_mean')} "
             f"cbm_valid_ratio={stats.get('cbm_valid_ratio')} "
             f"candidate_counts={stats.get('candidate_counts')} "
             f"enabled={stats.get('enabled_regions')} disabled={stats.get('disabled_regions')}",
+            f"[SV-UME][image][step={stats.get('step')}] "
+            f"score={stats.get('image_score_quantiles')} "
+            f"components={stats.get('image_component_quantiles')}",
             f"[SV-UME][token][step={stats.get('step')}] "
             f"score={stats.get('token_score_quantiles')} "
             f"components={stats.get('token_component_quantiles')}",

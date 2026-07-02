@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 from config import Config
 from utils import Logger, save_tensor_img
+from utils.evaluation_paths import align_evaluation_paths, list_image_paths
 from models import build_model_eval
 
 from .metrics import calculate
@@ -90,15 +91,24 @@ class Evaluator:
         gt_path = os.path.join(self.config.data_root_dir, self.config.task, testset_name)
         assert os.path.isdir(current_result_dir), f"[x] {current_result_dir} not exists!"
         
-        gt_paths = sorted([
-            os.path.join(gt_path, 'gt', file_name)
-            for file_name in os.listdir(os.path.join(gt_path, 'gt'))
-        ])
-        
-        pred_paths = sorted([
-            os.path.join(current_result_dir, file_name)
-            for file_name in os.listdir(current_result_dir)
-        ])
+        gt_paths = list_image_paths(os.path.join(gt_path, 'gt'))
+        pred_paths = list_image_paths(current_result_dir)
+        gt_paths, pred_paths, extra_prediction_stems = align_evaluation_paths(
+            gt_paths,
+            pred_paths,
+        )
+        if extra_prediction_stems:
+            message = (
+                f"[Evaluator] ignoring {len(extra_prediction_stems)} stale prediction(s) "
+                f"not present in GT; examples={extra_prediction_stems[:20]}"
+            )
+            log_fn = (
+                getattr(self.logger, "warn_info", None)
+                or getattr(self.logger, "warning", None)
+                or getattr(self.logger, "info", None)
+            )
+            if callable(log_fn):
+                log_fn(message)
         
         with open(log_savedir, 'a+', encoding='utf-8') as fw:
             tb = pt.PrettyTable()

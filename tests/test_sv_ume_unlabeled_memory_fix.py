@@ -1,12 +1,15 @@
 import math
+import io
 import runpy
 import unittest
+from contextlib import redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from CBM.memory.labels import REGION_NAMES
+from CBM.sv_ume.config_contract import validate_sv_ume_profile_contract
 from CBM.sv_ume.quality_adaptive_fusion import QualityAdaptiveSourceFusion
 from CBM.sv_ume.sam_refined_candidate_builder import SAMRefinedCandidateBuilder
 from CBM.sv_ume.schedules import (
@@ -14,7 +17,8 @@ from CBM.sv_ume.schedules import (
     expected_unlabeled_source_epoch,
     should_build_after_epoch,
 )
-from CBM.sv_ume.sv_ume_manager import SVUMEManager
+from CBM.sv_ume.sv_ume_manager import SVUMEManager, SVUMEZeroCandidatesError
+from config import Config
 from CBM.sv_ume.ume_reliability import (
     TOKEN_FACTOR_NAMES,
     TOKEN_WEIGHTED_SUM_WEIGHTS,
@@ -162,6 +166,15 @@ class CandidateDiagnosticsTests(unittest.TestCase):
             "score": torch.tensor([0.9]),
             "evidence_valid": torch.tensor([True]),
             "allow_image": torch.tensor([True]),
+            "threshold": 0.5,
+            "components": {
+                "global_teacher_sam_agreement": torch.tensor([0.9]),
+                "cbm_supported_change_score": torch.tensor([0.8]),
+                "sam_prompt_stability": torch.tensor([0.7]),
+                "area_reasonable_score": torch.tensor([1.0]),
+                "diversity_gain": torch.tensor([0.2]),
+                "over_seg_penalty": torch.tensor([0.0]),
+            },
             "global_metadata": {
                 "global_type": ["matched"],
                 "nearest_labeled_id": ["l0"],
@@ -242,6 +255,21 @@ class CandidateDiagnosticsTests(unittest.TestCase):
         self.assertGreater(threshold["rejected"]["token_below_threshold"], 0)
         self.assertEqual(threshold["rejected"]["token_cbm_invalid"], 0)
         self.assertGreater(empty["rejected"]["region_empty"], 0)
+
+    def test_log_distribution_passes_strict_half_threshold(self):
+        scores = torch.tensor([0.47, 0.49, 0.56, 0.68])
+        image_result = {
+            "score": scores,
+            "evidence_valid": torch.ones(4, dtype=torch.bool),
+            "allow_image": scores > 0.5,
+            "threshold": 0.5,
+            "components": {"agreement": torch.ones(4)},
+        }
+        stats = SAMRefinedCandidateBuilder._summarize_image_admission(image_result)
+        self.assertEqual(stats["image_evidence_valid_count"], 4)
+        self.assertEqual(stats["image_above_threshold_count"], 2)
+        self.assertEqual(stats["image_allowed_count"], 2)
+        self.assertAlmostEqual(stats["image_score_quantiles"]["max"], 0.68, places=6)
 
 
 class FusionScheduleManagerTests(unittest.TestCase):
@@ -325,6 +353,147 @@ class FusionScheduleManagerTests(unittest.TestCase):
         self.assertEqual(restored["token_score_quantiles"], {})
         self.assertIn("cbm_valid_ratio", restored)
 
+    def test_complete_collection_with_zero_candidates_fails_explicitly(self):
+        class EmptyCandidateBuilder:
+            def __init__(self):
+                self.last_result = None
+
+            def build_batch(self, **kwargs):
+                self.last_result = {
+                    "rejected": {"image_below_threshold": 1},
+                    "stats": {
+                        "batch_size": 1,
+                        "image_score_mean": 0.49,
+                        "image_score_min": 0.49,
+                        "image_score_max": 0.49,
+                        "image_threshold": 0.5,
+                        "image_evidence_valid_count": 1,
+                        "image_above_threshold_count": 0,
+                        "image_allowed_count": 0,
+                        "image_score_quantiles": {
+                            "count": 1,
+                            "mean": 0.49,
+                            "p50": 0.49,
+                            "p90": 0.49,
+                            "p99": 0.49,
+                            "max": 0.49,
+                        },
+                    },
+                }
+                return {region: [] for region in REGION_NAMES}
+
+        manager = SVUMEManager(
+            _safe_config(),
+            candidate_builder=EmptyCandidateBuilder(),
+            memory_builder=_MemoryDependency(),
+        )
+        with self.assertRaisesRegex(SVUMEZeroCandidatesError, "image_threshold=0.5"):
+            manager.collect_candidates_after_epoch(
+                teacher=object(),
+                sam_refiner=object(),
+                unlabeled_loader=[object()],
+                labeled_memory=object(),
+                memory_for_retrieval=object(),
+                epoch=29,
+                device=torch.device("cpu"),
+            )
+        self.assertEqual(manager.epoch_stats["status"], "zero_candidates")
+
+    def test_candidate_build_promotion_and_next_epoch_use(self):
+        candidate = SimpleNamespace(
+            key=torch.tensor([1.0]),
+            value=torch.tensor([1.0]),
+            global_key=torch.tensor([1.0]),
+            reliability=0.9,
+            diversity=0.1,
+            global_meta=None,
+            meta={
+                "image_id": "u0",
+                "coord": (0, 0),
+                "region": "fg_boundary",
+                "epoch_added": 29,
+                "step_added": 0,
+                "global_type": "matched",
+            },
+        )
+
+        class OneCandidateBuilder:
+            last_result = None
+
+            def build_batch(self, **kwargs):
+                pools = {region: [] for region in REGION_NAMES}
+                pools["fg_boundary"] = [candidate]
+                self.last_result = {
+                    "rejected": {},
+                    "stats": {
+                        "batch_size": 1,
+                        "image_score_mean": 0.6,
+                        "image_score_min": 0.6,
+                        "image_score_max": 0.6,
+                        "image_threshold": 0.5,
+                        "image_evidence_valid_count": 1,
+                        "image_above_threshold_count": 1,
+                        "image_allowed_count": 1,
+                        "candidate_counts": {
+                            region: int(region == "fg_boundary") for region in REGION_NAMES
+                        },
+                    },
+                }
+                return pools
+
+        class ReadyMemory:
+            def __init__(self, pools):
+                self.keys = {
+                    region: torch.stack([item.key for item in pools[region]])
+                    if pools[region]
+                    else torch.empty(0, 1)
+                    for region in REGION_NAMES
+                }
+                self.values = {
+                    region: torch.stack([item.value for item in pools[region]])
+                    if pools[region]
+                    else torch.empty(0, 1)
+                    for region in REGION_NAMES
+                }
+                self.meta = {
+                    region: [dict(item.meta) for item in pools[region]]
+                    for region in REGION_NAMES
+                }
+                self.global_meta = []
+
+            def is_ready(self):
+                return any(value.size(0) > 0 for value in self.keys.values())
+
+        class ReadyMemoryBuilder(_MemoryDependency):
+            def build_memory(self, **kwargs):
+                return ReadyMemory(kwargs["candidate_pool"])
+
+            def memory_state_dict(self, memory):
+                return {"keys": memory.keys, "values": memory.values}
+
+        manager = SVUMEManager(
+            _safe_config(),
+            candidate_builder=OneCandidateBuilder(),
+            memory_builder=ReadyMemoryBuilder(),
+        )
+        labeled_memory = SimpleNamespace(
+            keys={region: torch.ones(2, 1) for region in REGION_NAMES}
+        )
+        manager.collect_candidates_after_epoch(
+            teacher=object(),
+            sam_refiner=object(),
+            unlabeled_loader=[object()],
+            labeled_memory=labeled_memory,
+            memory_for_retrieval=object(),
+            epoch=29,
+            device=torch.device("cpu"),
+        )
+        manager.build_next_memory(labeled_memory, epoch=29)
+        promoted = manager.step_epoch()
+        self.assertIsNotNone(promoted)
+        self.assertIs(manager.get_unlabeled_memory_for_epoch(30), promoted)
+        self.assertEqual(manager.last_used_u_prev_epoch, 29)
+
 
 class SVUMEDebugConfigTests(unittest.TestCase):
     def test_debug_run_and_compatible_defaults(self):
@@ -335,17 +504,44 @@ class SVUMEDebugConfigTests(unittest.TestCase):
 
         cfg = runpy.run_path("config/runs/sv_ume_svb_plr_full.py")
         self.assertEqual(cfg["tot_epochs"], 35)
-        self.assertEqual(cfg["sv_ume_start_epoch"], 29)
+        self.assertEqual(cfg["sv_ume_start_epoch"], 16)
         self.assertEqual(cfg["sv_ume_token_score_mode"], "weighted_sum")
         self.assertEqual(cfg["sv_ume_regions"], ["fg_boundary", "bg_near"])
         self.assertEqual(cfg["gamma_max_final"], 0.25)
         self.assertFalse(cfg["use_aux_feature_fusion"])
         self.assertFalse(cfg["sam_use_mask_prompt"])
         self.assertFalse(cfg["sam_pseudo_use_mask"])
-        self.assertFalse(cfg["use_sam_embedding_cache"])
-        self.assertFalse(cfg["sam_embedding_cache_disk"])
         self.assertFalse(cfg["sam_use_conformal"])
         self.assertTrue(str(cfg["sam2_checkpoint"]).startswith("/home/"))
+        self.assertEqual(cfg["sv_ume_profile_name"], "boundary_debug_v1")
+        self.assertTrue(cfg["use_sam_embedding_cache"])
+        self.assertTrue(cfg["sam_embedding_cache_disk"])
+
+    def test_config_identity_and_strict_contract(self):
+        with redirect_stdout(io.StringIO()):
+            cfg = Config("config/runs/sv_ume_svb_plr_full.py")
+        self.assertTrue(cfg.run_cfg_path.endswith("sv_ume_svb_plr_full.py"))
+        self.assertEqual(len(cfg.run_cfg_sha256), 64)
+        effective = validate_sv_ume_profile_contract(cfg)
+        self.assertEqual(effective["tau_image"], 0.5)
+        self.assertEqual(effective["sv_ume_regions"], ["fg_boundary", "bg_near"])
+
+    def test_strict_contract_rejects_base_defaults(self):
+        cfg = SimpleNamespace(
+            sv_ume_profile_name="boundary_debug_v1",
+            sv_ume_profile_contract={
+                "tau_image": 0.5,
+                "sv_ume_token_score_mode": "weighted_sum",
+                "sv_ume_regions": ["fg_boundary", "bg_near"],
+            },
+            tau_image=0.8,
+            sv_ume_token_score_mode="product",
+            sv_ume_regions=list(REGION_NAMES),
+            run_cfg_path="wrong.py",
+            run_cfg_sha256="bad",
+        )
+        with self.assertRaisesRegex(ValueError, "profile 'boundary_debug_v1' mismatch"):
+            validate_sv_ume_profile_contract(cfg)
 
 
 if __name__ == "__main__":
