@@ -7,10 +7,12 @@ sam3
 segment_anything
 sam_vit_h_4b8939.pth
 sam2.1_hiera_large.pt
+tests
 ./cache
 .git
 .agents
 .claude
+.codex
 .pytest_cache
 .ruff_cache
 .serena

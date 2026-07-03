@@ -6,6 +6,12 @@ from .schedules import (
 )
 from .sam_refined_region_builder import build_sam_refined_regions
 from .sam_refined_candidate_builder import SAMRefinedCandidateBuilder, TokenCandidate
+from .candidate_pool_backends import (
+    CandidatePoolProtocol,
+    CandidatePoolStats,
+    DiskCandidatePool,
+    RAMCandidatePool,
+)
 from .sv_ume_manager import SVUMEManager
 from .lagged_memory_retriever import LaggedLabeledUnlabeledRetriever
 from .quality_adaptive_fusion import QualityAdaptiveSourceFusion
@@ -38,6 +44,10 @@ __all__ = [
     "UnlabeledMemoryToken",
     "TokenCandidate",
     "SAMRefinedCandidateBuilder",
+    "CandidatePoolProtocol",
+    "CandidatePoolStats",
+    "RAMCandidatePool",
+    "DiskCandidatePool",
     "LaggedLabeledUnlabeledRetriever",
     "QualityAdaptiveSourceFusion",
     "UMEDiversitySampler",

@@ -81,8 +81,24 @@ tau_token = {
 }
 sv_ume_token_score_mode = "weighted_sum"
 sv_ume_regions = ["fg_core", "fg_boundary", "bg_near", "bg_far"]
-sv_ume_diagnostics_interval = 600
 sv_ume_profile_name = "four_region_near_1to1_v1"
+
+# Memory-safe, lossless candidate-pool backend.
+sv_ume_candidate_pool_backend = "disk"
+sv_ume_candidate_pool_dir = ckpt_dir.rstrip("/\\") + "/sv_ume_candidate_pool"
+sv_ume_candidate_shard_size = 4096
+sv_ume_candidate_max_open_shards = 2
+sv_ume_candidate_delete_after_build = True
+sv_ume_candidate_exact_mode = True
+sv_ume_candidate_keep_dtype = "original"
+sv_ume_candidate_preserve_meta = True
+sv_ume_candidate_preserve_canonical_order = True
+sv_ume_candidate_preserve_identity_replacement = True
+sv_ume_candidate_log_memory = True
+sv_ume_candidate_log_interval = 20
+sv_ume_diagnostics_interval = 20
+sv_ume_candidate_backend_compare = False
+sv_ume_candidate_equivalence_test_batches = 50
 
 # Diversity
 use_diversity_selection = True
@@ -222,10 +238,10 @@ cache_prompt_debug = False
 
 # Frozen SAM2 predictor states are teacher-independent.  Keep a small CPU LRU
 # and a bounded persistent disk layer for exact augmented-image views.
-use_sam_embedding_cache = True
+use_sam_embedding_cache = False
 sam_image_embedding_cache_size = 64  # SAM1 compatibility
 sam2_image_embedding_cache_size = 16
-sam_embedding_cache_disk = True
+sam_embedding_cache_disk = False
 sam_embedding_cache_dir = "./cache/sam_image_embeddings/sam2.1_hiera_large"
 sam_embedding_cache_max_gb = 32
 sam_embedding_cache_store_dtype = "float16"  # SAM1 compatibility

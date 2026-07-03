@@ -1,16 +1,24 @@
 import math
 import io
 import runpy
+import sqlite3
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from CBM.memory.labels import REGION_NAMES
+from CBM.sv_ume.candidate_pool_backends import DiskCandidatePool, RAMCandidatePool
 from CBM.sv_ume.quality_adaptive_fusion import QualityAdaptiveSourceFusion
 from CBM.sv_ume.sam_refined_candidate_builder import SAMRefinedCandidateBuilder
+from CBM.sv_ume.scored_candidate_store import (
+    ScoredCandidateRecord,
+    ScoredCandidateStore,
+)
 from CBM.sv_ume.ume_diversity_sampler import UMEDiversitySampler
 from CBM.sv_ume.unlabeled_dense_memory import (
     UnlabeledDenseBoundaryMemory,
@@ -366,6 +374,57 @@ class CandidateDiagnosticsTests(unittest.TestCase):
         self.assertAlmostEqual(stats["image_score_quantiles"]["max"], 0.68, places=6)
 
 
+class ScoredCandidateStoreTests(unittest.TestCase):
+    def test_sqlite_store_orders_exactly_and_removes_storage(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = ScoredCandidateStore(root_dir=root)
+            storage_dir = store.storage_dir
+            store.add_many(
+                "fg_core",
+                [
+                    ScoredCandidateRecord(
+                        region="fg_core",
+                        gate_mode="strict" if index != 2 else "relaxed",
+                        image_id=f"u{index % 2}",
+                        input_index=index,
+                        selection_score=score,
+                        shard_id=3,
+                        shard_offset=index,
+                        canonical_index=index,
+                        d_img=0.1,
+                        d_region=0.2,
+                        raw_diversity=0.15,
+                        diversity_score=0.15,
+                    )
+                    for index, score in ((2, 0.8), (0, 0.9), (1, 0.9))
+                ],
+            )
+            self.assertEqual(
+                [item.input_index for item in store.iter_ranked("fg_core")],
+                [0, 1, 2],
+            )
+            self.assertEqual(
+                [
+                    item.input_index
+                    for item in store.iter_ranked("fg_core", gate_mode="strict")
+                ],
+                [0, 1],
+            )
+            self.assertEqual(store.gate_counts("fg_core"), {"relaxed": 1, "strict": 2})
+            self.assertEqual(store.image_counts("fg_core"), {"u0": 2, "u1": 1})
+            connection = sqlite3.connect(store.db_path)
+            try:
+                columns = connection.execute(
+                    "PRAGMA table_info(scored_candidates)"
+                ).fetchall()
+            finally:
+                connection.close()
+            self.assertNotIn("BLOB", {str(column[2]).upper() for column in columns})
+            store.close()
+            store.close()
+            self.assertFalse(storage_dir.exists())
+
+
 class FourRegionDiversitySamplerTests(unittest.TestCase):
     @staticmethod
     def _cfg(**overrides):
@@ -495,8 +554,208 @@ class FourRegionDiversitySamplerTests(unittest.TestCase):
             self.assertEqual(len(memory.meta[region]), 19)
         self.assertTrue(memory.is_ready())
 
+    def test_mapping_ram_and_disk_backends_select_identically(self):
+        cfg = self._cfg()
+        mapping_pool = {
+            region: [self._token(region, index) for index in range(8)]
+            for region in REGION_NAMES
+        }
+        labeled = self._labeled_memory(8)
+
+        def identity(token, region):
+            return (
+                str(token.meta["image_id"]),
+                tuple(token.meta["coord"]),
+                region,
+                int(token.meta["epoch_added"]),
+            )
+
+        def rank(token):
+            return float(token.reliability), int(token.meta["step_added"])
+
+        ram_pool = RAMCandidatePool(
+            regions=REGION_NAMES,
+            rank_fn=rank,
+            identity_fn=identity,
+        )
+        with tempfile.TemporaryDirectory() as root:
+            disk_pool = DiskCandidatePool(
+                root_dir=root,
+                regions=REGION_NAMES,
+                shard_size=3,
+                max_open_shards=1,
+                rank_fn=rank,
+                identity_fn=identity,
+                epoch=29,
+            )
+            for region in REGION_NAMES:
+                ram_pool.append_many(region, mapping_pool[region])
+                disk_pool.append_many(region, mapping_pool[region])
+
+            configs = (
+                cfg,
+                self._cfg(use_diversity_selection=False),
+                self._cfg(
+                    region_capacity_ratio={region: 0.0 for region in REGION_NAMES}
+                ),
+            )
+            for selection_cfg in configs:
+                results = [
+                    UMEDiversitySampler(selection_cfg).select(
+                        candidate_pool=pool,
+                        labeled_memory=labeled,
+                    )
+                    for pool in (mapping_pool, ram_pool, disk_pool)
+                ]
+                expected = results[0]
+                for actual in results[1:]:
+                    self.assertEqual(expected["stats"], actual["stats"])
+                    for region in REGION_NAMES:
+                        expected_tokens = expected["selected_tokens"][region]
+                        actual_tokens = actual["selected_tokens"][region]
+                        self.assertEqual(
+                            [dict(token.meta) for token in expected_tokens],
+                            [dict(token.meta) for token in actual_tokens],
+                        )
+                        for expected_token, actual_token in zip(
+                            expected_tokens,
+                            actual_tokens,
+                        ):
+                            self.assertTrue(
+                                torch.equal(expected_token.key, actual_token.key)
+                            )
+                            self.assertTrue(
+                                torch.equal(expected_token.value, actual_token.value)
+                            )
+            disk_pool.clear()
+            disk_pool.close()
+        ram_pool.clear()
+        ram_pool.close()
+
+    def test_streaming_exact_is_image_bounded_and_cleans_store_on_error(self):
+        cfg = self._cfg(
+            sample_per_image_unlabeled={region: 2 for region in REGION_NAMES},
+        )
+        mapping_pool = {region: [] for region in REGION_NAMES}
+        for image_index in range(6):
+            for local_index in range(2):
+                index = image_index * 2 + local_index
+                mapping_pool["fg_core"].append(
+                    self._token(
+                        "fg_core",
+                        index,
+                        image_id=f"u{image_index}",
+                        gate_mode="strict" if image_index < 3 else "relaxed",
+                        reliability=0.8,
+                    )
+                )
+        pending = mapping_pool["fg_core"][-1]
+        pending_meta = dict(pending.meta)
+        pending_meta["global_type"] = "novel_pending"
+        mapping_pool["fg_core"][-1] = UnlabeledMemoryToken(
+            key=pending.key,
+            value=pending.value,
+            global_key=pending.global_key,
+            meta=pending_meta,
+            reliability=pending.reliability,
+            diversity=pending.diversity,
+            global_meta=pending.global_meta,
+        )
+
+        def identity(token, region):
+            return (
+                str(token.meta["image_id"]),
+                tuple(token.meta["coord"]),
+                region,
+                int(token.meta["epoch_added"]),
+            )
+
+        def rank(token):
+            return float(token.reliability), int(token.meta["step_added"])
+
+        ram_pool = RAMCandidatePool(
+            regions=REGION_NAMES,
+            rank_fn=rank,
+            identity_fn=identity,
+        )
+        for region in REGION_NAMES:
+            ram_pool.append_many(region, mapping_pool[region])
+
+        class TrackingSampler(UMEDiversitySampler):
+            def __init__(self, config):
+                super().__init__(config)
+                self.max_scoring_group = 0
+
+            def _score_region_candidates(self, candidates, *args, **kwargs):
+                self.max_scoring_group = max(
+                    self.max_scoring_group,
+                    len(candidates),
+                )
+                return super()._score_region_candidates(candidates, *args, **kwargs)
+
+        labeled = self._labeled_memory(12)
+        expected = UMEDiversitySampler(cfg).select_ram(
+            candidate_pool=mapping_pool,
+            labeled_memory=labeled,
+        )
+        sampler = TrackingSampler(cfg)
+        actual = sampler.select(
+            candidate_pool=ram_pool,
+            labeled_memory=labeled,
+        )
+        self.assertEqual(expected["stats"], actual["stats"])
+        self.assertEqual(
+            [dict(token.meta) for token in expected["selected_tokens"]["fg_core"]],
+            [dict(token.meta) for token in actual["selected_tokens"]["fg_core"]],
+        )
+        self.assertLessEqual(sampler.max_scoring_group, 2)
+        self.assertFalse(Path(sampler.last_scored_store_dir).exists())
+
+        image_groups = list(ram_pool.iter_region_by_image("fg_core"))
+        located = image_groups[0][1][0]
+        self.assertEqual(located.canonical_index, 0)
+        self.assertEqual(located.shard_id, -1)
+        self.assertEqual(
+            ram_pool.get_candidate("fg_core", 0).canonical_index,
+            0,
+        )
+
+        failing = UMEDiversitySampler(cfg)
+        with patch.object(
+            failing,
+            "_select_region_streaming_exact",
+            side_effect=RuntimeError("selection failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "selection failure"):
+                failing.select(
+                    candidate_pool=ram_pool,
+                    labeled_memory=labeled,
+                )
+        self.assertFalse(Path(failing.last_scored_store_dir).exists())
+        ram_pool.clear()
+        ram_pool.close()
+
 
 class FusionScheduleManagerTests(unittest.TestCase):
+    @staticmethod
+    def _manager_candidate(*, reliability=0.9, step=0, epoch=29):
+        return UnlabeledMemoryToken(
+            key=torch.tensor([float(step + 1)]),
+            value=torch.tensor([float(step + 1)]),
+            global_key=torch.tensor([1.0]),
+            reliability=float(reliability),
+            diversity=0.1,
+            global_meta={"image_id": "u0"},
+            meta={
+                "image_id": "u0",
+                "coord": (0, 0),
+                "region": "fg_boundary",
+                "epoch_added": int(epoch),
+                "step_added": int(step),
+                "global_type": "matched",
+            },
+        )
+
     @staticmethod
     def _retrieval(y_value, r_value):
         return {
@@ -624,7 +883,7 @@ class FusionScheduleManagerTests(unittest.TestCase):
         self.assertEqual(manager.epoch_stats["status"], "zero_candidates")
 
     def test_candidate_build_promotion_and_next_epoch_use(self):
-        candidate = SimpleNamespace(
+        candidate = UnlabeledMemoryToken(
             key=torch.tensor([1.0]),
             value=torch.tensor([1.0]),
             global_key=torch.tensor([1.0]),
@@ -690,7 +949,14 @@ class FusionScheduleManagerTests(unittest.TestCase):
 
         class ReadyMemoryBuilder(_MemoryDependency):
             def build_memory(self, **kwargs):
-                return ReadyMemory(kwargs["candidate_pool"])
+                candidate_pool = kwargs["candidate_pool"]
+                pools = {
+                    region: list(
+                        candidate_pool.iter_region(region, order="canonical")
+                    )
+                    for region in REGION_NAMES
+                }
+                return ReadyMemory(pools)
 
             def memory_state_dict(self, memory):
                 return {"keys": memory.keys, "values": memory.values}
@@ -717,6 +983,241 @@ class FusionScheduleManagerTests(unittest.TestCase):
         self.assertIsNotNone(promoted)
         self.assertIs(manager.get_unlabeled_memory_for_epoch(30), promoted)
         self.assertEqual(manager.last_used_u_prev_epoch, 29)
+
+    def test_disk_pool_is_flushed_passed_directly_and_cleaned_on_step(self):
+        class TwoBatchCandidateBuilder:
+            def __init__(self):
+                self.step = 0
+                self.last_result = None
+
+            def build_batch(self, **kwargs):
+                pools = {region: [] for region in REGION_NAMES}
+                pools["fg_boundary"] = [
+                    FusionScheduleManagerTests._manager_candidate(
+                        reliability=0.8 + self.step * 0.1,
+                        step=self.step,
+                        epoch=kwargs["epoch"],
+                    )
+                ]
+                self.step += 1
+                return pools
+
+        class ReadyMemory:
+            def __init__(self, pools):
+                self.keys = {
+                    region: (
+                        torch.stack([token.key for token in pools[region]])
+                        if pools[region]
+                        else torch.empty(0, 1)
+                    )
+                    for region in REGION_NAMES
+                }
+                self.values = {
+                    region: (
+                        torch.stack([token.value for token in pools[region]])
+                        if pools[region]
+                        else torch.empty(0, 1)
+                    )
+                    for region in REGION_NAMES
+                }
+                self.meta = {
+                    region: [dict(token.meta) for token in pools[region]]
+                    for region in REGION_NAMES
+                }
+                self.global_meta = []
+
+            def is_ready(self):
+                return any(value.size(0) > 0 for value in self.keys.values())
+
+        class InspectingMemoryBuilder(_MemoryDependency):
+            def __init__(self):
+                self.received_pool = None
+                self.stats_at_build = None
+
+            def build_memory(self, **kwargs):
+                candidate_pool = kwargs["candidate_pool"]
+                self.received_pool = candidate_pool
+                self.stats_at_build = candidate_pool.stats().to_dict()
+                pools = {
+                    region: list(
+                        candidate_pool.iter_region(region, order="canonical")
+                    )
+                    for region in REGION_NAMES
+                }
+                return ReadyMemory(pools)
+
+        class Logger:
+            def __init__(self):
+                self.messages = []
+
+            def info(self, message):
+                self.messages.append(str(message))
+
+            error = info
+
+        with tempfile.TemporaryDirectory() as root:
+            cfg = _safe_config(
+                sv_ume_candidate_pool_backend="disk",
+                sv_ume_candidate_pool_dir=root,
+                sv_ume_candidate_shard_size=16,
+                sv_ume_candidate_max_open_shards=1,
+                sv_ume_candidate_log_interval=1,
+            )
+            builder = InspectingMemoryBuilder()
+            logger = Logger()
+            manager = SVUMEManager(
+                cfg,
+                candidate_builder=TwoBatchCandidateBuilder(),
+                memory_builder=builder,
+                logger=logger,
+            )
+            labeled_memory = SimpleNamespace(
+                keys={region: torch.ones(2, 1) for region in REGION_NAMES}
+            )
+            manager.collect_candidates_after_epoch(
+                teacher=object(),
+                sam_refiner=object(),
+                unlabeled_loader=[object(), object()],
+                labeled_memory=labeled_memory,
+                memory_for_retrieval=object(),
+                epoch=29,
+                device=torch.device("cpu"),
+            )
+            collected_dir = Path(manager.candidate_pool.storage_dir)
+            self.assertEqual(manager._candidate_counts()["fg_boundary"], 1)
+            self.assertEqual(
+                manager.candidate_pool.stats().replacement_counts["fg_boundary"],
+                1,
+            )
+
+            with patch.object(manager, "_process_rss_gb", return_value=None):
+                manager._log_candidate_pool_memory("test", epoch=29)
+            manager.build_next_memory(labeled_memory, epoch=29)
+            self.assertIsInstance(builder.received_pool, DiskCandidatePool)
+            self.assertEqual(
+                sum(builder.stats_at_build["buffered_counts"].values()),
+                0,
+            )
+            self.assertGreater(
+                sum(builder.stats_at_build["shard_counts"].values()),
+                0,
+            )
+            self.assertTrue(list(collected_dir.rglob("*.pt")))
+            promoted = manager.step_epoch()
+            self.assertIsNotNone(promoted)
+            self.assertFalse(list(collected_dir.rglob("*.pt")))
+            self.assertTrue(
+                any(
+                    "rss_gb=unavailable" in message
+                    and "active=" in message
+                    and "inactive=" in message
+                    and "shards=" in message
+                    for message in logger.messages
+                )
+            )
+            manager.clear_candidate_pool(epoch=None, suppress_errors=True)
+
+    def test_disk_pool_checkpoint_restore_and_error_cleanup(self):
+        class OneCandidateBuilder:
+            def __init__(self, fail_after_first=False):
+                self.calls = 0
+                self.fail_after_first = fail_after_first
+                self.last_result = None
+
+            def build_batch(self, **kwargs):
+                if self.fail_after_first and self.calls > 0:
+                    raise RuntimeError("candidate failure")
+                pools = {region: [] for region in REGION_NAMES}
+                pools["fg_boundary"] = [
+                    FusionScheduleManagerTests._manager_candidate(
+                        step=self.calls,
+                        epoch=kwargs["epoch"],
+                    )
+                ]
+                self.calls += 1
+                return pools
+
+        class FailingMemoryBuilder(_MemoryDependency):
+            def build_memory(self, **kwargs):
+                raise RuntimeError("memory failure")
+
+        with tempfile.TemporaryDirectory() as root:
+            cfg = _safe_config(
+                sv_ume_candidate_pool_backend="disk",
+                sv_ume_candidate_pool_dir=root,
+                sv_ume_candidate_shard_size=1,
+                sv_ume_checkpoint_candidate_pool=True,
+            )
+            labeled = SimpleNamespace(
+                keys={region: torch.ones(2, 1) for region in REGION_NAMES}
+            )
+            manager = SVUMEManager(
+                cfg,
+                candidate_builder=OneCandidateBuilder(),
+                memory_builder=_MemoryDependency(),
+            )
+            manager.collect_candidates_after_epoch(
+                teacher=object(),
+                sam_refiner=object(),
+                unlabeled_loader=[object()],
+                labeled_memory=labeled,
+                memory_for_retrieval=object(),
+                epoch=29,
+                device=torch.device("cpu"),
+            )
+            state = manager.state_dict()
+            restored = SVUMEManager(
+                cfg,
+                candidate_builder=OneCandidateBuilder(),
+                memory_builder=_MemoryDependency(),
+            ).load_state_dict(state)
+            self.assertEqual(restored._candidate_epoch, 29)
+            self.assertEqual(restored._candidate_counts()["fg_boundary"], 1)
+            self.assertEqual(
+                len(list(restored.candidate_pool.iter_region("fg_boundary"))),
+                1,
+            )
+            manager.clear_candidate_pool(epoch=None, suppress_errors=True)
+            restored.clear_candidate_pool(epoch=None, suppress_errors=True)
+
+            collect_failure = SVUMEManager(
+                cfg,
+                candidate_builder=OneCandidateBuilder(fail_after_first=True),
+                memory_builder=_MemoryDependency(),
+            )
+            with self.assertRaisesRegex(RuntimeError, "candidate failure"):
+                collect_failure.collect_candidates_after_epoch(
+                    teacher=object(),
+                    sam_refiner=object(),
+                    unlabeled_loader=[object(), object()],
+                    labeled_memory=labeled,
+                    memory_for_retrieval=object(),
+                    epoch=29,
+                    device=torch.device("cpu"),
+                )
+            self.assertIsNone(collect_failure._candidate_epoch)
+            self.assertFalse(list(Path(root).rglob("*.pt")))
+
+            build_failure = SVUMEManager(
+                cfg,
+                candidate_builder=OneCandidateBuilder(),
+                memory_builder=FailingMemoryBuilder(),
+            )
+            build_failure.collect_candidates_after_epoch(
+                teacher=object(),
+                sam_refiner=object(),
+                unlabeled_loader=[object()],
+                labeled_memory=labeled,
+                memory_for_retrieval=object(),
+                epoch=29,
+                device=torch.device("cpu"),
+            )
+            with self.assertRaisesRegex(RuntimeError, "memory failure"):
+                build_failure.build_next_memory(labeled, epoch=29)
+            self.assertIsNone(build_failure._candidate_epoch)
+            self.assertFalse(list(Path(root).rglob("*.pt")))
+            collect_failure.clear_candidate_pool(epoch=None, suppress_errors=True)
+            build_failure.clear_candidate_pool(epoch=None, suppress_errors=True)
 
 
 class SVUMEDebugConfigTests(unittest.TestCase):

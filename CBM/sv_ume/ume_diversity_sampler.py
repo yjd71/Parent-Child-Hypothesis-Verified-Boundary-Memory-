@@ -3,13 +3,18 @@ from __future__ import annotations
 import math
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
 from CBM.memory.labels import DEFAULT_SAMPLE_PER_IMAGE, REGION_NAMES
+from CBM.sv_ume.scored_candidate_store import (
+    ScoredCandidateRecord,
+    ScoredCandidateStore,
+)
 from CBM.sv_ume.unlabeled_dense_memory import UnlabeledMemoryToken
 from utils.log_control import log_enabled
 
@@ -29,10 +34,27 @@ class _PreparedCandidate:
     region_gate_mode: str
     normalized_key: torch.Tensor
     normalized_global_key: torch.Tensor
+    canonical_index: int = -1
+    shard_id: int = -1
+    shard_offset: int = -1
     d_img: float = 0.0
     d_region: float = 0.0
     diversity_score: float = 0.0
     selection_score: float = 0.0
+
+
+@dataclass
+class _StreamingSelectionState:
+    selected: List[_PreparedCandidate] = field(default_factory=list)
+    selected_input_indices: set[int] = field(default_factory=set)
+    selected_by_image: Dict[str, List[_PreparedCandidate]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    per_image_counts: Counter[str] = field(default_factory=Counter)
+    rejected: Counter[str] = field(default_factory=Counter)
+    stage_counts: Counter[str] = field(default_factory=Counter)
+    min_spatial_distance: Optional[float] = None
+    max_feature_similarity: Optional[float] = None
 
 
 class UMEDiversitySampler:
@@ -123,6 +145,7 @@ class UMEDiversitySampler:
                 )
 
         self.last_result: Optional[Dict[str, Any]] = None
+        self.last_scored_store_dir: Optional[str] = None
 
     @torch.no_grad()
     def select(
@@ -132,9 +155,44 @@ class UMEDiversitySampler:
         labeled_memory,
         prev_unlabeled_memory=None,
     ) -> Dict[str, Any]:
-        if not isinstance(candidate_pool, Mapping):
-            raise TypeError("candidate_pool must be a region-indexed mapping")
-        unknown_regions = set(candidate_pool) - set(self.regions)
+        use_streaming = bool(
+            getattr(self.cfg, "sv_ume_candidate_exact_mode", True)
+        ) and callable(getattr(candidate_pool, "iter_region_by_image", None))
+        if use_streaming:
+            return self.select_streaming_exact(
+                candidate_pool=candidate_pool,
+                labeled_memory=labeled_memory,
+                prev_unlabeled_memory=prev_unlabeled_memory,
+            )
+        return self.select_ram(
+            candidate_pool=candidate_pool,
+            labeled_memory=labeled_memory,
+            prev_unlabeled_memory=prev_unlabeled_memory,
+        )
+
+    @torch.no_grad()
+    def select_ram(
+        self,
+        *,
+        candidate_pool,
+        labeled_memory,
+        prev_unlabeled_memory=None,
+    ) -> Dict[str, Any]:
+        backend_iter = getattr(candidate_pool, "iter_region", None)
+        backend_counts = getattr(candidate_pool, "counts", None)
+        uses_backend = callable(backend_iter) and callable(backend_counts)
+        if isinstance(candidate_pool, Mapping):
+            pool_regions = set(candidate_pool)
+        elif uses_backend:
+            counts = backend_counts()
+            if not isinstance(counts, Mapping):
+                raise TypeError("candidate_pool.counts() must return a mapping")
+            pool_regions = set(counts)
+        else:
+            raise TypeError(
+                "candidate_pool must be a region-indexed mapping or candidate-pool backend"
+            )
+        unknown_regions = pool_regions - set(self.regions)
         if unknown_regions:
             raise KeyError(f"unknown candidate regions: {sorted(unknown_regions)}")
 
@@ -175,16 +233,21 @@ class UMEDiversitySampler:
                 ),
             )
 
-            raw_tokens = candidate_pool.get(region, ())
-            if isinstance(raw_tokens, (str, bytes)) or not isinstance(
-                raw_tokens, Sequence
-            ):
-                raise TypeError(f"candidate_pool[{region!r}] must be a sequence")
+            if uses_backend:
+                raw_tokens = backend_iter(region, order="canonical")
+            else:
+                raw_tokens = candidate_pool.get(region, ())
+                if isinstance(raw_tokens, (str, bytes)) or not isinstance(
+                    raw_tokens, Sequence
+                ):
+                    raise TypeError(f"candidate_pool[{region!r}] must be a sequence")
 
             rejected: Counter[str] = Counter()
             input_types: Counter[str] = Counter()
             eligible: List[_PreparedCandidate] = []
+            input_count = 0
             for input_index, token in enumerate(raw_tokens):
+                input_count += 1
                 prepared = self._prepare_candidate(token, region, input_index)
                 input_types[prepared.global_type] += 1
                 if (
@@ -218,7 +281,7 @@ class UMEDiversitySampler:
             total_rejected.update(rejected)
 
             region_stats[region] = self._region_stats(
-                input_count=len(raw_tokens),
+                input_count=input_count,
                 eligible=ranked,
                 selected=selected,
                 capacity=capacity,
@@ -254,6 +317,522 @@ class UMEDiversitySampler:
         self.last_result = result
         self._log_summary(result["stats"])
         return result
+
+    @torch.no_grad()
+    def select_streaming_exact(
+        self,
+        *,
+        candidate_pool,
+        labeled_memory,
+        prev_unlabeled_memory=None,
+    ) -> Dict[str, Any]:
+        iter_by_image = getattr(candidate_pool, "iter_region_by_image", None)
+        counts_fn = getattr(candidate_pool, "counts", None)
+        get_candidate = getattr(candidate_pool, "get_candidate", None)
+        if not all(callable(item) for item in (iter_by_image, counts_fn, get_candidate)):
+            raise TypeError(
+                "streaming exact selection requires iter_region_by_image(), "
+                "counts(), and get_candidate()"
+            )
+        pool_counts = counts_fn()
+        if not isinstance(pool_counts, Mapping):
+            raise TypeError("candidate_pool.counts() must return a mapping")
+        unknown_regions = set(pool_counts) - set(self.regions)
+        if unknown_regions:
+            raise KeyError(f"unknown candidate regions: {sorted(unknown_regions)}")
+
+        labeled_global = self._memory_global_keys(labeled_memory, "labeled_memory")
+        previous_global = self._memory_global_keys(
+            prev_unlabeled_memory,
+            "prev_unlabeled_memory",
+            allow_none=True,
+        )
+        global_banks = tuple(
+            bank for bank in (labeled_global, previous_global) if bank.size(0) > 0
+        )
+        selected_tokens: Dict[str, List[UnlabeledMemoryToken]] = {
+            region: [] for region in self.regions
+        }
+        region_stats: Dict[str, Dict[str, Any]] = {}
+        total_rejected: Counter[str] = Counter()
+
+        with ScoredCandidateStore(
+            root_dir=self._scored_store_root(candidate_pool)
+        ) as scored_store:
+            self.last_scored_store_dir = str(scored_store.storage_dir)
+            for region in self.regions:
+                labeled_keys = self._memory_region_keys(
+                    labeled_memory,
+                    region,
+                    "labeled_memory",
+                )
+                previous_keys = self._memory_region_keys(
+                    prev_unlabeled_memory,
+                    region,
+                    "prev_unlabeled_memory",
+                    allow_none=True,
+                )
+                capacity = min(
+                    int(labeled_keys.size(0)),
+                    int(
+                        math.floor(
+                            labeled_keys.size(0)
+                            * self.region_capacity_ratio[region]
+                        )
+                    ),
+                )
+                region_prototypes = tuple(
+                    prototype
+                    for prototype in (
+                        self._region_prototype(labeled_keys),
+                        self._region_prototype(previous_keys),
+                    )
+                    if prototype is not None
+                )
+                rejected: Counter[str] = Counter()
+                input_types: Counter[str] = Counter()
+                input_count = 0
+                seen_input_indices: set[int] = set()
+
+                for image_id, image_tokens in iter_by_image(region):
+                    if (
+                        isinstance(image_tokens, (str, bytes))
+                        or not isinstance(image_tokens, Sequence)
+                    ):
+                        raise TypeError(
+                            "candidate_pool.iter_region_by_image() must yield "
+                            "(image_id, sequence)"
+                        )
+                    prepared_group: List[_PreparedCandidate] = []
+                    for token in image_tokens:
+                        input_index = self._streaming_input_index(token)
+                        if input_index in seen_input_indices:
+                            raise ValueError(
+                                f"duplicate streaming input_index={input_index} "
+                                f"in region {region!r}"
+                            )
+                        seen_input_indices.add(input_index)
+                        input_count += 1
+                        prepared = self._prepare_candidate(
+                            token,
+                            region,
+                            input_index,
+                        )
+                        if prepared.image_id != str(image_id):
+                            raise ValueError(
+                                "iter_region_by_image image_id does not match token metadata"
+                            )
+                        input_types[prepared.global_type] += 1
+                        if (
+                            prepared.global_type == "novel_pending"
+                            and not bool(
+                                prepared.token.meta.get("novel_activated", False)
+                            )
+                        ):
+                            rejected["deferred_novel_pending"] += 1
+                            continue
+                        prepared_group.append(prepared)
+
+                    if not prepared_group:
+                        continue
+                    scored_group = self._score_region_candidates(
+                        prepared_group,
+                        global_banks,
+                        region_prototypes,
+                    )
+                    scored_store.add_many(
+                        region,
+                        [self._scored_record(region, item) for item in scored_group],
+                    )
+
+                selected, selection_rejected, selected_stats = (
+                    self._select_region_streaming_exact(
+                        scored_store,
+                        candidate_pool,
+                        region,
+                        capacity=capacity,
+                        per_image_limit=self.sample_per_image[region],
+                    )
+                )
+                rejected.update(selection_rejected)
+                selected_tokens[region] = [item.token for item in selected]
+                total_rejected.update(rejected)
+                region_stats[region] = self._region_stats_streaming(
+                    scored_store=scored_store,
+                    region=region,
+                    input_count=input_count,
+                    selected=selected,
+                    capacity=capacity,
+                    per_image_limit=self.sample_per_image[region],
+                    rejected=rejected,
+                    input_types=input_types,
+                    selected_stats=selected_stats,
+                )
+
+        result = {
+            "selected_tokens": selected_tokens,
+            "stats": {
+                "diversity_enabled": self.use_diversity_selection,
+                "lambda_diversity": self.lambda_diversity,
+                "spatial_nms_distance": self.spatial_nms_distance,
+                "feature_dup_sim_threshold": self.feature_dup_sim_threshold,
+                "target_fill_ratio": self.target_fill_ratio,
+                "relaxed_fill": self.relaxed_fill,
+                "feature_nms_scope": self.feature_nms_scope,
+                "input_tokens": sum(
+                    item["input_tokens"] for item in region_stats.values()
+                ),
+                "eligible_tokens": sum(
+                    item["eligible_tokens"] for item in region_stats.values()
+                ),
+                "selected_tokens": sum(
+                    item["selected_tokens"] for item in region_stats.values()
+                ),
+                "rejected": dict(total_rejected),
+                "regions": region_stats,
+            },
+        }
+        self.last_result = result
+        self._log_summary(result["stats"])
+        return result
+
+    def _select_region_streaming_exact(
+        self,
+        scored_store: ScoredCandidateStore,
+        candidate_pool,
+        region: str,
+        *,
+        capacity: int,
+        per_image_limit: int,
+    ):
+        state = _StreamingSelectionState()
+        target_count = min(
+            int(capacity),
+            int(math.ceil(float(capacity) * self.target_fill_ratio)),
+        )
+
+        def run(
+            gate_mode: Optional[str],
+            *,
+            stage: str,
+            stop_count: int,
+            use_nms: bool,
+            spatial_distance: float,
+            feature_threshold: float,
+        ) -> None:
+            records = scored_store.iter_ranked(region, gate_mode=gate_mode)
+            prepared = self._iter_scored_candidates(
+                records,
+                candidate_pool,
+                region,
+            )
+            self._run_pass_stream(
+                prepared,
+                state=state,
+                stage=stage,
+                stop_count=stop_count,
+                use_nms=use_nms,
+                spatial_distance=spatial_distance,
+                feature_threshold=feature_threshold,
+                per_image_limit=per_image_limit,
+            )
+
+        if not self.relaxed_fill:
+            run(
+                None,
+                stage="strict",
+                stop_count=capacity,
+                use_nms=True,
+                spatial_distance=self.spatial_nms_distance,
+                feature_threshold=self.feature_dup_sim_threshold,
+            )
+        else:
+            run(
+                "strict",
+                stage="strict",
+                stop_count=capacity,
+                use_nms=True,
+                spatial_distance=self.spatial_nms_distance,
+                feature_threshold=self.feature_dup_sim_threshold,
+            )
+            if len(state.selected) < target_count:
+                run(
+                    "strict",
+                    stage="relaxed_nms",
+                    stop_count=target_count,
+                    use_nms=True,
+                    spatial_distance=self.relaxed_spatial_nms_distance,
+                    feature_threshold=self.relaxed_feature_dup_sim_threshold,
+                )
+            if len(state.selected) < target_count:
+                run(
+                    "strict",
+                    stage="strict_fill",
+                    stop_count=target_count,
+                    use_nms=False,
+                    spatial_distance=0.0,
+                    feature_threshold=1.0,
+                )
+            if len(state.selected) < target_count:
+                run(
+                    "relaxed",
+                    stage="relaxed_gate_fill",
+                    stop_count=target_count,
+                    use_nms=False,
+                    spatial_distance=0.0,
+                    feature_threshold=1.0,
+                )
+
+        eligible_count = scored_store.count(region)
+        maximum_selectable = sum(
+            min(count, per_image_limit)
+            for count in scored_store.image_counts(region).values()
+        )
+        if len(state.selected) >= target_count:
+            underfill_reason = None
+        elif eligible_count < target_count:
+            underfill_reason = "candidate_shortage"
+        elif maximum_selectable < target_count:
+            underfill_reason = "per_image_limit"
+        elif not self.relaxed_fill:
+            underfill_reason = "strict_diversity"
+        else:
+            underfill_reason = "selection_exhausted"
+
+        return state.selected, state.rejected, {
+            "selected_per_image": dict(state.per_image_counts),
+            "selected_unique_images": len(state.per_image_counts),
+            "min_same_image_spatial_distance": state.min_spatial_distance,
+            "max_selected_feature_similarity": state.max_feature_similarity,
+            "target_count": target_count,
+            "target_reached": len(state.selected) >= target_count,
+            "fill_ratio": (
+                float(len(state.selected) / capacity) if capacity > 0 else 1.0
+            ),
+            "strict_candidates": scored_store.count(region, "strict"),
+            "relaxed_candidates": scored_store.count(region, "relaxed"),
+            "selection_stage_counts": dict(state.stage_counts),
+            "underfill_reason": underfill_reason,
+        }
+
+    def _run_pass_stream(
+        self,
+        candidates: Iterator[_PreparedCandidate],
+        *,
+        state: _StreamingSelectionState,
+        stage: str,
+        stop_count: int,
+        use_nms: bool,
+        spatial_distance: float,
+        feature_threshold: float,
+        per_image_limit: int,
+    ) -> None:
+        min_distance_sq = spatial_distance * spatial_distance
+        for candidate in candidates:
+            if len(state.selected) >= stop_count:
+                return
+            if candidate.input_index in state.selected_input_indices:
+                continue
+            if state.per_image_counts[candidate.image_id] >= per_image_limit:
+                state.rejected[f"{stage}_per_image_limit"] += 1
+                continue
+
+            nearest_sq = None
+            nearest_similarity = None
+            if use_nms and self.use_diversity_selection:
+                same_image_selected = state.selected_by_image[candidate.image_id]
+                if same_image_selected:
+                    nearest_sq = min(
+                        self._distance_sq(candidate.coord, item.coord)
+                        for item in same_image_selected
+                    )
+                    if nearest_sq <= min_distance_sq:
+                        state.rejected[f"{stage}_spatial_nms"] += 1
+                        continue
+
+                feature_reference = (
+                    same_image_selected
+                    if self.feature_nms_scope == "same_image"
+                    else state.selected
+                )
+                if feature_reference:
+                    reference_keys = torch.stack(
+                        [item.normalized_key for item in feature_reference],
+                        dim=0,
+                    )
+                    nearest_similarity = float(
+                        torch.mv(reference_keys, candidate.normalized_key)
+                        .max()
+                        .item()
+                    )
+                    if nearest_similarity >= feature_threshold:
+                        state.rejected[f"{stage}_feature_duplicate"] += 1
+                        continue
+
+            if nearest_sq is not None:
+                nearest_distance = math.sqrt(nearest_sq)
+                state.min_spatial_distance = (
+                    nearest_distance
+                    if state.min_spatial_distance is None
+                    else min(state.min_spatial_distance, nearest_distance)
+                )
+            if nearest_similarity is not None:
+                state.max_feature_similarity = (
+                    nearest_similarity
+                    if state.max_feature_similarity is None
+                    else max(state.max_feature_similarity, nearest_similarity)
+                )
+
+            metadata = self._detach_metadata(candidate.token.meta)
+            metadata["selection_stage"] = stage
+            staged = replace(
+                candidate,
+                token=replace(candidate.token, meta=metadata),
+            )
+            state.selected.append(staged)
+            state.selected_input_indices.add(candidate.input_index)
+            state.selected_by_image[candidate.image_id].append(staged)
+            state.per_image_counts[candidate.image_id] += 1
+            state.stage_counts[stage] += 1
+
+    def _iter_scored_candidates(
+        self,
+        records: Iterator[ScoredCandidateRecord],
+        candidate_pool,
+        region: str,
+    ) -> Iterator[_PreparedCandidate]:
+        for record in records:
+            token = candidate_pool.get_candidate(
+                region,
+                record.canonical_index,
+                shard_id=record.shard_id,
+                shard_offset=record.shard_offset,
+            )
+            prepared = self._prepare_candidate(token, region, record.input_index)
+            if prepared.image_id != record.image_id:
+                raise RuntimeError("scored candidate image_id does not match pool token")
+            if prepared.region_gate_mode != record.gate_mode:
+                raise RuntimeError("scored candidate gate_mode does not match pool token")
+            scored_token = self._copy_with_diversity(
+                token,
+                d_img=record.d_img,
+                d_region=record.d_region,
+                raw_diversity=record.raw_diversity,
+                applied_diversity=record.diversity_score,
+                selection_score=record.selection_score,
+            )
+            yield replace(
+                prepared,
+                token=scored_token,
+                d_img=record.d_img,
+                d_region=record.d_region,
+                diversity_score=record.diversity_score,
+                selection_score=record.selection_score,
+            )
+
+    def _region_stats_streaming(
+        self,
+        *,
+        scored_store: ScoredCandidateStore,
+        region: str,
+        input_count: int,
+        selected: Sequence[_PreparedCandidate],
+        capacity: int,
+        per_image_limit: int,
+        rejected: Counter,
+        input_types: Counter,
+        selected_stats: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        eligible_count = 0
+        sum_d_img = 0.0
+        sum_d_region = 0.0
+        sum_diversity = 0.0
+        for record in scored_store.iter_ranked(region):
+            eligible_count += 1
+            sum_d_img += record.d_img
+            sum_d_region += record.d_region
+            sum_diversity += record.diversity_score
+        denominator = float(eligible_count) if eligible_count else 1.0
+        return {
+            "input_tokens": input_count,
+            "eligible_tokens": eligible_count,
+            "selected_tokens": len(selected),
+            "capacity": capacity,
+            "per_image_limit": per_image_limit,
+            "rejected": dict(rejected),
+            "input_global_type_counts": dict(input_types),
+            "selected_global_type_counts": dict(
+                Counter(item.global_type for item in selected)
+            ),
+            "input_region_gate_counts": scored_store.gate_counts(region),
+            "selected_region_gate_counts": dict(
+                Counter(item.region_gate_mode for item in selected)
+            ),
+            "eligible_mean_D_img": sum_d_img / denominator,
+            "eligible_mean_D_region": sum_d_region / denominator,
+            "eligible_mean_diversity_score": sum_diversity / denominator,
+            "selected_mean_diversity_score": self._mean(
+                [item.diversity_score for item in selected]
+            ),
+            "selected_mean_selection_score": self._mean(
+                [item.selection_score for item in selected]
+            ),
+            **dict(selected_stats),
+        }
+
+    def _scored_record(
+        self,
+        region: str,
+        candidate: _PreparedCandidate,
+    ) -> ScoredCandidateRecord:
+        return ScoredCandidateRecord(
+            region=region,
+            gate_mode=candidate.region_gate_mode,
+            image_id=candidate.image_id,
+            input_index=candidate.input_index,
+            selection_score=candidate.selection_score,
+            shard_id=candidate.shard_id,
+            shard_offset=candidate.shard_offset,
+            canonical_index=candidate.canonical_index,
+            d_img=candidate.d_img,
+            d_region=candidate.d_region,
+            raw_diversity=float(
+                candidate.token.meta.get("raw_diversity_score", 0.0)
+            ),
+            diversity_score=candidate.diversity_score,
+        )
+
+    @staticmethod
+    def _streaming_input_index(token: UnlabeledMemoryToken) -> int:
+        meta = getattr(token, "meta", None)
+        if not isinstance(meta, Mapping):
+            raise TypeError("candidate token meta must be a mapping")
+        meta_index = meta.get("sv_ume_pool_input_index")
+        attr_index = getattr(token, "canonical_index", None)
+        if meta_index is None and attr_index is None:
+            raise KeyError(
+                "streaming candidate requires meta['sv_ume_pool_input_index'] "
+                "or candidate.canonical_index"
+            )
+        if (
+            meta_index is not None
+            and attr_index is not None
+            and int(meta_index) != int(attr_index)
+        ):
+            raise ValueError(
+                "candidate pool input index does not match canonical_index"
+            )
+        index = int(meta_index if meta_index is not None else attr_index)
+        if index < 0:
+            raise ValueError("candidate pool input index must be non-negative")
+        return index
+
+    def _scored_store_root(self, candidate_pool) -> Optional[Path]:
+        configured = getattr(self.cfg, "sv_ume_scored_candidate_dir", None)
+        if configured is not None and str(configured).strip():
+            return Path(configured)
+        storage_dir = getattr(candidate_pool, "storage_dir", None)
+        return None if storage_dir is None else Path(storage_dir)
 
     def _score_region_candidates(
         self,
@@ -560,6 +1139,9 @@ class UMEDiversitySampler:
             region_gate_mode=region_gate_mode,
             normalized_key=self._normalize_vector(key),
             normalized_global_key=self._normalize_vector(global_key),
+            canonical_index=int(getattr(token, "canonical_index", input_index)),
+            shard_id=int(getattr(token, "shard_id", -1)),
+            shard_offset=int(getattr(token, "shard_offset", input_index)),
         )
 
     def _copy_with_diversity(

@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional
 import torch
 
 from CBM.memory.labels import REGION_NAMES
+from CBM.sv_ume.candidate_pool_backends import DiskCandidatePool, RAMCandidatePool
 from CBM.sv_ume.schedules import (
     can_use_lagged_memory,
     expected_unlabeled_source_epoch,
@@ -75,13 +76,12 @@ class SVUMEManager:
 
         self.U_prev = None
         self.U_next = None
-        self.candidate_pool = self._empty_candidate_pool()
-        self._candidate_index = {region: {} for region in REGION_NAMES}
+        self._candidate_epoch: Optional[int] = None
+        self.candidate_pool = self._new_candidate_pool(epoch=None)
         self.epoch_stats: Dict[str, Any] = self._new_epoch_stats(
             epoch=None,
             status="initialized" if self.enabled else "disabled",
         )
-        self._candidate_epoch: Optional[int] = None
         self._u_prev_epoch: Optional[int] = None
         self._u_next_epoch: Optional[int] = None
         self.last_used_u_prev_epoch: Optional[int] = None
@@ -142,9 +142,18 @@ class SVUMEManager:
         )
         return memory
 
-    def clear_candidate_pool(self) -> None:
-        self.candidate_pool = self._empty_candidate_pool()
-        self._candidate_index = {region: {} for region in REGION_NAMES}
+    def clear_candidate_pool(
+        self,
+        epoch: Optional[int] = None,
+        *,
+        suppress_errors: bool = False,
+    ) -> None:
+        previous = getattr(self, "candidate_pool", None)
+        if previous is not None:
+            self._log_candidate_pool_memory("clear_before", epoch=epoch, pool=previous)
+            self._dispose_candidate_pool(previous, suppress_errors=suppress_errors)
+        self.candidate_pool = self._new_candidate_pool(epoch=epoch)
+        self._log_candidate_pool_memory("clear_after", epoch=epoch)
 
     @torch.no_grad()
     def collect_candidates_after_epoch(
@@ -171,11 +180,12 @@ class SVUMEManager:
         if labeled_memory is None:
             raise ValueError("labeled_memory is required when SV-UME is enabled")
 
-        self.clear_candidate_pool()
+        self.clear_candidate_pool(epoch=current_epoch)
         self.U_next = None
         self._u_next_epoch = None
         self._candidate_epoch = current_epoch
         self.epoch_stats = self._new_epoch_stats(current_epoch, "collecting")
+        self._log_candidate_pool_memory("collect_start", epoch=current_epoch)
 
         try:
             for batch in unlabeled_loader:
@@ -193,19 +203,28 @@ class SVUMEManager:
                 self._accumulate_candidate_diagnostics(
                     getattr(self.candidate_builder, "last_result", None)
                 )
+                if self.epoch_stats["batches_seen"] % self._candidate_log_interval() == 0:
+                    self._log_candidate_pool_memory(
+                        "collect_batch",
+                        epoch=current_epoch,
+                        batch=self.epoch_stats["batches_seen"],
+                    )
         except Exception as exc:
-            self.clear_candidate_pool()
+            failed_counts = self._candidate_counts()
+            self._log_candidate_pool_memory("collect_error", epoch=current_epoch)
             self.U_next = None
             self._candidate_epoch = None
             self._u_next_epoch = None
             self.epoch_stats["status"] = "collect_error"
             self.epoch_stats["error"] = str(exc)
-            self.epoch_stats["candidate_counts"] = self._candidate_counts()
+            self.epoch_stats["candidate_counts"] = failed_counts
+            self.clear_candidate_pool(epoch=None, suppress_errors=True)
             self._error(f"[SV-UME] candidate collection failed at epoch {current_epoch}: {exc}")
             raise
 
         self.epoch_stats["status"] = "candidates_collected"
         self.epoch_stats["candidate_counts"] = self._candidate_counts()
+        self._log_candidate_pool_memory("collect_end", epoch=current_epoch)
         self._info(
             f"[SV-UME] epoch={current_epoch} candidates="
             f"{self.epoch_stats['candidate_counts']}"
@@ -232,6 +251,8 @@ class SVUMEManager:
             self.epoch_stats["status"] = "zero_candidates"
             self.epoch_stats["error"] = message
             self._error(message)
+            self._candidate_epoch = None
+            self.clear_candidate_pool(epoch=None, suppress_errors=True)
             raise SVUMEZeroCandidatesError(message)
         return self.epoch_stats
 
@@ -253,8 +274,11 @@ class SVUMEManager:
         capacities = self._region_capacities(labeled_memory)
         self.epoch_stats["region_capacities"] = dict(capacities)
         try:
+            self._log_candidate_pool_memory("build_before_flush", epoch=current_epoch)
+            self.candidate_pool.flush_all()
+            self._log_candidate_pool_memory("build_after_flush", epoch=current_epoch)
             memory = self.memory_builder.build_memory(
-                candidate_pool={region: list(self.candidate_pool[region]) for region in REGION_NAMES},
+                candidate_pool=self.candidate_pool,
                 labeled_memory=labeled_memory,
                 region_capacities=dict(capacities),
                 epoch=current_epoch,
@@ -264,10 +288,13 @@ class SVUMEManager:
             self._validate_capacity(memory_counts, capacities)
             self._validate_active_novel_entries(memory)
         except Exception as exc:
+            self._log_candidate_pool_memory("build_error", epoch=current_epoch)
             self.U_next = None
             self._u_next_epoch = None
+            self._candidate_epoch = None
             self.epoch_stats["status"] = "build_error"
             self.epoch_stats["error"] = str(exc)
+            self.clear_candidate_pool(epoch=None, suppress_errors=True)
             self._error(f"[SV-UME] U_{current_epoch} build failed: {exc}")
             raise
 
@@ -275,6 +302,7 @@ class SVUMEManager:
         self._u_next_epoch = current_epoch
         self.epoch_stats["status"] = "memory_built"
         self.epoch_stats["memory_counts"] = memory_counts
+        self._log_candidate_pool_memory("build_end", epoch=current_epoch)
         self._info(f"[SV-UME] built U_{current_epoch} counts={memory_counts}")
         return self.U_next
 
@@ -288,7 +316,7 @@ class SVUMEManager:
         self.U_next = None
         self._u_next_epoch = None
         self._candidate_epoch = None
-        self.clear_candidate_pool()
+        self.clear_candidate_pool(epoch=None, suppress_errors=True)
 
         if next_memory is None or next_epoch is None or not self._memory_ready(next_memory):
             self.U_prev = None
@@ -687,20 +715,7 @@ class SVUMEManager:
                 continue
             if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
                 raise TypeError(f"candidates for {region} must be a sequence")
-            for candidate in values:
-                identity = self._candidate_identity(candidate, region)
-                rank = self._candidate_rank(candidate)
-                previous = self._candidate_index[region].get(identity)
-                if previous is None:
-                    self._candidate_index[region][identity] = (
-                        len(self.candidate_pool[region]),
-                        rank,
-                    )
-                    self.candidate_pool[region].append(candidate)
-                elif rank > previous[1]:
-                    index = previous[0]
-                    self.candidate_pool[region][index] = candidate
-                    self._candidate_index[region][identity] = (index, rank)
+            self.candidate_pool.append_many(region, values)
 
     def _memory_state_dict(self, memory) -> Dict[str, Any]:
         memory_state = self.memory_builder.memory_state_dict(memory)
@@ -753,7 +768,13 @@ class SVUMEManager:
 
     def _serialize_candidate_pool(self) -> Dict[str, List[dict]]:
         return {
-            region: [self._candidate_to_state(candidate, region) for candidate in self.candidate_pool[region]]
+            region: [
+                self._candidate_to_state(candidate, region)
+                for candidate in self.candidate_pool.iter_region(
+                    region,
+                    order="canonical",
+                )
+            ]
             for region in REGION_NAMES
         }
 
@@ -765,7 +786,7 @@ class SVUMEManager:
             raise KeyError(f"unknown candidate-pool regions: {sorted(unknown)}")
         from CBM.sv_ume.unlabeled_dense_memory import UnlabeledMemoryToken
 
-        self.clear_candidate_pool()
+        self.clear_candidate_pool(epoch=self._candidate_epoch)
         restored = self._empty_candidate_pool()
         for region in REGION_NAMES:
             entries = state.get(region, [])
@@ -794,7 +815,12 @@ class SVUMEManager:
                         ),
                     )
                 )
-        self._append_batch_candidates(restored)
+        try:
+            self._append_batch_candidates(restored)
+        except Exception:
+            self._candidate_epoch = None
+            self.clear_candidate_pool(epoch=None, suppress_errors=True)
+            raise
 
     def _candidate_to_state(self, candidate, region: str) -> dict:
         self._candidate_identity(candidate, region)
@@ -1122,7 +1148,139 @@ class SVUMEManager:
         return {region: self._entry_count(keys[region]) for region in REGION_NAMES}
 
     def _candidate_counts(self) -> Dict[str, int]:
+        counts_fn = getattr(self.candidate_pool, "counts", None)
+        if callable(counts_fn):
+            counts = counts_fn()
+            if not isinstance(counts, Mapping):
+                raise TypeError("candidate_pool.counts() must return a mapping")
+            return {region: int(counts.get(region, 0)) for region in REGION_NAMES}
         return {region: len(self.candidate_pool[region]) for region in REGION_NAMES}
+
+    def _new_candidate_pool(self, epoch: Optional[int] = None):
+        backend = str(
+            getattr(self.cfg, "sv_ume_candidate_pool_backend", "ram")
+        ).strip().lower()
+        common = {
+            "regions": REGION_NAMES,
+            "rank_fn": self._candidate_rank,
+            "identity_fn": self._candidate_identity,
+        }
+        if backend == "ram":
+            return RAMCandidatePool(**common)
+        if backend == "disk":
+            root_dir = getattr(self.cfg, "sv_ume_candidate_pool_dir", None)
+            if root_dir is not None and not str(root_dir).strip():
+                root_dir = None
+            return DiskCandidatePool(
+                cfg=self.cfg,
+                root_dir=root_dir,
+                epoch=epoch,
+                shard_size=int(
+                    getattr(self.cfg, "sv_ume_candidate_shard_size", 4096)
+                ),
+                max_open_shards=int(
+                    getattr(self.cfg, "sv_ume_candidate_max_open_shards", 2)
+                ),
+                logger=self.logger,
+                **common,
+            )
+        raise ValueError(
+            f"unknown sv_ume_candidate_pool_backend={backend!r}; "
+            "expected 'ram' or 'disk'"
+        )
+
+    def _dispose_candidate_pool(self, pool, *, suppress_errors: bool) -> None:
+        errors: List[Exception] = []
+        for method_name in ("clear", "close"):
+            method = getattr(pool, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                method()
+            except Exception as exc:
+                errors.append(exc)
+        if not errors:
+            return
+        message = "; ".join(str(error) for error in errors)
+        if suppress_errors:
+            self._error(f"[SV-UME][pool] cleanup failed: {message}")
+            return
+        raise errors[0]
+
+    def _candidate_log_interval(self) -> int:
+        try:
+            return max(
+                1,
+                int(getattr(self.cfg, "sv_ume_candidate_log_interval", 20)),
+            )
+        except (TypeError, ValueError):
+            return 20
+
+    @staticmethod
+    def _process_rss_gb() -> Optional[float]:
+        try:
+            import psutil
+
+            return float(psutil.Process().memory_info().rss) / float(1024 ** 3)
+        except Exception:
+            return None
+
+    def _log_candidate_pool_memory(
+        self,
+        stage: str,
+        *,
+        epoch: Optional[int],
+        batch: Optional[int] = None,
+        pool=None,
+    ) -> None:
+        if not bool(getattr(self.cfg, "sv_ume_candidate_log_memory", True)):
+            return
+        target = self.candidate_pool if pool is None else pool
+        try:
+            stats_fn = getattr(target, "stats", None)
+            if callable(stats_fn):
+                raw_stats = stats_fn()
+                to_dict = getattr(raw_stats, "to_dict", None)
+                stats = to_dict() if callable(to_dict) else dict(raw_stats)
+            else:
+                counts = {
+                    region: len(target.get(region, ())) for region in REGION_NAMES
+                }
+                stats = {
+                    "backend": "mapping",
+                    "active_counts": counts,
+                    "records_written": counts,
+                    "buffered_counts": {region: 0 for region in REGION_NAMES},
+                    "shard_counts": {region: 0 for region in REGION_NAMES},
+                }
+            counts = {
+                region: int(stats.get("active_counts", {}).get(region, 0))
+                for region in REGION_NAMES
+            }
+            records_written = sum(
+                int(value) for value in stats.get("records_written", {}).values()
+            )
+            active = sum(counts.values())
+            backend = str(stats.get("backend", "unknown"))
+            inactive = max(0, records_written - active) if backend == "disk" else 0
+            buffered = sum(
+                int(value) for value in stats.get("buffered_counts", {}).values()
+            )
+            shards = {
+                region: int(stats.get("shard_counts", {}).get(region, 0))
+                for region in REGION_NAMES
+            }
+            rss_gb = self._process_rss_gb()
+            rss_text = "unavailable" if rss_gb is None else f"{rss_gb:.3f}"
+            batch_text = "" if batch is None else f" batch={int(batch)}"
+            self._info(
+                f"[SV-UME][pool][mem] stage={stage} epoch={epoch}"
+                f"{batch_text} rss_gb={rss_text} backend={backend} "
+                f"counts={counts} active={active} inactive={inactive} "
+                f"buffered={buffered} shards={shards}"
+            )
+        except Exception:
+            return
 
     @staticmethod
     def _empty_candidate_pool() -> Dict[str, List[Any]]:

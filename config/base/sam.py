@@ -49,6 +49,24 @@ unlabeled_memory_source = "sam_refined_pseudo_label"
 unlabeled_memory_feature_source = "teacher_p3"
 use_sam_embedding_as_memory_key = False
 
+# Memory-safe SV-UME candidate pool.  ``ckpt_dir`` is defined only by run
+# configs, so enabled SV-UME runs must bind the storage directory explicitly.
+sv_ume_candidate_pool_backend = "disk"
+sv_ume_candidate_pool_dir = None
+sv_ume_candidate_shard_size = 4096
+sv_ume_candidate_max_open_shards = 2
+sv_ume_candidate_delete_after_build = True
+sv_ume_candidate_exact_mode = True
+sv_ume_candidate_keep_dtype = "original"
+sv_ume_candidate_preserve_meta = True
+sv_ume_candidate_preserve_canonical_order = True
+sv_ume_candidate_preserve_identity_replacement = True
+sv_ume_candidate_log_memory = True
+sv_ume_candidate_log_interval = 20
+sv_ume_diagnostics_interval = 20
+sv_ume_candidate_backend_compare = False
+sv_ume_candidate_equivalence_test_batches = 50
+
 # Capacity
 unlabeled_to_labeled_ratio = 1.0
 region_capacity_ratio = {
@@ -85,7 +103,6 @@ tau_token = {
 # run config explicitly opts into the debug or stable alternatives.
 sv_ume_token_score_mode = "product"  # product | geometric_mean | weighted_sum
 sv_ume_regions = ["fg_core", "fg_boundary", "bg_near", "bg_far"]
-sv_ume_diagnostics_interval = 20
 sv_ume_context_floor = 0.30
 sv_ume_non_boundary_context = 0.80
 
