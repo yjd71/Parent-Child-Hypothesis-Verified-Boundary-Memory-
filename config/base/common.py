@@ -10,7 +10,7 @@ precisionHigh = True
 compile = False
 verbose_eval = True
 
-# CBM / SVB-PLR / SV-UME logging only. Baseline training progress keeps its
+# CBM logging only. Baseline training progress keeps its
 # fixed 20-batch cadence; visualization save settings remain independent.
 log_enable = True
 log_interval = 200

@@ -9,8 +9,6 @@ tot_epochs = 15
 
 sup_only_train_epoch = 5
 distributed_train = False
-sam_refine_mode = "off"
-
 device_map = {
     'model': '*'
 }  # Only available for non distributed training
@@ -31,7 +29,7 @@ backbone = [
     'swin_v1_b', 'swin_v1_l',               # 5-bs9, 6-bs6
     'swin_v1_t', 'swin_v1_s',               # 7, 8
     'pvt_v2_b0', 'pvt_v2_b1',               # 9, 10
-][5]
+][6]
 lateral_channels_in_collection = {
     'vgg16': [512, 256, 128, 64], 'vgg16bn': [512, 256, 128, 64], 'resnet50': [1024, 512, 256, 64],
     'pvt_v2_b2': [512, 320, 128, 64], 'pvt_v2_b5': [512, 320, 128, 64],
