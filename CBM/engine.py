@@ -47,6 +47,7 @@ class CBMPFIEngine(nn.Module):
             value_dim=int(getattr(self.config, "cbm_value_dim", 8)),
             selection_config=self.labeled_memory_profile,
         )
+        self.memory.set_compat_meta(self._build_memory_compat_meta())
         self.builder = LabeledMemoryBuilder(self.memory, config=self.config, logger=logger)
 
         self.router: Optional[GlobalMemoryRouter] = None
@@ -218,6 +219,7 @@ class CBMPFIEngine(nn.Module):
         return loss
 
     def memory_state_dict(self):
+        self.memory.set_compat_meta(self._build_memory_compat_meta())
         return self.memory.to_state_dict()
 
     def load_memory_state_dict(
@@ -227,8 +229,37 @@ class CBMPFIEngine(nn.Module):
         dtype: Optional[torch.dtype] = None,
     ) -> None:
         target_device = _normalize_device(device) or self.device or torch.device("cpu")
+        self._check_memory_state_compatible(state)
         self.memory.load_state_dict(state, device=target_device, dtype=dtype)
         self.state.memory_ready = self.memory.is_ready()
+
+    def _build_memory_compat_meta(self):
+        return {
+            "backbone": str(getattr(self.config, "backbone", "")),
+            "img_size": int(getattr(self.config, "img_size", 0)),
+            "lateral_channels_in_collection": [
+                int(channel) for channel in getattr(self.config, "lateral_channels_in_collection", [])
+            ],
+            "pc_dim": int(getattr(self.config, "cbm_memory_dim", 128)),
+            "value_dim": int(getattr(self.config, "cbm_value_dim", 8)),
+            "feature_version": str(getattr(self.config, "cbm_memory_feature_version", "swin_l_pc_hbm_v1")),
+        }
+
+    def _check_memory_state_compatible(self, state) -> None:
+        if not state:
+            return
+        if not isinstance(state, Mapping):
+            raise RuntimeError("Memory checkpoint must be a mapping. Rebuild labelled memory.")
+        memory_meta = state.get("compat_meta")
+        if not memory_meta:
+            raise RuntimeError("Memory checkpoint has no compat_meta. Rebuild labelled memory.")
+        expected = self._build_memory_compat_meta()
+        for key, expected_value in expected.items():
+            if memory_meta.get(key) != expected_value:
+                raise RuntimeError(
+                    f"Memory incompatible: {key}: memory={memory_meta.get(key)} "
+                    f"expected={expected_value}. Rebuild labelled memory."
+                )
 
     def _ensure_modules(self, x3_channels: int, p3_channels: int, ref: torch.Tensor) -> None:
         if self.router is not None and self._x3_channels != int(x3_channels):

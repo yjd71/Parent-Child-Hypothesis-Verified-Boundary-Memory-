@@ -1,8 +1,10 @@
 CBM_DEFAULTS = {
     "cbm_pfi_enable": False,
+    "use_pc_hbm": False,
     "cbm_start_epoch": 0,
     "cbm_memory_dim": 128,
     "cbm_value_dim": 8,
+    "cbm_memory_feature_version": "swin_l_pc_hbm_v1",
     "cbm_labeled_memory_profile": "auto",
     "cbm_labeled_memory_profile_overrides": {},
     "cbm_labeled_split": None,

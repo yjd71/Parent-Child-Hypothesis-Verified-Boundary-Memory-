@@ -52,6 +52,10 @@ lr_decay_rate = 0.5
 only_S_MAE = False
 SDPA_enabled = False  
 
+# Checkpoint migration defaults for backbone/channel changes.
+checkpoint_load_strategy = "shape_matched"
+resume_training_state = False
+
 # backbone weights settings
 weights_root_dir = os.path.join(sys_home_dir, 'weights')
 weights = {

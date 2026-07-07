@@ -60,6 +60,47 @@ def _checkpoint_has_cbm_keys(model_state) -> bool:
     return hasattr(model_state, "keys") and any(str(key).startswith("cbm.") for key in model_state.keys())
 
 
+def _load_shape_matched_state(model: torch.nn.Module, state_dict, logger: Logger = None, prefix: str = "Model checkpoint"):
+    model_state = model.state_dict()
+    keep = {}
+    skip = []
+    for key, value in state_dict.items():
+        if key in model_state and hasattr(value, "shape") and tuple(value.shape) == tuple(model_state[key].shape):
+            keep[key] = value
+        else:
+            skip.append(key)
+
+    merged_state = dict(model_state)
+    merged_state.update(keep)
+    load_result = model.load_state_dict(merged_state, strict=False)
+    _log(logger, ("key_info", "info"), f"[+] {prefix} shape-matched keys loaded: {len(keep)}")
+    if skip:
+        _log(logger, ("warn_info", "warning", "info"), f"[!] {prefix} mismatched/unexpected keys skipped: {len(skip)}")
+        _log(logger, ("warn_info", "warning", "info"), f"[!] {prefix} first skipped keys: {skip[:10]}")
+    return load_result, keep, skip
+
+
+def _load_model_checkpoint_state(
+    model: torch.nn.Module,
+    checkpoint,
+    config: Config,
+    logger: Logger,
+    prefix: str = "Model checkpoint",
+):
+    model_state = _model_state_from_checkpoint(checkpoint)
+    strategy = str(getattr(config, "checkpoint_load_strategy", "shape_matched")).strip().lower()
+    if strategy in ("shape_matched", "shape-matched", "shape_safe", "shape-safe"):
+        load_result, _, _ = _load_shape_matched_state(model, model_state, logger=logger, prefix=prefix)
+        return load_result
+    if strategy in ("non_strict", "non-strict", "strict_false"):
+        load_result = model.load_state_dict(model_state, strict=False)
+        _log_incompatible_keys(logger, load_result, prefix)
+        return load_result
+    if strategy == "strict":
+        return model.load_state_dict(model_state, strict=True)
+    raise NotImplementedError(f"Unsupported checkpoint_load_strategy: {strategy}")
+
+
 def _log_incompatible_keys(logger: Logger, load_result, prefix: str) -> None:
     missing = list(getattr(load_result, "missing_keys", []) or [])
     unexpected = list(getattr(load_result, "unexpected_keys", []) or [])
@@ -143,8 +184,7 @@ def build_model_optimizers(config: Config, logger: Logger, device: torch.device,
         if os.path.isfile(resume):
             logger.key_info("[+] Loading model checkpoint from '{}'".format(resume))
             checkpoint = torch.load(resume, map_location='cpu')
-            load_result = model.load_state_dict(_model_state_from_checkpoint(checkpoint), strict=False)
-            _log_incompatible_keys(logger, load_result, "Model checkpoint")
+            _load_model_checkpoint_state(model, checkpoint, config, logger, prefix="Model checkpoint")
             _load_cbm_memory_from_checkpoint(cbm, checkpoint, config, device, logger)
         else:
             logger.warn_info("[!] No checkpoint found at '{}'".format(resume))
@@ -170,7 +210,7 @@ def build_model_optimizers(config: Config, logger: Logger, device: torch.device,
     lr_scheduler = _build_lr_scheduler(config, optimizer)
     logger.freeze_info("Scheduler type: {}".format(str(getattr(config, "scheduler_type", "multistep"))))
 
-    if checkpoint is not None:
+    if checkpoint is not None and bool(getattr(config, "resume_training_state", False)):
         if 'optimizer' in checkpoint:
             try:
                 optimizer.load_state_dict(checkpoint['optimizer'])
@@ -181,6 +221,8 @@ def build_model_optimizers(config: Config, logger: Logger, device: torch.device,
         if 'epoch' in checkpoint:
             epoch_st = checkpoint['epoch'] + 1
             logger.key_info("[+] Resume training from epoch {}".format(epoch_st))
+    elif checkpoint is not None:
+        _log(logger, ("warn_info", "warning", "info"), "[!] Training state resume disabled; optimizer/lr_scheduler/epoch were not restored.")
 
     logger.freeze_info("Optimizer details: {}".format(str(optimizer)))
     logger.freeze_info("Scheduler details: {}".format(str(lr_scheduler.state_dict())))
@@ -198,9 +240,7 @@ def build_model_eval(config: Config, logger: Logger, resume: str, device: torch.
     has_cbm_keys = _checkpoint_has_cbm_keys(model_state)
     if cbm is None and has_cbm_keys:
         _log(logger, ("warn_info", "warning", "info"), "[!] Checkpoint contains CBM parameters but cbm_pfi_enable is false; loading baseline weights and ignoring CBM keys.")
-    load_result = model.load_state_dict(model_state, strict=(cbm is None and not has_cbm_keys))
-    if cbm is not None or has_cbm_keys:
-        _log_incompatible_keys(logger, load_result, "Eval checkpoint")
+    _load_model_checkpoint_state(model, checkpoint, config, logger, prefix="Eval checkpoint")
     if cbm is not None:
         _load_cbm_memory_from_checkpoint(cbm, checkpoint, config, device, logger)
     model = model.to(device)

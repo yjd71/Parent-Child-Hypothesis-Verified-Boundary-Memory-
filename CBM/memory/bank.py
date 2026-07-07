@@ -79,6 +79,7 @@ class DenseBoundaryMemory:
         self.mem_dim = int(mem_dim)
         self.value_dim = int(value_dim)
         self.regions = tuple(regions)
+        self.compat_meta: Dict[str, Any] = {}
         requested_sample = sample_per_image or dict(DEFAULT_SAMPLE_PER_IMAGE)
         requested_sizes = max_sizes or dict(DEFAULT_MAX_SIZES)
         self.selection_config = selection_config or _default_selection_config(requested_sample, requested_sizes)
@@ -227,9 +228,13 @@ class DenseBoundaryMemory:
     def is_ready(self) -> bool:
         return self._finalized and sum(self.keys[region].size(0) for region in self.regions) > 0
 
+    def set_compat_meta(self, compat_meta: Optional[Dict[str, Any]]) -> None:
+        self.compat_meta = dict(compat_meta or {})
+
     def to_state_dict(self) -> Dict[str, Any]:
         return {
             "format_version": 2,
+            "compat_meta": dict(self.compat_meta),
             "mem_dim": self.mem_dim,
             "value_dim": self.value_dim,
             "regions": list(self.regions),
@@ -253,6 +258,7 @@ class DenseBoundaryMemory:
         self.clear()
         if not state:
             return
+        self.compat_meta = dict(state.get("compat_meta", {}) or {})
         mem_dim = int(state.get("mem_dim", self.mem_dim))
         value_dim = int(state.get("value_dim", self.value_dim))
         if mem_dim != self.mem_dim:

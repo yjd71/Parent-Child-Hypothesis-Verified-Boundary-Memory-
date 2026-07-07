@@ -11,6 +11,7 @@ from models.modules.aspp import ASPP, ASPPDeformable
 from models.modules.ing import *
 from models.refinement.refiner import Refiner, RefinerPVTInChannels4, RefUNet
 from models.refinement.stem_layer import StemLayer
+from models.channel_spec import build_talnet_channel_spec
 
 class ModelEMA(nn.Module):
     def __init__(self, config, bb_pretrained=True, alpha=0.999):
@@ -29,6 +30,11 @@ class ModelEMA(nn.Module):
         if ema:
             return self.teacher.extract_cbm_memory_features(x)
         return self.student.extract_cbm_memory_features(x)
+
+    def forward_return_pc_hbm_features(self, x, ema=True):
+        if ema:
+            return self.teacher.forward_return_pc_hbm_features(x)
+        return self.student.forward_return_pc_hbm_features(x)
 
     def forward(self, x, ema=False, use_memory=None, cbm=None, return_aux=False, memory_t=None):
         active_cbm = self.cbm if cbm is None else cbm
@@ -85,6 +91,7 @@ class TalNet(nn.Module):
         self.epoch = 1
         self.ema = ema
         self.cbm = None
+        self.channel_spec = build_talnet_channel_spec(config)
         self.bb = build_backbone(self.config.backbone, config=config, pretrained=bb_pretrained)
         channels = self.config.lateral_channels_in_collection
         if self.config.squeeze_block:
@@ -156,6 +163,30 @@ class TalNet(nn.Module):
             del x1, x2, x4
             _, p3, _ = self.decoder.forward_to_p3(features)
             return {"x3": x3.detach(), "p3": p3.detach()}
+        finally:
+            if was_training:
+                self.train()
+
+    @torch.no_grad()
+    def forward_return_pc_hbm_features(self, x):
+        was_training = self.training
+        self.eval()
+        try:
+            x1, x2, x3, x4, features = self._build_decoder_features(x)
+            state, p3, m3 = self.decoder.forward_to_p3(features)
+            _, p2, m2 = self.decoder.forward_p2_from_p3(state, p3)
+            return {
+                "x1": x1.detach(),
+                "x2": x2.detach(),
+                "x3": x3.detach(),
+                "x4": x4.detach(),
+                "p3": p3.detach(),
+                "p2": p2.detach(),
+                "m3": None if m3 is None else m3.detach(),
+                "m2": None if m2 is None else m2.detach(),
+                "channel_spec": self.channel_spec,
+                "input_size": tuple(x.shape[-2:]),
+            }
         finally:
             if was_training:
                 self.train()
@@ -417,15 +448,16 @@ class Decoder(nn.Module):
         return state, p3, m3
 
     def forward_from_p3(self, state, p3_override):
+        state2, p2, _ = self.forward_p2_from_p3(state, p3_override)
+        scaled_preds, _, _ = self.forward_p1_from_p2(state2, p2)
+        return scaled_preds
+
+    def forward_p2_from_p3(self, state, p3_override):
         x = state["x"]
-        x1 = state["x1"]
         x2 = state["x2"]
         gdt_gt = state["gdt_gt"]
-        outs = list(state["outs"])
         outs_gdt_pred = list(state["outs_gdt_pred"])
         outs_gdt_label = list(state["outs_gdt_label"])
-        m4 = state["m4"]
-        m3 = state["m3"]
 
         p3 = p3_override
         _p3 = F.interpolate(p3, size=x2.shape[2:], mode='bilinear', align_corners=True)
@@ -449,26 +481,49 @@ class Decoder(nn.Module):
             gdt_attn_2 = self.gdt_convs_attn_2(p2_gdt).sigmoid()
             # >> Finally:
             p2 = p2 * gdt_attn_2
+        state2 = dict(state)
+        state2.update(
+            {
+                "p3": p3,
+                "p2": p2,
+                "m2": m2,
+                "outs_gdt_pred": outs_gdt_pred,
+                "outs_gdt_label": outs_gdt_label,
+            }
+        )
+        return state2, p2, m2
+
+    def forward_p1_from_p2(self, state2, p2_override):
+        x = state2["x"]
+        x1 = state2["x1"]
+        outs = list(state2["outs"])
+        outs_gdt_pred = list(state2["outs_gdt_pred"])
+        outs_gdt_label = list(state2["outs_gdt_label"])
+        m4 = state2["m4"]
+        m3 = state2["m3"]
+        m2 = state2["m2"]
+
+        p2 = p2_override
         _p2 = F.interpolate(p2, size=x1.shape[2:], mode='bilinear', align_corners=True)
         _p1 = _p2 + self.lateral_block2(x1)
         if self.config.dec_ipt:
             patches_batch = self.get_patches_batch(x, _p1) if self.split else x
             _p1 = torch.cat((_p1, self.ipt_blk2(F.interpolate(patches_batch, size=x1.shape[2:], mode='bilinear', align_corners=True))), 1)
 
-        _p1 = self.decoder_block1(_p1)
-        _p1 = F.interpolate(_p1, size=x.shape[2:], mode='bilinear', align_corners=True)
+        p1 = self.decoder_block1(_p1)
+        _p1 = F.interpolate(p1, size=x.shape[2:], mode='bilinear', align_corners=True)
         if self.config.dec_ipt:
             patches_batch = self.get_patches_batch(x, _p1) if self.split else x
             _p1 = torch.cat((_p1, self.ipt_blk1(F.interpolate(patches_batch, size=x.shape[2:], mode='bilinear', align_corners=True))), 1)
-        p1_out = self.conv_out1(_p1)
+        z_main = self.conv_out1(_p1)
 
         if self.config.ms_supervision:
             outs.append(m4)
             outs.append(m3)
             outs.append(m2)
-        outs.append(p1_out)
+        outs.append(z_main)
         scaled_preds = outs if not (self.config.out_ref and self.training) else ([outs_gdt_pred, outs_gdt_label], outs)
-        return scaled_preds
+        return scaled_preds, p1, z_main
 
     def forward(self, features):
         state, p3, _ = self.forward_to_p3(features)
