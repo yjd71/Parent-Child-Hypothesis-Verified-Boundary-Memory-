@@ -7,7 +7,7 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 
-from .utils import EPS, entropy_from_probs, gather_tokens, masked_softmax, normalize
+from ..common.utils import EPS, entropy_from_probs, gather_tokens, masked_softmax, normalize
 
 
 class ParentRetriever(nn.Module):

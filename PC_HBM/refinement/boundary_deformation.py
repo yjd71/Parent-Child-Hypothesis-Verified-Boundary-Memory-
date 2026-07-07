@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .utils import make_normalized_grid
+from ..common.utils import make_normalized_grid
 
 
 def deform_logits(z_main: torch.Tensor, offset_pix: torch.Tensor, mask_corr: torch.Tensor) -> torch.Tensor:

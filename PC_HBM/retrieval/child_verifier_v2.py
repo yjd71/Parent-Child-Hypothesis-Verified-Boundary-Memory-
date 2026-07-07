@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from .geo_score_mlp import GeoScoreMLP
 from .structured_prior_bias_net import StructuredPriorBiasNet
-from .utils import EPS, js_divergence, normalize_prob
+from ..common.utils import EPS, js_divergence, normalize_prob
 
 
 class ChildScoreMLP(nn.Module):

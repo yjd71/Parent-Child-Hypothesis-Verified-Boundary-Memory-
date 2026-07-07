@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .boundary_query_head import BoundaryQueryHead1
-from .utils import (
+from ..common.utils import (
     boundary_features_from_logits,
     finite_or_zero,
     gather_tokens,

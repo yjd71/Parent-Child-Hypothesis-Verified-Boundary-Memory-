@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .child_local_encoder import ChildLocalEncoder
-from .utils import gather_tokens, scale_flat_indices
+from ..common.utils import gather_tokens, scale_flat_indices
 
 
 class ChildQueryBuilder(nn.Module):

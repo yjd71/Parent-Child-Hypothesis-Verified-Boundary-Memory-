@@ -12,7 +12,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn.functional as F
 
-from .utils import EPS, gradient_strength
+from ..common.utils import EPS, gradient_strength
 
 
 def build_pc_regions(gt: torch.Tensor, target_size: Tuple[int, int]) -> Dict[str, torch.Tensor]:

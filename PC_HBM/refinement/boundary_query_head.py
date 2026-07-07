@@ -11,7 +11,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 
-from .utils import finite_or_zero, token_indices_from_score
+from ..common.utils import finite_or_zero, token_indices_from_score
 
 
 class BoundaryQueryHead(nn.Module):

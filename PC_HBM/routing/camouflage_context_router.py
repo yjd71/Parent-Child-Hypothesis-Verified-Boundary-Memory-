@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .route_attention_pool import RouteAttentionPool
-from .utils import EPS, finite_or_zero, gradient_strength, normalize
+from ..common.utils import EPS, finite_or_zero, gradient_strength, normalize
 
 
 class CamouflageContextRouter(nn.Module):

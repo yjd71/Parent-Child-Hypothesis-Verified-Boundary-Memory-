@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .boundary_deformation import deform_logits
-from .utils import gradient_strength
+from ..common.utils import gradient_strength
 
 
 class AdaptiveMixtureHead(nn.Module):

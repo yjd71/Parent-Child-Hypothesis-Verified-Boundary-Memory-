@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from .boundary_query_head import BoundaryQueryHead2
-from .utils import (
+from ..common.utils import (
     add_tokens_to_map,
     finite_or_zero,
     gather_tokens,
@@ -53,7 +53,7 @@ class P2BoundaryRetargetAttention(nn.Module):
         nn.init.zeros_(self.restore.bias)
 
     def build_boundary_input(self, prob2: torch.Tensor, pc_maps: Dict[str, torch.Tensor]) -> torch.Tensor:
-        from .utils import boundary_features_from_logits
+        from ..common.utils import boundary_features_from_logits
 
         base = boundary_features_from_logits(torch.logit(prob2.clamp(1e-6, 1.0 - 1e-6)))
         target = prob2.shape[-2:]

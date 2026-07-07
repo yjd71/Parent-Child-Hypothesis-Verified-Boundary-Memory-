@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .utils import add_tokens_to_map
+from ..common.utils import add_tokens_to_map
 
 
 class P3GatedResidual(nn.Module):

@@ -6,7 +6,7 @@ from typing import Dict, Tuple
 
 import torch
 
-from .utils import scatter_tokens
+from ..common.utils import scatter_tokens
 
 
 def pc_scatter(

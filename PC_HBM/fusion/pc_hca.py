@@ -7,7 +7,7 @@ import math
 import torch
 import torch.nn as nn
 
-from .utils import finite_or_zero, masked_softmax, normalize
+from ..common.utils import finite_or_zero, masked_softmax, normalize
 
 
 class PCHCA(nn.Module):

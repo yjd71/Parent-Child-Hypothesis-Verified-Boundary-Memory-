@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Sequence
 import torch
 import torch.nn.functional as F
 
-from .utils import EPS, REGION_TO_ID, normalize
+from ..common.utils import EPS, REGION_TO_ID, normalize
 
 
 class PCHBMMemory:

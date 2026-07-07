@@ -16,26 +16,26 @@ import torch.nn.functional as F
 
 from models.channel_spec import build_talnet_channel_spec
 
-from .adaptive_mixture_head import AdaptiveMixtureHead
-from .boundary_query_head import BoundaryQueryHead3
-from .camouflage_context_router import CamouflageContextRouter
-from .child_query_builder import ChildQueryBuilder
-from .child_verifier_v2 import ChildVerifierV2
-from .diagnostics import collect_pc_hbm_diagnostics
-from .hypothesis_token_builder import HypothesisTokenBuilder
-from .p1_pixel_refinement_attention import P1PixelRefinementAttention
-from .p2_boundary_retarget_attention import P2BoundaryRetargetAttention
-from .p3_gated_residual import P3GatedResidual
+from ..debug.diagnostics import collect_pc_hbm_diagnostics
+from ..fusion.hypothesis_token_builder import HypothesisTokenBuilder
+from ..fusion.p3_gated_residual import P3GatedResidual
+from ..fusion.pc_hca import PCHCA
+from ..fusion.pc_scatter import pc_scatter
+from ..fusion.pc_token_decoder import PCTokenDecoder
+from ..fusion.query_state_builder import QueryStateBuilder
+from ..fusion.structured_gate_mlp import StructuredGateMLP
+from ..memory.pc_memory import PCHBMMemory, parent_values_from_region
+from ..memory.pc_region_builder import build_pc_regions
+from ..memory.sampling_policy import sample_region_indices
+from ..refinement.adaptive_mixture_head import AdaptiveMixtureHead
+from ..refinement.boundary_query_head import BoundaryQueryHead3
+from ..refinement.p1_pixel_refinement_attention import P1PixelRefinementAttention
+from ..refinement.p2_boundary_retarget_attention import P2BoundaryRetargetAttention
+from ..retrieval.child_query_builder import ChildQueryBuilder
+from ..retrieval.child_verifier_v2 import ChildVerifierV2
+from ..routing.camouflage_context_router import CamouflageContextRouter
 from .pc_config import apply_pc_hbm_defaults, pc_hbm_enabled, pc_hbm_should_rebuild_memory
-from .pc_memory import PCHBMMemory, parent_values_from_region
-from .pc_region_builder import build_pc_regions
-from .pc_scatter import pc_scatter
-from .pc_hca import PCHCA
-from .pc_token_decoder import PCTokenDecoder
-from .query_state_builder import QueryStateBuilder
-from .sampling_policy import sample_region_indices
-from .structured_gate_mlp import StructuredGateMLP
-from .utils import boundary_features_from_logits, finite_or_zero, gather_tokens
+from ..common.utils import boundary_features_from_logits, finite_or_zero, gather_tokens
 
 
 def _normalize_device(device: Optional[torch.device]) -> torch.device:
@@ -307,7 +307,7 @@ class PCHBMEngine(nn.Module):
         return outputs, aux
 
     def compute_losses(self, outputs, aux, gt):
-        from .pc_losses import compute_pc_hbm_labeled_loss
+        from ..training.pc_losses import compute_pc_hbm_labeled_loss
 
         loss, log = compute_pc_hbm_labeled_loss(outputs, aux, gt, self.config)
         self.loss_dict = {key: float(value.detach().item()) for key, value in log.items()}
@@ -535,7 +535,7 @@ class PCHBMEngine(nn.Module):
             fn(message)
 
 
-from .parent_retriever import ParentRetriever as ParentRetrieverProxy
+from ..retrieval.parent_retriever import ParentRetriever as ParentRetrieverProxy
 
 
 def build_pc_hbm(config, device=None, logger=None) -> PCHBMEngine:
