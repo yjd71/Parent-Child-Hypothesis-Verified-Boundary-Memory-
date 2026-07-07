@@ -58,8 +58,37 @@ save_last = 7
 
 
 # CBM-PFI
-cbm_pfi_enable = True
-use_pc_hbm = False
+cbm_pfi_enable = False
+use_pc_hbm = True
+
+# PC-HBM core
+pc_hbm_enable = True
+memory_source = "labeled_only"
+memory_rebuild_interval = 1
+use_unlabeled_memory_update = False
+parent_topk = 64
+p2_boundary_top_ratio = 0.25
+p1_boundary_top_ratio = 0.20
+
+# PC-HBM stage schedule
+warmup_epoch = 2
+parent_start_epoch = 3
+child_start_epoch = 6
+attention_refine_start_epoch = 6
+unlabeled_start_epoch = 6
+
+# PC-HBM loss weights
+lambda_final = 1.0
+lambda_main = 1.0
+lambda_nomix = 0.5
+lambda_mem = 0.2
+lambda_boundary_aux = 0.2
+lambda_mix_oracle = 0.2
+lambda_branch = 0.2
+lambda_quality = 0.05
+lambda_usage = 0.02
+lambda_reg = 0.05
+lambda_u = 1.0
 
 # CBM stage schedule: epoch 从 0 开始时，stage_epoch = epoch + 1
 cbm_stage_epoch_offset = 1

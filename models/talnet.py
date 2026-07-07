@@ -20,10 +20,15 @@ class ModelEMA(nn.Module):
         self.student = TalNet(config=config, bb_pretrained=bb_pretrained)
         self.teacher = TalNet(config=config, bb_pretrained=bb_pretrained, ema=True)
         self.cbm = None
+        self.pc_hbm = None
         self._init_teacher_params()
 
     def set_cbm(self, cbm):
         self.cbm = cbm
+        return self
+
+    def set_pc_hbm(self, pc_hbm):
+        self.pc_hbm = pc_hbm
         return self
 
     def extract_cbm_memory_features(self, x, ema=True):
@@ -35,6 +40,17 @@ class ModelEMA(nn.Module):
         if ema:
             return self.teacher.forward_return_pc_hbm_features(x)
         return self.student.forward_return_pc_hbm_features(x)
+
+    def forward_pc_hbm(self, x, memory=None, use_memory=True, return_all_logits=True, epoch=None, ema=False):
+        target = self.teacher if ema else self.student
+        return target.forward_pc_hbm(
+            x,
+            memory=memory,
+            use_memory=use_memory,
+            return_all_logits=return_all_logits,
+            epoch=epoch,
+            engine=self.pc_hbm,
+        )
 
     def forward(self, x, ema=False, use_memory=None, cbm=None, return_aux=False, memory_t=None):
         active_cbm = self.cbm if cbm is None else cbm
@@ -91,6 +107,7 @@ class TalNet(nn.Module):
         self.epoch = 1
         self.ema = ema
         self.cbm = None
+        self.pc_hbm = None
         self.channel_spec = build_talnet_channel_spec(config)
         self.bb = build_backbone(self.config.backbone, config=config, pretrained=bb_pretrained)
         channels = self.config.lateral_channels_in_collection
@@ -112,6 +129,10 @@ class TalNet(nn.Module):
 
     def set_cbm(self, cbm):
         self.cbm = cbm
+        return self
+
+    def set_pc_hbm(self, pc_hbm):
+        self.pc_hbm = pc_hbm
         return self
 
     def forward_enc(self, x):
@@ -236,6 +257,34 @@ class TalNet(nn.Module):
             cbm=active_cbm,
             memory_t=memory_t,
             return_aux=return_aux,
+        )
+
+    def forward_pc_hbm(self, img, memory=None, use_memory=True, return_all_logits=True, epoch=None, engine=None):
+        active_engine = self.pc_hbm if engine is None else engine
+        if active_engine is None:
+            *_, features = self._build_decoder_features(img)
+            scaled_preds = self.decoder(features)
+            if isinstance(scaled_preds, tuple) and len(scaled_preds) == 2:
+                outs = scaled_preds[1]
+            else:
+                outs = scaled_preds
+            z_main = outs[-1]
+            aux = {
+                "fallback_reason": "pc_hbm_none",
+                "z_main": z_main,
+                "z_nomix": z_main,
+                "z_final": z_main,
+                "p_final": torch.sigmoid(z_main),
+                "pc_hbm_used": False,
+            }
+            return outs, aux
+        return active_engine.forward_talnet(
+            self,
+            img,
+            memory=memory,
+            use_memory=use_memory,
+            return_all_logits=return_all_logits,
+            epoch=epoch,
         )
 
     def _should_use_cbm(self, use_memory, cbm):

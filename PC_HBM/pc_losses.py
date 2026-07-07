@@ -1,0 +1,318 @@
+"""PC-HBM labelled and semi-supervised losses.
+
+All disabled or unavailable terms return tensor zeros on the active device, so
+training code can log a stable dictionary across stages.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Iterable
+
+import torch
+import torch.nn.functional as F
+
+from .branch_oracle import oracle_distribution
+
+
+def zero_like_loss(ref: torch.Tensor) -> torch.Tensor:
+    return ref.sum() * 0.0
+
+
+def dice_loss_with_logits(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    prob = torch.sigmoid(logits)
+    if target.shape[-2:] != logits.shape[-2:]:
+        target = F.interpolate(target.float(), size=logits.shape[-2:], mode="nearest")
+    inter = (prob * target).sum(dim=(-2, -1))
+    denom = prob.sum(dim=(-2, -1)) + target.sum(dim=(-2, -1))
+    return (1.0 - (2.0 * inter + eps) / (denom + eps)).mean()
+
+
+def iou_loss_with_logits(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    prob = torch.sigmoid(logits)
+    if target.shape[-2:] != logits.shape[-2:]:
+        target = F.interpolate(target.float(), size=logits.shape[-2:], mode="nearest")
+    inter = (prob * target).sum(dim=(-2, -1))
+    union = (prob + target - prob * target).sum(dim=(-2, -1))
+    return (1.0 - (inter + eps) / (union + eps)).mean()
+
+
+def seg_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    if target.shape[-2:] != logits.shape[-2:]:
+        target = F.interpolate(target.float(), size=logits.shape[-2:], mode="nearest")
+    bce = F.binary_cross_entropy_with_logits(logits, target.float())
+    return bce + dice_loss_with_logits(logits, target) + iou_loss_with_logits(logits, target)
+
+
+def compute_pc_hbm_labeled_loss(outputs, aux: Dict[str, Any] | None, gt: torch.Tensor, config: Any) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Compute full labelled PC-HBM loss and logging tensors."""
+
+    if aux is None:
+        ref = outputs[-1] if isinstance(outputs, (list, tuple)) else gt
+        z = zero_like_loss(ref)
+        return z, _zero_log(z)
+    m4, m3, m2, z_main = outputs
+    ref = z_main
+    L_ms = (
+        0.4 * seg_loss(m4, gt)
+        + 0.6 * seg_loss(m3, gt)
+        + 0.8 * seg_loss(m2, gt)
+        + float(getattr(config, "lambda_main", 1.0)) * seg_loss(z_main, gt)
+    )
+    z_final = aux.get("z_final", z_main)
+    z_nomix = aux.get("z_nomix", z_main)
+    L_final = float(getattr(config, "lambda_final", 1.0)) * seg_loss(z_final, gt)
+    L_nomix = float(getattr(config, "lambda_nomix", 0.5)) * seg_loss(z_nomix, gt)
+    L_seg_total = L_ms + L_final + L_nomix
+    pc = aux.get("pc_hbm", {}) or {}
+    mix = aux.get("mixture", {}) or {}
+    p2 = aux.get("p2_bra", {}) or {}
+    p1 = aux.get("p1_pra", {}) or {}
+    L_parent_ce = _parent_ce(pc, gt)
+    L_child_verify = _child_verify(pc)
+    L_geometry = _geometry_loss(pc)
+    L_gate = _gate_loss(pc)
+    L_mem = L_parent_ce + L_child_verify + L_geometry + L_gate
+    L_boundary_aux = _boundary_aux(pc, p2, p1, gt, ref)
+    L_mix_oracle, oracle = _mix_oracle(mix, gt, config, ref)
+    L_branch = _branch_loss(mix, gt, ref)
+    L_quality = _quality_loss(mix, oracle, ref)
+    L_usage = _usage_loss(mix, gt, ref)
+    L_reg = _regularization(mix, ref)
+    total = (
+        L_seg_total
+        + float(getattr(config, "lambda_mem", 0.2)) * L_mem
+        + float(getattr(config, "lambda_boundary_aux", 0.2)) * L_boundary_aux
+        + float(getattr(config, "lambda_mix_oracle", 0.2)) * L_mix_oracle
+        + float(getattr(config, "lambda_branch", 0.2)) * L_branch
+        + float(getattr(config, "lambda_quality", 0.05)) * L_quality
+        + float(getattr(config, "lambda_usage", 0.02)) * L_usage
+        + float(getattr(config, "lambda_reg", 0.05)) * L_reg
+    )
+    log = {
+        "L_seg_total": L_seg_total.detach(),
+        "L_parent_ce": L_parent_ce.detach(),
+        "L_child_verify": L_child_verify.detach(),
+        "L_geometry": L_geometry.detach(),
+        "L_gate": L_gate.detach(),
+        "L_boundary_aux": L_boundary_aux.detach(),
+        "L_mix_oracle": L_mix_oracle.detach(),
+        "L_branch": L_branch.detach(),
+        "L_quality": L_quality.detach(),
+        "L_usage": L_usage.detach(),
+        "L_reg": L_reg.detach(),
+        "pi_keep_mean": _mean_or_zero(mix.get("pi", ref.new_zeros(ref.size(0), 4, *ref.shape[-2:]))[:, 0:1], ref).detach(),
+        "pi_res_mean": _mean_or_zero(mix.get("pi", ref.new_zeros(ref.size(0), 4, *ref.shape[-2:]))[:, 1:2], ref).detach(),
+        "pi_def_mean": _mean_or_zero(mix.get("pi", ref.new_zeros(ref.size(0), 4, *ref.shape[-2:]))[:, 2:3], ref).detach(),
+        "pi_sup_mean": _mean_or_zero(mix.get("pi", ref.new_zeros(ref.size(0), 4, *ref.shape[-2:]))[:, 3:4], ref).detach(),
+        "gate_pc_mean": _mean_or_zero(pc.get("gate_pc_map"), ref).detach(),
+        "C23_mean": _mean_or_zero(pc.get("C23_map"), ref).detach(),
+        "route_entropy": _mean_or_zero(pc.get("route_entropy"), ref).detach(),
+        "parent_entropy": _mean_or_zero(pc.get("parent_entropy"), ref).detach(),
+    }
+    return total, log
+
+
+def compute_pc_hbm_unlabeled_loss(student_aux: Dict[str, Any], pseudo_prob: torch.Tensor, confidence: torch.Tensor, config: Any) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Stage-4 unlabeled loss: supervise student z_nomix/z_main, not z_final."""
+
+    z_student = student_aux.get("z_nomix", student_aux.get("z_main"))
+    if z_student is None:
+        z_student = pseudo_prob
+    if pseudo_prob.shape[-2:] != z_student.shape[-2:]:
+        pseudo_prob = F.interpolate(pseudo_prob, size=z_student.shape[-2:], mode="nearest")
+    if confidence.shape[-2:] != z_student.shape[-2:]:
+        confidence = F.interpolate(confidence, size=z_student.shape[-2:], mode="bilinear", align_corners=False)
+    bce = F.binary_cross_entropy_with_logits(z_student, pseudo_prob.detach(), reduction="none")
+    loss = (bce * confidence.detach()).sum() / confidence.sum().clamp_min(1.0)
+    final_weight = float(getattr(config, "pc_hbm_unsup_final_consistency_weight", 0.1))
+    z_final = student_aux.get("z_final")
+    if z_final is not None and final_weight > 0:
+        final_bce = F.binary_cross_entropy_with_logits(z_final, pseudo_prob.detach(), reduction="none")
+        high = (confidence > 0.8).float()
+        loss = loss + final_weight * (final_bce * high).sum() / high.sum().clamp_min(1.0)
+    return float(getattr(config, "lambda_u", 1.0)) * loss, {"L_u": loss.detach(), "pseudo_conf_mean": confidence.mean().detach()}
+
+
+def structure_aware_confidence(teacher_aux: Dict[str, Any]) -> torch.Tensor:
+    """Confidence from probability certainty, PC agreement, mixture and route entropy."""
+
+    p = teacher_aux.get("p_final", teacher_aux.get("p_main"))
+    if p is None:
+        p = torch.sigmoid(teacher_aux["z_final"])
+    certainty = (2.0 * (p - 0.5).abs()).clamp(0.0, 1.0)
+    mix = teacher_aux.get("mixture", {}) or {}
+    pc = teacher_aux.get("pc_hbm", {}) or {}
+    pi = mix.get("pi")
+    if pi is not None:
+        mix_ent = -(pi * pi.clamp_min(1e-6).log()).sum(dim=1, keepdim=True) / torch.log(torch.tensor(4.0, device=pi.device, dtype=pi.dtype))
+    else:
+        mix_ent = torch.zeros_like(certainty)
+    c23 = pc.get("C23_map")
+    if c23 is None:
+        c23_up = torch.zeros_like(certainty)
+    else:
+        c23_up = F.interpolate(c23, size=certainty.shape[-2:], mode="bilinear", align_corners=False).clamp(0.0, 1.0)
+    route_ent = pc.get("route_entropy")
+    if isinstance(route_ent, torch.Tensor) and route_ent.numel() > 0:
+        route_penalty = route_ent.view(route_ent.size(0), 1, 1, 1).to(device=certainty.device, dtype=certainty.dtype)
+    else:
+        route_penalty = torch.zeros_like(certainty[:, :, :1, :1])
+    return (certainty * (1.0 - 0.5 * mix_ent) * (1.0 - 0.5 * c23_up) * (1.0 - 0.25 * route_penalty)).clamp(0.0, 1.0)
+
+
+def _parent_ce(pc: Dict[str, Any], gt: torch.Tensor) -> torch.Tensor:
+    scores = pc.get("top_parent_scores")
+    values = pc.get("top_parent_values")
+    if scores is None or values is None or scores.numel() == 0:
+        return zero_like_loss(gt)
+    target = values[..., :4].argmax(dim=-1)
+    return F.cross_entropy(scores, target[:, 0].clamp(0, 3))
+
+
+def _child_verify(pc: Dict[str, Any]) -> torch.Tensor:
+    s_child = pc.get("S_child")
+    values = pc.get("top_parent_values")
+    if s_child is None or values is None or s_child.numel() == 0:
+        ref = next((v for v in pc.values() if isinstance(v, torch.Tensor)), torch.tensor(0.0))
+        return zero_like_loss(ref)
+    support = values[..., 1] + values[..., 5]
+    weight = torch.where(support > 0.5, torch.ones_like(support), torch.full_like(support, 2.0))
+    return F.binary_cross_entropy_with_logits(s_child, support.clamp(0.0, 1.0), weight=weight)
+
+
+def _geometry_loss(pc: Dict[str, Any]) -> torch.Tensor:
+    g_parent = pc.get("G_attn")
+    g_child = pc.get("G_child_attn")
+    if g_parent is None or g_child is None or g_parent.numel() == 0:
+        ref = next((v for v in pc.values() if isinstance(v, torch.Tensor)), torch.tensor(0.0))
+        return zero_like_loss(ref)
+    return (g_parent - g_child).abs().mean()
+
+
+def _gate_loss(pc: Dict[str, Any]) -> torch.Tensor:
+    gate = pc.get("gate_pc_map")
+    c23 = pc.get("C23_map")
+    if gate is None or c23 is None:
+        ref = next((v for v in pc.values() if isinstance(v, torch.Tensor)), torch.tensor(0.0))
+        return zero_like_loss(ref)
+    target = (1.0 - c23).clamp(0.0, 1.0)
+    return F.binary_cross_entropy(gate.clamp(1e-6, 1.0 - 1e-6), target.detach())
+
+
+def _boundary_aux(pc, p2, p1, gt, ref):
+    losses = []
+    for key, aux in (("B3", pc), ("B2", p2), ("B1", p1), ("B2_refined_map", p2)):
+        pred = aux.get(key)
+        if pred is None:
+            continue
+        target = _gt_boundary(gt, pred.shape[-2:])
+        losses.append(F.binary_cross_entropy(pred.clamp(1e-6, 1.0 - 1e-6), target))
+    return sum(losses) if losses else zero_like_loss(ref)
+
+
+def _gt_boundary(gt, size):
+    target = F.interpolate(gt.float(), size=size, mode="nearest")
+    dil = F.max_pool2d(target, 3, stride=1, padding=1)
+    ero = -F.max_pool2d(-target, 3, stride=1, padding=1)
+    return (dil - ero).clamp(0.0, 1.0)
+
+
+def _mix_oracle(mix, gt, config, ref):
+    if not mix or "pi" not in mix:
+        return zero_like_loss(ref), {}
+    oracle = oracle_distribution(mix, gt, tau=float(getattr(config, "pc_hbm_tau_oracle", 0.5)))
+    target_mix = oracle["target_mix"].detach()
+    mask = oracle["oracle_mask"].detach()
+    pi = mix["pi"].clamp_min(1e-6)
+    kl = (target_mix * (target_mix.clamp_min(1e-6).log() - pi.log())).sum(dim=1, keepdim=True)
+    loss = (kl * mask).sum() / mask.sum().clamp_min(1.0)
+    return loss, oracle
+
+
+def _branch_loss(mix, gt, ref):
+    if not mix or "z_keep" not in mix:
+        return zero_like_loss(ref)
+    return 0.25 * sum(seg_loss(mix[name], gt) for name in ("z_keep", "z_res", "z_def", "z_sup"))
+
+
+def _quality_loss(mix, oracle, ref):
+    quality = mix.get("branch_quality")
+    if quality is None or not oracle:
+        return zero_like_loss(ref)
+    err = oracle["pixel_error"].detach()
+    target_gain = err[:, 0:1] - err
+    weight = mix.get("B_pix", torch.ones_like(target_gain[:, :1])).detach()
+    return (F.smooth_l1_loss(quality, target_gain, reduction="none") * weight).sum() / weight.sum().clamp_min(1.0)
+
+
+def _usage_loss(mix, gt, ref):
+    pi = mix.get("pi")
+    if pi is None:
+        return zero_like_loss(ref)
+    target = F.interpolate(gt.float(), size=pi.shape[-2:], mode="nearest")
+    p_keep = torch.sigmoid(mix.get("z_keep", ref))
+    if p_keep.shape[-2:] != pi.shape[-2:]:
+        p_keep = F.interpolate(p_keep, size=pi.shape[-2:], mode="bilinear", align_corners=False)
+    fn = ((target > 0.5) & (p_keep < 0.4)).float()
+    fp = ((target < 0.5) & (p_keep > 0.6)).float()
+    grad = _gt_boundary(target, pi.shape[-2:])
+    mis = grad * (1.0 - fn) * (1.0 - fp)
+    stable = (1.0 - torch.maximum(torch.maximum(fn, fp), mis)).clamp(0.0, 1.0)
+    targets = [
+        (stable, pi.new_tensor([0.90, 0.03, 0.04, 0.03])),
+        (fn, pi.new_tensor([0.20, 0.60, 0.15, 0.05])),
+        (fp, pi.new_tensor([0.20, 0.05, 0.15, 0.60])),
+        (mis, pi.new_tensor([0.25, 0.15, 0.50, 0.10])),
+    ]
+    loss = zero_like_loss(pi)
+    for mask, vec in targets:
+        tgt = vec.view(1, 4, 1, 1).expand_as(pi)
+        ce = -(tgt * pi.clamp_min(1e-6).log()).sum(dim=1, keepdim=True)
+        loss = loss + (ce * mask).sum() / mask.sum().clamp_min(1.0)
+    return loss
+
+
+def _regularization(mix, ref):
+    if not mix:
+        return zero_like_loss(ref)
+    reg = zero_like_loss(ref)
+    if "O_pix" in mix:
+        off = mix["O_pix"]
+        reg = reg + off.abs().mean()
+        reg = reg + (off[..., 1:, :] - off[..., :-1, :]).abs().mean() + (off[..., :, 1:] - off[..., :, :-1]).abs().mean()
+    if "Mask_corr" in mix:
+        reg = reg + mix["Mask_corr"].mean() * 0.1
+    if "z_final" in mix and "z_keep" in mix:
+        reg = reg + (mix["z_final"] - mix["z_keep"]).abs().mean() * 0.01
+    return reg
+
+
+def _mean_or_zero(value, ref):
+    if isinstance(value, torch.Tensor) and value.numel() > 0:
+        return value.mean()
+    return zero_like_loss(ref)
+
+
+def _zero_log(z):
+    names = [
+        "L_seg_total",
+        "L_parent_ce",
+        "L_child_verify",
+        "L_geometry",
+        "L_gate",
+        "L_boundary_aux",
+        "L_mix_oracle",
+        "L_branch",
+        "L_quality",
+        "L_usage",
+        "L_reg",
+        "pi_keep_mean",
+        "pi_res_mean",
+        "pi_def_mean",
+        "pi_sup_mean",
+        "gate_pc_mean",
+        "C23_mean",
+        "route_entropy",
+        "parent_entropy",
+    ]
+    return {name: z.detach() for name in names}

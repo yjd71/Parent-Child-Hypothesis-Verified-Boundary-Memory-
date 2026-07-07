@@ -3,6 +3,9 @@ works
 dataset
 log.txt
 tests
+!tests/
+tests/*
+!tests/test_pc_hbm_shapes.py
 ./cache
 .git
 .agents

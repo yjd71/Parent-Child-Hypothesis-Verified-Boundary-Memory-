@@ -11,6 +11,7 @@ from config import Config
 from utils import Logger, save_tensor_img
 from utils.evaluation_paths import align_evaluation_paths, list_image_paths
 from models import build_model_eval
+from PC_HBM import pc_hbm_enabled
 
 from .metrics import calculate
 
@@ -46,7 +47,16 @@ class Evaluator:
             label_paths = batch[-2]
 
             with torch.no_grad():
-                if memory_t is None:
+                if pc_hbm_enabled(self.config) and hasattr(self.model, "forward_pc_hbm"):
+                    _, aux = self.model.forward_pc_hbm(
+                        inputs,
+                        ema=ema,
+                        use_memory=True,
+                        return_all_logits=True,
+                        epoch=epoch,
+                    )
+                    scaled_preds = aux.get("p_final", torch.sigmoid(aux["z_final"]))
+                elif memory_t is None:
                     scaled_preds = self.model(inputs, ema=ema)[-1].sigmoid()
                 else:
                     predictions, aux = self.model(
