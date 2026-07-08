@@ -137,15 +137,25 @@ def compute_pc_hbm_unlabeled_loss(student_aux: Dict[str, Any], pseudo_prob: torc
 def structure_aware_confidence(teacher_aux: Dict[str, Any]) -> torch.Tensor:
     """Confidence from probability certainty, PC agreement, mixture and route entropy."""
 
-    p = teacher_aux.get("p_final", teacher_aux.get("p_main"))
-    if p is None:
-        p = torch.sigmoid(teacher_aux["z_final"])
-    certainty = (2.0 * (p - 0.5).abs()).clamp(0.0, 1.0)
+    p_mix = teacher_aux.get("p_final")
+    if p_mix is None:
+        p_mix = torch.sigmoid(teacher_aux.get("z_final", teacher_aux["z_main"]))
+    z_main = teacher_aux.get("z_main")
+    if z_main is not None:
+        p_main = torch.sigmoid(z_main)
+    else:
+        p_main = teacher_aux.get("p_main", p_mix)
+    if p_main.shape[-2:] != p_mix.shape[-2:]:
+        p_main = F.interpolate(p_main, size=p_mix.shape[-2:], mode="bilinear", align_corners=False)
+    certainty = (2.0 * (p_mix - 0.5).abs()).clamp(0.0, 1.0)
+    agreement = (1.0 - (p_mix - p_main).abs()).clamp(0.0, 1.0)
     mix = teacher_aux.get("mixture", {}) or {}
     pc = teacher_aux.get("pc_hbm", {}) or {}
     pi = mix.get("pi")
     if pi is not None:
         mix_ent = -(pi * pi.clamp_min(1e-6).log()).sum(dim=1, keepdim=True) / torch.log(torch.tensor(4.0, device=pi.device, dtype=pi.dtype))
+        if mix_ent.shape[-2:] != certainty.shape[-2:]:
+            mix_ent = F.interpolate(mix_ent, size=certainty.shape[-2:], mode="bilinear", align_corners=False)
     else:
         mix_ent = torch.zeros_like(certainty)
     c23 = pc.get("C23_map")
@@ -158,7 +168,7 @@ def structure_aware_confidence(teacher_aux: Dict[str, Any]) -> torch.Tensor:
         route_penalty = route_ent.view(route_ent.size(0), 1, 1, 1).to(device=certainty.device, dtype=certainty.dtype)
     else:
         route_penalty = torch.zeros_like(certainty[:, :, :1, :1])
-    return (certainty * (1.0 - 0.5 * mix_ent) * (1.0 - 0.5 * c23_up) * (1.0 - 0.25 * route_penalty)).clamp(0.0, 1.0)
+    return (certainty * agreement * (1.0 - 0.5 * mix_ent) * (1.0 - 0.5 * c23_up) * (1.0 - 0.25 * route_penalty)).clamp(0.0, 1.0)
 
 
 def _parent_ce(pc: Dict[str, Any], gt: torch.Tensor) -> torch.Tensor:
@@ -253,6 +263,16 @@ def _boundary_aux(pc, p2, p1, gt, ref):
             continue
         target = _gt_boundary(gt, pred.shape[-2:])
         losses.append(F.binary_cross_entropy(pred.clamp(1e-6, 1.0 - 1e-6), target))
+    g2_ref = p2.get("G2_refined_map")
+    if torch.is_tensor(g2_ref):
+        need2 = build_need_correction_map(ref, gt, g2_ref.shape[-2:], threshold=0.25)
+        losses.append(F.binary_cross_entropy(g2_ref.clamp(1e-6, 1.0 - 1e-6), need2))
+    o2_ref = p2.get("O2_refined_map")
+    if torch.is_tensor(o2_ref):
+        geo2 = build_geometry_target(gt, o2_ref.shape[-2:])
+        valid2 = p2.get("valid2_map", torch.ones_like(o2_ref[:, :1])).to(device=o2_ref.device, dtype=o2_ref.dtype)
+        offset_loss = F.smooth_l1_loss(o2_ref, geo2["offset"].to(device=o2_ref.device, dtype=o2_ref.dtype), reduction="none")
+        losses.append(0.25 * (offset_loss * valid2).sum() / valid2.sum().clamp_min(1.0))
     return sum(losses) if losses else zero_like_loss(ref)
 
 
