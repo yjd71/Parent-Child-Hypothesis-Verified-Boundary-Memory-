@@ -322,6 +322,9 @@ class PCHBMEngine(nn.Module):
         from ..training.pc_losses import compute_pc_hbm_labeled_loss
 
         loss, log = compute_pc_hbm_labeled_loss(outputs, aux, gt, self.config)
+        diagnostics = collect_pc_hbm_diagnostics(aux, gt)
+        for key, value in diagnostics.items():
+            log.setdefault(key, value.detach())
         self.loss_dict = {key: float(value.detach().item()) for key, value in log.items()}
         return loss
 

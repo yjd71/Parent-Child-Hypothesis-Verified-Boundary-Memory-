@@ -7,6 +7,15 @@ from typing import Any, Dict
 import torch
 import torch.nn.functional as F
 
+from ..training.pc_supervision import (
+    REGION_BG_NEAR,
+    REGION_FG_BOUNDARY,
+    build_geometry_target,
+    build_need_correction_map,
+    build_region_label_map,
+    gather_by_boundary_indices,
+)
+
 
 DIAGNOSTIC_KEYS = (
     "parent_top1_region_acc",
@@ -68,18 +77,39 @@ def collect_pc_hbm_diagnostics(aux: Dict[str, Any], gt: torch.Tensor | None = No
         diag["branch_oracle_def_ratio"] = (pi.argmax(dim=1) == 2).float().mean()
         diag["branch_oracle_sup_ratio"] = (pi.argmax(dim=1) == 3).float().mean()
     s_child = pc.get("S_child")
-    values = pc.get("top_parent_values")
-    if torch.is_tensor(s_child) and torch.is_tensor(values) and s_child.numel() > 0:
-        support = values[..., 1].clamp(0.0, 1.0)
-        diag["child_verify_auc"] = _approx_auc(torch.sigmoid(s_child).reshape(-1), support.reshape(-1), ref)
-        diag["child_score_fg_boundary_mean"] = _masked_mean(torch.sigmoid(s_child), support, ref)
-        bg_near = values[..., 2].clamp(0.0, 1.0)
-        diag["child_score_bg_near_mean"] = _masked_mean(torch.sigmoid(s_child), bg_near, ref)
+    parent_region = pc.get("top_parent_region_ids")
+    region_label3 = None
+    if gt is not None and torch.is_tensor(parent_region) and parent_region.numel() > 0:
+        boundary = pc.get("boundary_indices3")
+        if isinstance(boundary, dict):
+            region_label_map = build_region_label_map(gt.to(device=parent_region.device), _pc_size(pc))
+            region_label3 = gather_by_boundary_indices(region_label_map, boundary).long().clamp(0, 3)
+            valid_parent = parent_region.ge(0)
+            diag["parent_top1_region_acc"] = ((parent_region[:, 0] == region_label3) & valid_parent[:, 0]).float().mean()
+            diag["parent_topk_region_acc"] = ((parent_region == region_label3[:, None]) & valid_parent).any(dim=1).float().mean()
+    if torch.is_tensor(s_child) and torch.is_tensor(parent_region) and s_child.numel() > 0:
+        score = torch.sigmoid(s_child)
+        if region_label3 is not None:
+            support = (parent_region == region_label3[:, None]).to(dtype=score.dtype)
+            valid = parent_region.ge(0)
+            diag["child_verify_auc"] = _approx_auc(score[valid].reshape(-1), support[valid].reshape(-1), ref) if valid.any() else ref.new_zeros(())
+        diag["child_score_fg_boundary_mean"] = _masked_mean(score, (parent_region == REGION_FG_BOUNDARY).float(), ref)
+        diag["child_score_bg_near_mean"] = _masked_mean(score, (parent_region == REGION_BG_NEAR).float(), ref)
     g_attn = pc.get("G_attn")
     g_child = pc.get("G_child_attn")
-    if torch.is_tensor(g_attn) and torch.is_tensor(g_child) and g_attn.numel() > 0:
-        diag["geo_sdf_l1"] = (g_attn[:, :1] - g_child[:, :1]).abs().mean()
-        diag["geo_offset_l1"] = (g_attn[:, 3:5] - g_child[:, 3:5]).abs().mean()
+    if torch.is_tensor(g_attn) and g_attn.numel() > 0:
+        boundary = pc.get("boundary_indices3")
+        if gt is not None and isinstance(boundary, dict):
+            geo = build_geometry_target(gt.to(device=g_attn.device), _pc_size(pc))
+            gt_sdf = gather_by_boundary_indices(geo["sdf"], boundary)
+            gt_offset = gather_by_boundary_indices(geo["offset"], boundary)
+            diag["geo_sdf_l1"] = (g_attn[:, :1] - gt_sdf).abs().mean()
+            o_pc = pc.get("O_pc_token")
+            if torch.is_tensor(o_pc) and o_pc.numel() > 0:
+                diag["geo_offset_l1"] = (o_pc - gt_offset).abs().mean()
+        elif torch.is_tensor(g_child) and g_child.numel() > 0:
+            diag["geo_sdf_l1"] = (g_attn[:, :1] - g_child[:, :1]).abs().mean()
+            diag["geo_offset_l1"] = (g_attn[:, 3:5] - g_child[:, 3:5]).abs().mean()
     if gt is not None:
         z_main = aux.get("z_main")
         z_final = aux.get("z_final")
@@ -88,12 +118,9 @@ def collect_pc_hbm_diagnostics(aux: Dict[str, Any], gt: torch.Tensor | None = No
         if torch.is_tensor(z_final):
             diag["z_final_loss"] = F.binary_cross_entropy_with_logits(z_final, _resize_gt(gt, z_final))
         if torch.is_tensor(gate) and torch.is_tensor(z_main):
-            pred = torch.sigmoid(z_main.detach())
-            target = _resize_gt(gt, z_main)
-            err = (pred - target).abs()
-            err_gate = F.interpolate(gate, size=err.shape[-2:], mode="bilinear", align_corners=False)
-            diag["gate_pc_on_error"] = _masked_mean(err_gate, (err > 0.3).float(), ref)
-            diag["gate_pc_on_correct"] = _masked_mean(err_gate, (err <= 0.3).float(), ref)
+            need = build_need_correction_map(z_main.detach(), gt.to(device=z_main.device), gate.shape[-2:], threshold=0.25)
+            diag["gate_pc_on_error"] = _masked_mean(gate, need, ref)
+            diag["gate_pc_on_correct"] = _masked_mean(gate, 1.0 - need, ref)
         if torch.is_tensor(pi) and torch.is_tensor(z_main):
             target = _resize_gt(gt, z_main)
             pred = torch.sigmoid(z_main.detach())
@@ -155,3 +182,11 @@ def _boundary(prob):
     dil = F.max_pool2d(prob.float(), 3, stride=1, padding=1)
     ero = -F.max_pool2d(-prob.float(), 3, stride=1, padding=1)
     return (dil - ero).clamp(0.0, 1.0)
+
+
+def _pc_size(pc):
+    for key in ("B3", "valid3_map", "G_attn_map", "M_pc_map"):
+        value = pc.get(key)
+        if torch.is_tensor(value) and value.dim() >= 2:
+            return tuple(int(v) for v in value.shape[-2:])
+    return (40, 40)
