@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from .branch_oracle import oracle_distribution
+from .pc_supervision import build_geometry_target, build_need_correction_map, build_region_label_map, gather_by_boundary_indices
 
 
 def zero_like_loss(ref: torch.Tensor) -> torch.Tensor:
@@ -68,9 +69,9 @@ def compute_pc_hbm_labeled_loss(outputs, aux: Dict[str, Any] | None, gt: torch.T
     p2 = aux.get("p2_bra", {}) or {}
     p1 = aux.get("p1_pra", {}) or {}
     L_parent_ce = _parent_ce(pc, gt)
-    L_child_verify = _child_verify(pc)
-    L_geometry = _geometry_loss(pc)
-    L_gate = _gate_loss(pc)
+    L_child_verify = _child_verify(pc, gt)
+    L_geometry = _geometry_loss(pc, gt)
+    L_gate = _gate_loss(pc, aux, gt)
     L_mem = L_parent_ce + L_child_verify + L_geometry + L_gate
     L_boundary_aux = _boundary_aux(pc, p2, p1, gt, ref)
     L_mix_oracle, oracle = _mix_oracle(mix, gt, config, ref)
@@ -161,42 +162,87 @@ def structure_aware_confidence(teacher_aux: Dict[str, Any]) -> torch.Tensor:
 
 
 def _parent_ce(pc: Dict[str, Any], gt: torch.Tensor) -> torch.Tensor:
-    scores = pc.get("top_parent_scores")
-    values = pc.get("top_parent_values")
-    if scores is None or values is None or scores.numel() == 0:
+    p3_group = pc.get("P3_group")
+    boundary = pc.get("boundary_indices3")
+    if p3_group is None or boundary is None or p3_group.numel() == 0:
         return zero_like_loss(gt)
-    target = values[..., :4].argmax(dim=-1)
-    return F.cross_entropy(scores, target[:, 0].clamp(0, 3))
+    region_label_map = build_region_label_map(gt, _pc_size3(pc))
+    region_label3 = gather_by_boundary_indices(region_label_map, boundary).long().clamp(0, 3)
+    probs = p3_group.clamp_min(1e-6)
+    probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    return F.nll_loss(probs.log(), region_label3)
 
 
-def _child_verify(pc: Dict[str, Any]) -> torch.Tensor:
+def _child_verify(pc: Dict[str, Any], gt: torch.Tensor) -> torch.Tensor:
     s_child = pc.get("S_child")
-    values = pc.get("top_parent_values")
-    if s_child is None or values is None or s_child.numel() == 0:
-        ref = next((v for v in pc.values() if isinstance(v, torch.Tensor)), torch.tensor(0.0))
+    parent_region = pc.get("top_parent_region_ids")
+    boundary = pc.get("boundary_indices3")
+    if s_child is None or parent_region is None or boundary is None or s_child.numel() == 0:
+        ref = next((v for v in pc.values() if isinstance(v, torch.Tensor)), gt)
         return zero_like_loss(ref)
-    support = values[..., 1] + values[..., 5]
-    weight = torch.where(support > 0.5, torch.ones_like(support), torch.full_like(support, 2.0))
-    return F.binary_cross_entropy_with_logits(s_child, support.clamp(0.0, 1.0), weight=weight)
+    region_label_map = build_region_label_map(gt, _pc_size3(pc))
+    region_label3 = gather_by_boundary_indices(region_label_map, boundary).long().clamp(0, 3)
+    support = (parent_region == region_label3[:, None]).to(dtype=s_child.dtype)
+    valid = parent_region.ge(0).to(dtype=s_child.dtype)
+    hard_neg = (
+        ((region_label3[:, None] == 1) & (parent_region == 2))
+        | ((region_label3[:, None] == 2) & (parent_region == 1))
+    ).to(dtype=s_child.dtype)
+    weight = valid * (1.0 + hard_neg)
+    loss = F.binary_cross_entropy_with_logits(s_child, support, weight=weight, reduction="sum")
+    return loss / weight.sum().clamp_min(1.0)
 
 
-def _geometry_loss(pc: Dict[str, Any]) -> torch.Tensor:
+def _geometry_loss(pc: Dict[str, Any], gt: torch.Tensor) -> torch.Tensor:
     g_parent = pc.get("G_attn")
     g_child = pc.get("G_child_attn")
-    if g_parent is None or g_child is None or g_parent.numel() == 0:
-        ref = next((v for v in pc.values() if isinstance(v, torch.Tensor)), torch.tensor(0.0))
+    o_pc = pc.get("O_pc_token")
+    boundary = pc.get("boundary_indices3")
+    if g_parent is None or boundary is None or g_parent.numel() == 0:
+        ref = next((v for v in pc.values() if isinstance(v, torch.Tensor)), gt)
         return zero_like_loss(ref)
-    return (g_parent - g_child).abs().mean()
+    geo = build_geometry_target(gt, _pc_size3(pc))
+    gt_sdf = gather_by_boundary_indices(geo["sdf"], boundary).view(-1)
+    gt_normal = gather_by_boundary_indices(geo["normal"], boundary)
+    gt_offset = gather_by_boundary_indices(geo["offset"], boundary)
+    l_sdf = F.l1_loss(g_parent[:, 0], gt_sdf)
+    l_normal = 1.0 - F.cosine_similarity(g_parent[:, 1:3], gt_normal, dim=-1).mean()
+    l_offset = F.l1_loss(o_pc, gt_offset) if torch.is_tensor(o_pc) and o_pc.numel() > 0 else zero_like_loss(g_parent)
+    l_cons = 0.0
+    if torch.is_tensor(g_child) and g_child.numel() > 0 and g_child.shape == g_parent.shape:
+        l_cons = 0.1 * (g_parent - g_child).abs().mean()
+    return l_sdf + 0.5 * l_normal + 0.5 * l_offset + l_cons
 
 
-def _gate_loss(pc: Dict[str, Any]) -> torch.Tensor:
-    gate = pc.get("gate_pc_map")
-    c23 = pc.get("C23_map")
-    if gate is None or c23 is None:
-        ref = next((v for v in pc.values() if isinstance(v, torch.Tensor)), torch.tensor(0.0))
+def _gate_loss(pc: Dict[str, Any], aux: Dict[str, Any], gt: torch.Tensor) -> torch.Tensor:
+    gate = pc.get("gate_pc_token")
+    c23 = pc.get("C23_token")
+    boundary = pc.get("boundary_indices3")
+    z_main = aux.get("z_main")
+    if boundary is None or z_main is None:
+        ref = next((v for v in pc.values() if isinstance(v, torch.Tensor)), gt)
         return zero_like_loss(ref)
-    target = (1.0 - c23).clamp(0.0, 1.0)
-    return F.binary_cross_entropy(gate.clamp(1e-6, 1.0 - 1e-6), target.detach())
+    if gate is None:
+        gate_map = pc.get("gate_pc_map")
+        gate = gather_by_boundary_indices(gate_map, boundary) if torch.is_tensor(gate_map) else None
+    if c23 is None:
+        c23_map = pc.get("C23_map")
+        c23 = gather_by_boundary_indices(c23_map, boundary) if torch.is_tensor(c23_map) else None
+    if gate is None or c23 is None or gate.numel() == 0:
+        ref = next((v for v in pc.values() if isinstance(v, torch.Tensor)), gt)
+        return zero_like_loss(ref)
+    need = build_need_correction_map(z_main, gt, _pc_size3(pc), threshold=0.25)
+    gate_target = gather_by_boundary_indices(need, boundary).view(-1, 1)
+    gate_target = gate_target * (1.0 - c23.detach()).clamp(0.0, 1.0)
+    return F.binary_cross_entropy(gate.view_as(gate_target).clamp(1e-6, 1.0 - 1e-6), gate_target.detach())
+
+
+def _pc_size3(pc: Dict[str, Any]) -> tuple[int, int]:
+    for key in ("B3", "valid3_map", "G_attn_map", "M_pc_map"):
+        value = pc.get(key)
+        if torch.is_tensor(value) and value.dim() >= 2:
+            return tuple(int(v) for v in value.shape[-2:])
+    return (40, 40)
 
 
 def _boundary_aux(pc, p2, p1, gt, ref):
