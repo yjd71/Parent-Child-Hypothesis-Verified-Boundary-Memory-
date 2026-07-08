@@ -325,8 +325,8 @@ def parent_values_from_region(region: str, sdf: torch.Tensor, reliability: torch
     region_id = int(REGION_TO_ID[region])
     value[:, region_id] = 1.0
     is_fg = 1.0 if region in ("fg_core", "fg_boundary") else 0.0
-    value[:, 4] = 1.0 - is_fg
-    value[:, 5] = is_fg
+    value[:, 4] = is_fg
+    value[:, 5] = 1.0 - is_fg
     value[:, 6] = sdf.reshape(-1)
     value[:, 7] = reliability.reshape(-1)
     return value

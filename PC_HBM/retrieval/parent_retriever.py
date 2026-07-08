@@ -54,8 +54,8 @@ class ParentRetriever(nn.Module):
         attn = torch.softmax(score / max(self.tau, EPS), dim=1)
         p3_group = (attn.unsqueeze(-1) * top_values[..., :4]).sum(dim=1)
         p3_group = p3_group / p3_group.sum(dim=1, keepdim=True).clamp_min(EPS)
-        fg = (attn * top_values[..., 5]).sum(dim=1, keepdim=True)
-        bg = (attn * top_values[..., 4]).sum(dim=1, keepdim=True)
+        fg = (attn * top_values[..., 4]).sum(dim=1, keepdim=True)
+        bg = (attn * top_values[..., 5]).sum(dim=1, keepdim=True)
         parent_entropy = entropy_from_probs(attn, dim=1)
         meta_top = []
         for row in idx.detach().cpu().tolist():

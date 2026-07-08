@@ -28,8 +28,8 @@ class StructuredPriorBiasNet(nn.Module):
         s_child: torch.Tensor,
         s_geo: torch.Tensor,
     ) -> torch.Tensor:
-        parent_fg = parent_values[..., 5]
-        parent_bg = parent_values[..., 4]
+        parent_fg = parent_values[..., 4]
+        parent_bg = parent_values[..., 5]
         child_pos = torch.sigmoid(s_child)
         geo_pos = torch.sigmoid(s_geo)
         contradiction = parent_bg * child_pos + parent_fg * (1.0 - child_pos)

@@ -487,6 +487,7 @@ class PCHBMEngine(nn.Module):
             "lateral_channels_in_collection": [int(v) for v in getattr(self.config, "lateral_channels_in_collection", [])],
             "pc_dim": self.dim,
             "value_dim": self.value_dim,
+            "value_schema_version": "fg4_bg5_v2",
             "geometry_dim": self.geometry_dim,
             "feature_version": str(getattr(self.config, "cbm_memory_feature_version", "swin_l_pc_hbm_v1")),
         }

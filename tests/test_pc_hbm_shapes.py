@@ -59,7 +59,7 @@ def make_memory(n_parent=128, n_img=2):
     child_ptr = mem.append_child(child_keys, child_geo, child_meta)
     values = torch.zeros(n_parent, 8)
     values[:, 1] = 1.0
-    values[:, 5] = 1.0
+    values[:, 4] = 1.0
     values[:, 7] = 1.0
     parent_meta = [{"image_id": f"img{i % n_img}", "region": "fg_boundary", "region_id": 1} for i in range(n_parent)]
     mem.append_parent(torch.randn(n_parent, 512), values, torch.randn(n_parent, 6), child_ptr, parent_meta)
