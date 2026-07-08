@@ -11,6 +11,7 @@ from PC_HBM.memory import parent_values_from_region
 from PC_HBM.fusion.pc_token_decoder import PCTokenDecoder
 from PC_HBM.retrieval import ParentRetriever
 from PC_HBM.retrieval.structured_prior_bias_net import StructuredPriorBiasNet
+from PC_HBM.training.pc_supervision import build_region_label_map, gather_by_boundary_indices
 
 
 def test_parent_values_follow_scheme_fg_bg_indices():
@@ -54,6 +55,8 @@ def test_parent_retriever_uses_scheme_fg_bg_indices_for_scores():
     assert out["S_fg_parent"].item() > 0.99
     assert out["S_bg_parent"].item() < 0.01
     assert out["M_parent"].item() > 0.99
+    assert out["top_parent_region_ids"].shape == (1, 2)
+    assert out["top_parent_region_ids"][0, 0].item() == 1
 
 
 def test_structured_prior_bias_net_reads_fg_from_v4_and_bg_from_v5():
@@ -100,3 +103,19 @@ def test_pc_token_decoder_m_pc_is_evidence_margin_when_residual_zero():
     torch.testing.assert_close(out["M_pc_evidence"].squeeze(1), expected)
     torch.testing.assert_close(out["M_pc_token"].squeeze(1), expected.clamp(-1.0, 1.0))
     assert torch.all(out["M_pc_residual"] == 0)
+
+
+def test_supervision_gather_returns_current_query_region_labels():
+    gt = torch.zeros(1, 1, 16, 16)
+    gt[:, :, 6:10, 6:10] = 1.0
+    labels = build_region_label_map(gt, (8, 8))
+    boundary = {
+        "batch_ids": torch.tensor([0, 0], dtype=torch.long),
+        "flat_indices": torch.tensor([27, 0], dtype=torch.long),
+    }
+
+    gathered = gather_by_boundary_indices(labels, boundary)
+
+    assert gathered.shape == (2,)
+    assert gathered[0].item() in (0, 1)
+    assert gathered[1].item() in (2, 3)

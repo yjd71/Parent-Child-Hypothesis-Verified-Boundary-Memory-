@@ -7,7 +7,7 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 
-from ..common.utils import EPS, entropy_from_probs, gather_tokens, masked_softmax, normalize
+from ..common.utils import EPS, REGION_TO_ID, entropy_from_probs, gather_tokens, masked_softmax, normalize
 
 
 class ParentRetriever(nn.Module):
@@ -58,8 +58,19 @@ class ParentRetriever(nn.Module):
         bg = (attn * top_values[..., 5]).sum(dim=1, keepdim=True)
         parent_entropy = entropy_from_probs(attn, dim=1)
         meta_top = []
-        for row in idx.detach().cpu().tolist():
-            meta_top.append([meta[int(i)] if int(i) < len(meta) else {} for i in row])
+        top_parent_region_ids = torch.full((m, self.topk), -1, device=p3.device, dtype=torch.long)
+        for row_idx, row in enumerate(idx.detach().cpu().tolist()):
+            meta_row = []
+            for col_idx, item in enumerate(row):
+                meta_i = meta[int(item)] if int(item) < len(meta) else {}
+                meta_row.append(meta_i)
+                if isinstance(meta_i, dict):
+                    raw = meta_i.get("region_id", REGION_TO_ID.get(str(meta_i.get("region", "")), -1))
+                    try:
+                        top_parent_region_ids[row_idx, col_idx] = int(raw)
+                    except (TypeError, ValueError):
+                        top_parent_region_ids[row_idx, col_idx] = -1
+            meta_top.append(meta_row)
         return {
             "q3": q3,
             "q3_map": q_map,
@@ -75,6 +86,8 @@ class ParentRetriever(nn.Module):
             "M_parent": fg - bg,
             "parent_entropy": parent_entropy,
             "top_parent_meta": meta_top,
+            "top_parent_region_ids": top_parent_region_ids,
+            "top_parent_reliability": top_values[..., 7],
         }
 
     def _empty(self, q3: torch.Tensor, k: int) -> Dict[str, Any]:
@@ -94,4 +107,6 @@ class ParentRetriever(nn.Module):
             "M_parent": q3.new_empty(m, 1),
             "parent_entropy": q3.new_empty(m),
             "top_parent_meta": [],
+            "top_parent_region_ids": torch.full((m, k), -1, device=q3.device, dtype=torch.long),
+            "top_parent_reliability": q3.new_empty(m, k),
         }

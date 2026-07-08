@@ -244,6 +244,9 @@ def test_forward_pc_hbm_fallback_and_full_path():
     assert aux["p1"].shape == (1, 192, 160, 160)
     pc = aux["pc_hbm"]
     assert pc["top_parent_keys"].shape[-2:] == (64, 512)
+    assert pc["top_parent_region_ids"].shape == pc["S_child"].shape
+    assert pc["top_parent_reliability"].shape == pc["S_child"].shape
+    assert pc["batch_ids3"].numel() == pc["flat_indices3"].numel()
     assert pc["K_child_top"].shape[-2:] == (64, 512)
     assert pc["H_tokens"].shape[-2:] == (64, 512)
     assert pc["q3_new"].shape[-1] == 512
