@@ -23,6 +23,29 @@ from ..common.utils import (
 )
 
 
+class P2LocalStructuredPrior(nn.Module):
+    """Structured local prior for P2-BRA attention logits."""
+
+    def __init__(self, in_dim: int = 8, hidden: int = 32) -> None:
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1))
+        self.residual = nn.Sequential(nn.Linear(in_dim, hidden), nn.GELU(), nn.Linear(hidden, 1))
+
+    def forward(
+        self,
+        valid: torch.Tensor,
+        gate: torch.Tensor,
+        c23: torch.Tensor,
+        m_pc: torch.Tensor,
+        dist: torch.Tensor,
+        offset_mag: torch.Tensor,
+        reliability: torch.Tensor,
+        residual_terms: torch.Tensor,
+    ) -> torch.Tensor:
+        base = valid + gate - c23 + 0.25 * m_pc + 0.25 * reliability - dist - 0.1 * offset_mag
+        return base + self.gamma.tanh() * self.residual(residual_terms).squeeze(-1)
+
+
 class P2BoundaryRetargetAttention(nn.Module):
     """Retarget p3 PC refs to p2 boundary tokens with local attention."""
 
@@ -43,7 +66,8 @@ class P2BoundaryRetargetAttention(nn.Module):
         self.q_proj = nn.Linear(self.dim, self.dim)
         self.k_proj = nn.Linear(self.dim, self.dim)
         self.v_proj = nn.Linear(self.dim, self.dim)
-        self.prior = nn.Linear(self.dim, 1)
+        self.prior_residual = nn.Linear(self.dim, 1)
+        self.structured_prior = P2LocalStructuredPrior(in_dim=8)
         self.restore = nn.Linear(self.dim, int(p2_ch))
         self.b_head = nn.Linear(self.dim, 1)
         self.g_head = nn.Linear(self.dim, 1)
@@ -95,7 +119,8 @@ class P2BoundaryRetargetAttention(nn.Module):
         k = self.k_proj(local_R3)
         v = self.v_proj(local_R3)
         logits = (q * k).sum(dim=-1) / (self.dim ** 0.5) / max(self.tau, 1e-6)
-        logits = logits + self.prior(local_R3).squeeze(-1)
+        prior2 = self._structured_prior(pc_maps, batch_ids, flat_indices, (h2, w2), tuple(R3_map.shape[-2:]), local_mask3, local_R3)
+        logits = logits + prior2 + self.prior_residual(local_R3).squeeze(-1)
         attn = masked_softmax(logits, local_mask3, dim=1)
         f2_tokens = finite_or_zero((attn.unsqueeze(-1) * v).sum(dim=1))
         gate2 = torch.sigmoid(self.gate(f2_tokens))
@@ -117,6 +142,7 @@ class P2BoundaryRetargetAttention(nn.Module):
             "boundary_indices2": idx,
             "R3_map": R3_map,
             "attn2": attn,
+            "prior2": prior2,
         }
 
     def _empty(self, p2: torch.Tensor, B2: torch.Tensor, R3_map: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -132,4 +158,31 @@ class P2BoundaryRetargetAttention(nn.Module):
             "boundary_indices2": {"batch_ids": torch.empty(0, device=p2.device, dtype=torch.long), "flat_indices": torch.empty(0, device=p2.device, dtype=torch.long)},
             "R3_map": R3_map,
             "attn2": p2.new_empty(0, self.window * self.window),
+            "prior2": p2.new_empty(0, self.window * self.window),
         }
+
+    def _structured_prior(self, pc_maps, batch_ids, flat_indices, query_hw, ref_hw, local_mask, local_R3):
+        local_gate, _ = local_window_gather(pc_maps["gate_pc_map"], batch_ids, flat_indices, query_hw, ref_hw, self.window)
+        local_c23, _ = local_window_gather(pc_maps["C23_map"], batch_ids, flat_indices, query_hw, ref_hw, self.window)
+        local_mpc, _ = local_window_gather(pc_maps["M_pc_map"], batch_ids, flat_indices, query_hw, ref_hw, self.window)
+        local_valid, _ = local_window_gather(pc_maps["valid3_map"], batch_ids, flat_indices, query_hw, ref_hw, self.window)
+        local_offset, _ = local_window_gather(pc_maps["O_pc_map"], batch_ids, flat_indices, query_hw, ref_hw, self.window)
+        local_e, _ = local_window_gather(pc_maps["E_attn_map"], batch_ids, flat_indices, query_hw, ref_hw, self.window)
+        gate = local_gate.squeeze(-1).clamp(0.0, 1.0)
+        c23 = local_c23.squeeze(-1).clamp(0.0, 1.0)
+        m_pc = local_mpc.squeeze(-1).clamp(-1.0, 1.0)
+        valid = local_valid.squeeze(-1).clamp(0.0, 1.0) * local_mask.to(dtype=local_R3.dtype)
+        offset_mag = local_offset.norm(dim=-1).clamp(0.0, 2.0)
+        reliability = local_e[..., 7].clamp(0.0, 1.0) if local_e.size(-1) > 7 else valid
+        dist = self._window_distance(local_R3.device, local_R3.dtype).unsqueeze(0).expand_as(valid)
+        residual_terms = torch.stack([valid, gate, c23, m_pc, dist, offset_mag, reliability, local_mask.to(dtype=local_R3.dtype)], dim=-1)
+        return self.structured_prior(valid, gate, c23, m_pc, dist, offset_mag, reliability, residual_terms)
+
+    def _window_distance(self, device, dtype):
+        radius = self.window // 2
+        coords = []
+        denom = max(float(radius), 1.0)
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                coords.append(((dx * dx + dy * dy) ** 0.5) / denom)
+        return torch.tensor(coords, device=device, dtype=dtype)

@@ -23,6 +23,27 @@ from ..common.utils import (
 )
 
 
+class P1LocalStructuredPrior(nn.Module):
+    """Structured local prior for P1-PRA attention logits."""
+
+    def __init__(self, in_dim: int = 6, hidden: int = 32) -> None:
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1))
+        self.residual = nn.Sequential(nn.Linear(in_dim, hidden), nn.GELU(), nn.Linear(hidden, 1))
+
+    def forward(
+        self,
+        valid: torch.Tensor,
+        b2_refined: torch.Tensor,
+        g2_refined: torch.Tensor,
+        dist: torch.Tensor,
+        offset_mag: torch.Tensor,
+        residual_terms: torch.Tensor,
+    ) -> torch.Tensor:
+        base = valid + b2_refined + g2_refined - dist - 0.1 * offset_mag
+        return base + self.gamma.tanh() * self.residual(residual_terms).squeeze(-1)
+
+
 class P1PixelRefinementAttention(nn.Module):
     """Retarget p2 refs to p1 tokens with local attention."""
 
@@ -43,7 +64,8 @@ class P1PixelRefinementAttention(nn.Module):
         self.q_proj = nn.Linear(self.dim, self.dim)
         self.k_proj = nn.Linear(self.dim, self.dim)
         self.v_proj = nn.Linear(self.dim, self.dim)
-        self.prior = nn.Linear(self.dim, 1)
+        self.prior_residual = nn.Linear(self.dim, 1)
+        self.structured_prior = P1LocalStructuredPrior(in_dim=6)
         self.g_head = nn.Linear(self.dim, 1)
         self.r_head = nn.Linear(self.dim, 1)
         self.o_head = nn.Linear(self.dim, 2)
@@ -87,7 +109,8 @@ class P1PixelRefinementAttention(nn.Module):
         k = self.k_proj(local_R2)
         v = self.v_proj(local_R2)
         logits = (q * k).sum(dim=-1) / (self.dim ** 0.5) / max(self.tau, 1e-6)
-        logits = logits + self.prior(local_R2).squeeze(-1)
+        prior1 = self._structured_prior(p2_aux, batch_ids, flat_indices, (h1, w1), tuple(R2_map.shape[-2:]), local_mask2, local_R2)
+        logits = logits + prior1 + self.prior_residual(local_R2).squeeze(-1)
         attn = masked_softmax(logits, local_mask2, dim=1)
         r1_tokens = finite_or_zero((attn.unsqueeze(-1) * v).sum(dim=1))
         G1_map = scatter_tokens((bsz, 1, h1, w1), batch_ids, flat_indices, torch.sigmoid(self.g_head(r1_tokens)), reduce="replace")
@@ -105,6 +128,7 @@ class P1PixelRefinementAttention(nn.Module):
             "boundary_indices1": idx,
             "R2_map": R2_map,
             "attn1": attn,
+            "prior1": prior1,
         }
 
     def _empty(self, p1: torch.Tensor, B1: torch.Tensor, R2_map: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -119,4 +143,27 @@ class P1PixelRefinementAttention(nn.Module):
             "boundary_indices1": {"batch_ids": torch.empty(0, device=p1.device, dtype=torch.long), "flat_indices": torch.empty(0, device=p1.device, dtype=torch.long)},
             "R2_map": R2_map,
             "attn1": p1.new_empty(0, self.window * self.window),
+            "prior1": p1.new_empty(0, self.window * self.window),
         }
+
+    def _structured_prior(self, p2_aux, batch_ids, flat_indices, query_hw, ref_hw, local_mask, local_R2):
+        local_b2, _ = local_window_gather(p2_aux["B2_refined_map"], batch_ids, flat_indices, query_hw, ref_hw, self.window)
+        local_g2, _ = local_window_gather(p2_aux["G2_refined_map"], batch_ids, flat_indices, query_hw, ref_hw, self.window)
+        local_valid, _ = local_window_gather(p2_aux["valid2_map"], batch_ids, flat_indices, query_hw, ref_hw, self.window)
+        local_offset, _ = local_window_gather(p2_aux["O2_refined_map"], batch_ids, flat_indices, query_hw, ref_hw, self.window)
+        b2_refined = local_b2.squeeze(-1).clamp(0.0, 1.0)
+        g2_refined = local_g2.squeeze(-1).clamp(0.0, 1.0)
+        valid = local_valid.squeeze(-1).clamp(0.0, 1.0) * local_mask.to(dtype=local_R2.dtype)
+        offset_mag = local_offset.norm(dim=-1).clamp(0.0, 2.0)
+        dist = self._window_distance(local_R2.device, local_R2.dtype).unsqueeze(0).expand_as(valid)
+        residual_terms = torch.stack([valid, b2_refined, g2_refined, dist, offset_mag, local_mask.to(dtype=local_R2.dtype)], dim=-1)
+        return self.structured_prior(valid, b2_refined, g2_refined, dist, offset_mag, residual_terms)
+
+    def _window_distance(self, device, dtype):
+        radius = self.window // 2
+        coords = []
+        denom = max(float(radius), 1.0)
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                coords.append(((dx * dx + dy * dy) ** 0.5) / denom)
+        return torch.tensor(coords, device=device, dtype=dtype)

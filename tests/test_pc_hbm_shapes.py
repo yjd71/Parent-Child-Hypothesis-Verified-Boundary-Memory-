@@ -20,6 +20,8 @@ from PC_HBM.refinement import (
     P1PixelRefinementAttention,
     P2BoundaryRetargetAttention,
 )
+from PC_HBM.refinement.p1_pixel_refinement_attention import P1LocalStructuredPrior
+from PC_HBM.refinement.p2_boundary_retarget_attention import P2LocalStructuredPrior
 from PC_HBM.retrieval import ChildLocalEncoder, ChildQueryBuilder, ChildVerifierV2, ParentRetriever
 
 
@@ -156,6 +158,7 @@ def test_p2_bra_shapes():
     assert out["F2_ref_map"].shape == (2, 512, 80, 80)
     assert out["B2_refined_map"].shape == (2, 1, 80, 80)
     assert out["O2_refined_map"].shape == (2, 2, 80, 80)
+    assert out["prior2"].shape == out["attn2"].shape
 
 
 def test_p1_pra_shapes():
@@ -166,6 +169,37 @@ def test_p1_pra_shapes():
     assert out["R1_map"].shape == (2, 1, 160, 160)
     assert out["R_sup_map"].shape == (2, 1, 160, 160)
     assert out["O1_map"].shape == (2, 2, 160, 160)
+    assert out["prior1"].shape == out["attn1"].shape
+
+
+def test_p2_structured_prior_penalizes_high_c23():
+    prior = P2LocalStructuredPrior(in_dim=8)
+    valid = torch.ones(1, 2)
+    gate = torch.zeros(1, 2)
+    c23 = torch.tensor([[0.0, 1.0]])
+    m_pc = torch.zeros(1, 2)
+    dist = torch.zeros(1, 2)
+    offset = torch.zeros(1, 2)
+    reliability = torch.ones(1, 2)
+    residual = torch.zeros(1, 2, 8)
+
+    out = prior(valid, gate, c23, m_pc, dist, offset, reliability, residual)
+
+    assert out[0, 0] > out[0, 1]
+
+
+def test_p1_structured_prior_prefers_valid_near_refined_tokens():
+    prior = P1LocalStructuredPrior(in_dim=6)
+    valid = torch.ones(1, 2)
+    b2 = torch.tensor([[0.1, 0.9]])
+    g2 = torch.tensor([[0.1, 0.9]])
+    dist = torch.tensor([[0.5, 0.0]])
+    offset = torch.tensor([[0.2, 0.0]])
+    residual = torch.zeros(1, 2, 6)
+
+    out = prior(valid, b2, g2, dist, offset, residual)
+
+    assert out[0, 1] > out[0, 0]
 
 
 def test_adaptive_mixture_shapes():
