@@ -221,7 +221,7 @@ def prepare_labeled_memory_dataloader(config, labeled_indices) -> data.DataLoade
         drop_last=False,
     )
     logger.success_info(
-        "[CBM] Memory labeled dataloader created: samples={}, batches={}, unique_image_ids={}.".format(
+        "[PC-HBM] Memory labeled dataloader created: samples={}, batches={}, unique_image_ids={}.".format(
             len(memory_dataset),
             len(memory_loader),
             len(unique_labeled_ids),

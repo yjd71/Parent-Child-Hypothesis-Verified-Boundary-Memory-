@@ -5,7 +5,6 @@ import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from utils import Logger
-from CBM import build_cbm_pfi
 from PC_HBM import build_pc_hbm, pc_hbm_enabled
 from config import Config
 from .talnet import ModelEMA
@@ -39,20 +38,6 @@ def _log(logger: Logger, names, message: str) -> None:
             return
 
 
-def _attach_cbm_if_enabled(config: Config, logger: Logger, device: torch.device, model: torch.nn.Module):
-    if not bool(getattr(config, "cbm_pfi_enable", False)):
-        return None
-    if not isinstance(model, ModelEMA):
-        _log(logger, ("warn_info", "warning", "info"), "[!] CBM-PFI is enabled but current model does not support set_cbm; CBM skipped.")
-        return None
-
-    cbm = build_cbm_pfi(config, device=device, logger=logger)
-    cbm.initialize_modules(device=device)
-    model.set_cbm(cbm)
-    _log(logger, ("key_info", "info"), "[+] CBM-PFI engine attached before optimizer/checkpoint loading.")
-    return cbm
-
-
 def _attach_pc_hbm_if_enabled(config: Config, logger: Logger, device: torch.device, model: torch.nn.Module):
     if not pc_hbm_enabled(config):
         return None
@@ -67,10 +52,6 @@ def _attach_pc_hbm_if_enabled(config: Config, logger: Logger, device: torch.devi
 
 def _model_state_from_checkpoint(checkpoint):
     return checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
-
-
-def _checkpoint_has_cbm_keys(model_state) -> bool:
-    return hasattr(model_state, "keys") and any(str(key).startswith("cbm.") for key in model_state.keys())
 
 
 def _checkpoint_has_pc_hbm_keys(model_state) -> bool:
@@ -127,22 +108,8 @@ def _log_incompatible_keys(logger: Logger, load_result, prefix: str) -> None:
         _log(logger, ("warn_info", "warning", "info"), f"[!] {prefix} unexpected keys: {len(unexpected)}")
 
 
-def _load_cbm_memory_from_checkpoint(cbm, checkpoint, config: Config, device: torch.device, logger: Logger) -> None:
-    if cbm is None or not bool(getattr(config, "cbm_checkpoint_memory", True)):
-        return
-    if not isinstance(checkpoint, dict) or "cbm_memory" not in checkpoint:
-        _log(logger, ("warn_info", "warning", "info"), "[!] Checkpoint has no CBM memory; CBM eval will fallback until memory is rebuilt.")
-        return
-    try:
-        cbm.load_memory_state_dict(checkpoint["cbm_memory"], device=device)
-        _log(logger, ("key_info", "info"), f"[+] CBM memory restored from checkpoint: ready={cbm.memory.is_ready()}.")
-    except Exception as exc:
-        cbm.memory.clear()
-        _log(logger, ("warn_info", "warning", "info"), f"[!] Failed to restore CBM memory: {exc}. Fallback to baseline.")
-
-
 def _load_pc_hbm_memory_from_checkpoint(pc_hbm, checkpoint, config: Config, device: torch.device, logger: Logger) -> None:
-    if pc_hbm is None or not bool(getattr(config, "cbm_checkpoint_memory", True)):
+    if pc_hbm is None or not bool(getattr(config, "pc_hbm_checkpoint_memory", True)):
         return
     if not isinstance(checkpoint, dict) or "pc_hbm_memory" not in checkpoint:
         _log(logger, ("warn_info", "warning", "info"), "[!] Checkpoint has no PC-HBM memory; PC-HBM eval will fallback until memory is rebuilt.")
@@ -207,7 +174,6 @@ def _build_lr_scheduler(config: Config, optimizer: optim.Optimizer):
 
 def build_model_optimizers(config: Config, logger: Logger, device: torch.device, resume: str = None) -> any:
     model = build_model(config)
-    cbm = _attach_cbm_if_enabled(config, logger, device, model)
     pc_hbm = _attach_pc_hbm_if_enabled(config, logger, device, model)
     epoch_st = 0
     checkpoint = None
@@ -217,7 +183,6 @@ def build_model_optimizers(config: Config, logger: Logger, device: torch.device,
             logger.key_info("[+] Loading model checkpoint from '{}'".format(resume))
             checkpoint = torch.load(resume, map_location='cpu')
             _load_model_checkpoint_state(model, checkpoint, config, logger, prefix="Model checkpoint")
-            _load_cbm_memory_from_checkpoint(cbm, checkpoint, config, device, logger)
             _load_pc_hbm_memory_from_checkpoint(pc_hbm, checkpoint, config, device, logger)
         else:
             logger.warn_info("[!] No checkpoint found at '{}'".format(resume))
@@ -265,21 +230,15 @@ def build_model_optimizers(config: Config, logger: Logger, device: torch.device,
 
 def build_model_eval(config: Config, logger: Logger, resume: str, device: torch.device = 'cpu') -> torch.nn.Module:
     model = build_model(config=config)
-    cbm = _attach_cbm_if_enabled(config, logger, device, model)
     pc_hbm = _attach_pc_hbm_if_enabled(config, logger, device, model)
     logger.freeze_info("[+] Loading model from {} to evaluate...".format(resume))
     assert os.path.isfile(resume), "[x] target checkpoint not exists!"
     checkpoint = torch.load(resume, map_location='cpu')
     model_state = _model_state_from_checkpoint(checkpoint)
-    has_cbm_keys = _checkpoint_has_cbm_keys(model_state)
     has_pc_hbm_keys = _checkpoint_has_pc_hbm_keys(model_state)
-    if cbm is None and has_cbm_keys:
-        _log(logger, ("warn_info", "warning", "info"), "[!] Checkpoint contains CBM parameters but cbm_pfi_enable is false; loading baseline weights and ignoring CBM keys.")
     if pc_hbm is None and has_pc_hbm_keys:
         _log(logger, ("warn_info", "warning", "info"), "[!] Checkpoint contains PC-HBM parameters but use_pc_hbm/pc_hbm_enable is false; loading baseline weights and ignoring PC-HBM keys.")
     _load_model_checkpoint_state(model, checkpoint, config, logger, prefix="Eval checkpoint")
-    if cbm is not None:
-        _load_cbm_memory_from_checkpoint(cbm, checkpoint, config, device, logger)
     if pc_hbm is not None:
         _load_pc_hbm_memory_from_checkpoint(pc_hbm, checkpoint, config, device, logger)
     model = model.to(device)

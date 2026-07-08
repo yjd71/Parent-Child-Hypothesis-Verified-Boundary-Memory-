@@ -8,13 +8,27 @@ from torch.distributed import get_rank
 
 BASIC_TRAIN_LOG_INTERVAL = 20
 
-_CBM_METRIC_KEYS = {
-    "cbm_stage",
+_PC_HBM_METRIC_KEYS = {
+    "L_seg_total",
+    "L_parent_ce",
+    "L_child_verify",
+    "L_geometry",
+    "L_gate",
+    "L_boundary_aux",
+    "L_mix_oracle",
+    "L_branch",
+    "L_quality",
+    "L_usage",
+    "L_reg",
+    "pi_keep_mean",
+    "pi_res_mean",
+    "pi_def_mean",
+    "pi_sup_mean",
+    "gate_pc_mean",
+    "C23_mean",
+    "route_entropy",
+    "parent_entropy",
     "memory_ready",
-    "gate_mean",
-    "valid_ratio",
-    "retrieval_uncertainty_mean",
-    "memory_tokens",
 }
 def log_info(logger, message: str) -> None:
     if logger is None:
@@ -25,10 +39,10 @@ def log_info(logger, message: str) -> None:
         log_fn(message)
 
 
-def format_loss_info(loss_dict: Mapping[str, Any], title: str, include_cbm_losses: bool = True) -> str:
+def format_loss_info(loss_dict: Mapping[str, Any], title: str, include_module_losses: bool = True) -> str:
     info_loss = title
     for loss_name, loss_value in loss_dict.items():
-        if not include_cbm_losses and (loss_name.startswith("loss_cbm_") or loss_name.startswith("raw_cbm_")):
+        if not include_module_losses and _module_metric_group(str(loss_name)) is not None:
             continue
         info_loss += ", {}: {:.3f}".format(loss_name, float(loss_value))
     return info_loss
@@ -40,7 +54,7 @@ def partition_training_metrics(
     """Split baseline training metrics from module-owned diagnostics."""
     base_metrics: Dict[str, Any] = {}
     module_metrics: Dict[str, Dict[str, Any]] = {
-        "CBM": {},
+        "PC-HBM": {},
     }
     for name, value in loss_dict.items():
         group = _module_metric_group(str(name))
@@ -70,7 +84,7 @@ def log_training_progress(
     num_batches: int,
     step: int,
     distributed_train: bool = False,
-    include_cbm_losses: bool = True,
+    include_module_losses: bool = True,
     progress_label: str = "",
     log_base: bool = True,
     log_modules: bool = False,
@@ -88,7 +102,7 @@ def log_training_progress(
         info_loss = format_loss_info(
             base_metrics,
             title,
-            include_cbm_losses=include_cbm_losses,
+            include_module_losses=include_module_losses,
         )
         log_info(logger, " ".join((info_progress, info_loss)))
 
@@ -127,28 +141,6 @@ def log_training_progress(
             )
 
 
-def record_cbm_aux(
-    loss_dict: Dict[str, Any],
-    cbm,
-    cbm_stage: int,
-    aux,
-    branch_name: str,
-    logger=None,
-    log_enabled: bool = True,
-) -> None:
-    if cbm is not None:
-        loss_dict["cbm_stage"] = float(cbm_stage)
-        loss_dict["memory_ready"] = 1.0 if cbm.memory.is_ready() else 0.0
-    if not aux:
-        return
-    loss_dict["gate_mean"] = float(aux.get("gate_mean", 0.0) or 0.0)
-    loss_dict["valid_ratio"] = float(aux.get("valid_ratio", 0.0) or 0.0)
-    loss_dict["retrieval_uncertainty_mean"] = float(aux.get("u_mean", 0.0) or 0.0)
-    loss_dict["memory_tokens"] = float(aux.get("num_memory_tokens", 0) or 0)
-    if log_enabled and aux.get("fallback_reason"):
-        log_info(logger, "[CBM] {} fallback={}".format(branch_name, aux.get("fallback_reason")))
-
-
 def _is_rank_zero(distributed_train: bool) -> bool:
     if not distributed_train:
         return True
@@ -159,8 +151,8 @@ def _is_rank_zero(distributed_train: bool) -> bool:
 
 
 def _module_metric_group(name: str):
-    if name in _CBM_METRIC_KEYS or name.startswith(("loss_cbm_", "raw_cbm_", "cbm_")):
-        return "CBM"
+    if name in _PC_HBM_METRIC_KEYS or name.startswith(("pc_hbm_", "L_", "pi_")):
+        return "PC-HBM"
     return None
 
 
@@ -170,6 +162,5 @@ __all__ = [
     "log_training_progress",
     "log_info",
     "partition_training_metrics",
-    "record_cbm_aux",
     "should_log_training_progress",
 ]

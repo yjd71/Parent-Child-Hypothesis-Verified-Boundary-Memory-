@@ -10,8 +10,8 @@ precisionHigh = True
 compile = False
 verbose_eval = True
 
-# CBM logging only. Baseline training progress keeps its
-# fixed 20-batch cadence; visualization save settings remain independent.
+# Module diagnostics logging only. Baseline training progress keeps its
+# fixed 20-batch cadence.
 log_enable = True
 log_interval = 200
 

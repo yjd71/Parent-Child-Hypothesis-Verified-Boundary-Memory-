@@ -12,13 +12,10 @@ from utils.log_control import log_enabled, should_log
 from utils.solver_logging import (
     log_info,
     log_training_progress,
-    record_cbm_aux,
     should_log_training_progress,
 )
-from CBM.config.schedule import cbm_should_rebuild_memory, cbm_stage_epoch, cbm_stage_id, cbm_stage_name, cbm_unlabeled_enabled
-from CBM.diagnostics.visualization import save_pfi_binary_visualizations_v42
-from PC_HBM.pc_config import pc_hbm_enabled, pc_hbm_unlabeled_enabled
-from PC_HBM.pc_losses import compute_pc_hbm_unlabeled_loss, structure_aware_confidence
+from PC_HBM.core.pc_config import pc_hbm_enabled, pc_hbm_unlabeled_enabled
+from PC_HBM.training.pc_losses import compute_pc_hbm_unlabeled_loss, structure_aware_confidence
 from .loss import PixLoss
 from .evaluator import Evaluator
 
@@ -39,9 +36,7 @@ class SemiSupervisedTrainer:
         self.global_step = 0
         self.device = device
         self.logger = logger
-        self.cbm = None
         self.pc_hbm = None
-        self.cbm_stage = 0
 
     def _destory_model(self):
         try:
@@ -54,7 +49,6 @@ class SemiSupervisedTrainer:
         torch.cuda.empty_cache()
         self.model, self.model_optimizer, self.model_lr_scheduler, self.epoch_st = model_lrsch
         self.current_labeled_indices = labeled_indices
-        self.cbm = self._get_model_cbm()
         self.pc_hbm = self._get_model_pc_hbm()
 
     @retry_if_cuda_oom
@@ -64,23 +58,20 @@ class SemiSupervisedTrainer:
         gt_replace=None,
         loss_alpha=1.0,
         use_memory=False,
-        enable_cbm_loss=False,
+        enable_pc_hbm_loss=False,
         branch_name="Sup",
     ):
         inputs = batch[0].to(self.device)
         gts = batch[1].to(self.device) if gt_replace is None else gt_replace
 
-        cbm_aux = None
+        module_aux = None
         if self._pc_hbm_active():
-            scaled_preds, cbm_aux = self.model.forward_pc_hbm(
+            scaled_preds, module_aux = self.model.forward_pc_hbm(
                 inputs,
                 use_memory=use_memory,
                 return_all_logits=True,
                 epoch=getattr(self, "current_epoch", None),
             )
-        elif use_memory:
-            model_kwargs = {"use_memory": True, "return_aux": True}
-            scaled_preds, cbm_aux = self.model(inputs, **model_kwargs)
         else:
             scaled_preds = self.model(inputs)
 
@@ -98,8 +89,8 @@ class SemiSupervisedTrainer:
                 cur = self.criterion_gdt(gdt_pred, gdt_label)
                 loss_gdt = cur if idx == 0 else loss_gdt + cur
 
-        if self._pc_hbm_active() and enable_cbm_loss:
-            loss_pix = self.pc_hbm.compute_losses(scaled_preds, cbm_aux, torch.clamp(gts, 0, 1)) * loss_alpha
+        if self._pc_hbm_active() and enable_pc_hbm_loss:
+            loss_pix = self.pc_hbm.compute_losses(scaled_preds, module_aux, torch.clamp(gts, 0, 1)) * loss_alpha
             for loss_name, loss_value in self.pc_hbm.loss_dict.items():
                 self.loss_dict[loss_name] = loss_value
         else:
@@ -110,22 +101,6 @@ class SemiSupervisedTrainer:
         if self.config.out_ref and not self._pc_hbm_active():
             loss = loss + loss_gdt
             self.loss_dict['loss_gdt'] = loss_gdt.item() if hasattr(loss_gdt, "item") else float(loss_gdt)
-
-        if enable_cbm_loss and self.cbm is not None and not self._pc_hbm_active():
-            loss_cbm = self.cbm.compute_losses(cbm_aux, torch.clamp(gts, 0, 1))
-            loss = loss + loss_cbm
-            for loss_name, loss_value in self.cbm.state.loss_dict.items():
-                self.loss_dict[loss_name] = loss_value
-        record_cbm_aux(
-            self.loss_dict,
-            self.cbm,
-            self.cbm_stage,
-            cbm_aux,
-            branch_name,
-            logger=self.logger,
-            log_enabled=self._should_log_module(),
-        )
-        self._maybe_save_cbm_visualizations(cbm_aux, batch, branch_name)
 
         self.loss_log.update(loss.item(), inputs.size(0))
         self.model_optimizer.zero_grad()
@@ -138,15 +113,12 @@ class SemiSupervisedTrainer:
         self.current_epoch = int(epoch)
         self.model.train()
         self.loss_dict = {}
-        self.cbm = self._get_model_cbm()
         self.pc_hbm = self._get_model_pc_hbm()
         if self._pc_hbm_active():
             self._prepare_pc_hbm_epoch(epoch)
-        else:
-            self._prepare_cbm_epoch(epoch)
         self.model.train()
-        use_memory = self._pc_hbm_use_memory(epoch) if self._pc_hbm_active() else self._cbm_use_memory(epoch)
-        enable_labeled_cbm_loss = use_memory
+        use_memory = self._pc_hbm_use_memory(epoch)
+        enable_pc_hbm_loss = self._pc_hbm_active() and use_memory
         enable_unsup = self._pc_hbm_unlabeled_enabled(epoch) if self._pc_hbm_active() else self._unlabeled_enabled(epoch)
 
         if epoch > total_epochs + self.config.IoU_finetune_last_epochs:
@@ -170,7 +142,7 @@ class SemiSupervisedTrainer:
             self._train_batch(
                 sup_batch,
                 use_memory=use_memory,
-                enable_cbm_loss=enable_labeled_cbm_loss,
+                enable_pc_hbm_loss=enable_pc_hbm_loss,
                 branch_name="Sup",
             )
             if log_base_progress or log_module_progress:
@@ -225,16 +197,15 @@ class SemiSupervisedTrainer:
                     teacher_preds = self.model(
                         img_u_w,
                         ema=True,
-                        use_memory=use_memory,
                     )
                     teacher_pseudo = teacher_preds[-1].sigmoid()
                 pseudo_s = self._align_pseudo_to_strong(teacher_pseudo, geom)
                 self._train_batch(
                     student_unsup_batch,
                     gt_replace=pseudo_s,
-                    loss_alpha=float(getattr(self.config, "cbm_unsup_loss_alpha", 0.1)),
+                    loss_alpha=float(getattr(self.config, "lambda_u", 1.0)),
                     use_memory=use_memory,
-                    enable_cbm_loss=False,
+                    enable_pc_hbm_loss=False,
                     branch_name="Unsup",
                 )
 
@@ -269,31 +240,6 @@ class SemiSupervisedTrainer:
                     self.model.ema_update(self.global_step)
 
         return self.loss_log.avg
-
-    def _prepare_cbm_epoch(self, epoch):
-        if self.cbm is None:
-            return
-        self.cbm_stage = cbm_stage_id(self.config, epoch)
-        stage_epoch = cbm_stage_epoch(self.config, epoch)
-        stage_name = cbm_stage_name(self.config, epoch)
-        if cbm_should_rebuild_memory(self.config, epoch):
-            self.cbm.prepare_epoch(self.model, self.memory_labeled_dataloader, epoch)
-        else:
-            self.cbm.state.epoch = int(epoch)
-            self.cbm.state.stage_epoch = stage_epoch
-            self.cbm.state.stage_name = stage_name
-            self.cbm.state.memory_ready = self.cbm.memory.is_ready()
-            self._log_module_info(self.cbm.memory.diagnostic_string())
-        ready = self.cbm.memory.is_ready()
-        failed = getattr(self.cbm.state, "memory_build_failed", False)
-        error = getattr(self.cbm.state, "memory_build_error", None)
-        info = (
-            f"[CBM] epoch={epoch}, stage_epoch={stage_epoch}, stage={self.cbm_stage}:{stage_name}, "
-            f"memory_ready={ready}, memory_failed={failed}"
-        )
-        if error:
-            info += f", fallback_reason={error}"
-        self._log_module_info(info)
 
     def _prepare_pc_hbm_epoch(self, epoch):
         if self.pc_hbm is None:
@@ -393,28 +339,19 @@ class SemiSupervisedTrainer:
             return out
         return tensor
 
-    def _cbm_use_memory(self, epoch):
-        return bool(self.cbm is not None and self.cbm.enabled_for_epoch(epoch))
-
     def _pc_hbm_use_memory(self, epoch):
         return bool(self.pc_hbm is not None and self.pc_hbm.enabled_for_epoch(epoch))
 
     def _unlabeled_enabled(self, epoch):
-        if self.cbm is None:
-            return epoch >= self.config.sup_only_train_epoch
-        return cbm_unlabeled_enabled(self.config, epoch)
+        return epoch >= self.config.sup_only_train_epoch
 
     def _pc_hbm_unlabeled_enabled(self, epoch):
         return bool(self.pc_hbm is not None and pc_hbm_unlabeled_enabled(self.config, epoch))
 
     def _sync_teacher_this_epoch(self, epoch):
-        if self.cbm is None:
+        if self.pc_hbm is None:
             return epoch < self.config.sup_only_train_epoch
-        return not cbm_unlabeled_enabled(self.config, epoch)
-
-    def _get_model_cbm(self):
-        model = self.model.module if hasattr(getattr(self, "model", None), "module") else getattr(self, "model", None)
-        return getattr(model, "cbm", None)
+        return not pc_hbm_unlabeled_enabled(self.config, epoch)
 
     def _get_model_pc_hbm(self):
         model = self.model.module if hasattr(getattr(self, "model", None), "module") else getattr(self, "model", None)
@@ -422,19 +359,6 @@ class SemiSupervisedTrainer:
 
     def _pc_hbm_active(self):
         return bool(self.pc_hbm is not None and pc_hbm_enabled(self.config))
-
-    def _maybe_save_cbm_visualizations(self, aux, batch, branch_name):
-        if not aux:
-            return
-        save_pfi_binary_visualizations_v42(
-            aux=aux,
-            batch=batch,
-            epoch=int(getattr(self, "current_epoch", 0)),
-            iteration=int(self.global_step),
-            config=self.config,
-            logger=self.logger,
-            branch_name=branch_name,
-        )
 
     def _log_module_info(self, message):
         if self._module_logging_enabled():
@@ -474,7 +398,7 @@ class SemiSupervisedTrainer:
             is_unsup=True,
         )
         self.memory_labeled_dataloader = None
-        if self.cbm is not None:
+        if self.pc_hbm is not None:
             self.memory_labeled_dataloader = prepare_labeled_memory_dataloader(
                 config=self.config,
                 labeled_indices=self.current_labeled_indices,
@@ -505,11 +429,8 @@ class SemiSupervisedTrainer:
                     'lr_scheduler': self.model_lr_scheduler.state_dict(),
                     'epoch': epoch,
                 }
-                cbm = self._get_model_cbm()
-                if cbm is not None and bool(getattr(self.config, "cbm_checkpoint_memory", True)):
-                    model_dict['cbm_memory'] = cbm.memory_state_dict()
                 pc_hbm = self._get_model_pc_hbm()
-                if pc_hbm is not None and bool(getattr(self.config, "cbm_checkpoint_memory", True)):
+                if pc_hbm is not None and bool(getattr(self.config, "pc_hbm_checkpoint_memory", True)):
                     model_dict['pc_hbm_memory'] = pc_hbm.memory_state_dict()
                 self.logger.freeze_info("[*] Saving model...")
                 torch.save(model_dict, os.path.join(self.config.ckpt_dir, 'split{}_model_{}.pth'.format(split, epoch)))

@@ -58,7 +58,7 @@ def semi_supervised_training_pipeline():
         config=config, device=device, logger=logger, writer=writer
     )
     for split in config.data_split:
-        config.cbm_labeled_split = float(split)
+        config.pc_hbm_labeled_split = float(split)
         model_lrsch = build_model_optimizers(config, logger, device, resume=args.resume)
         labeled_indices_file = config.data_split_indices_file_format.format(split)
         

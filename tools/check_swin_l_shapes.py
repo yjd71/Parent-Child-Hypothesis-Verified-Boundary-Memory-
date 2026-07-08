@@ -39,8 +39,8 @@ def main():
     cfg.lateral_channels_in_collection = [3072, 1536, 768, 384]
     cfg.cxt_num = 3
     cfg.cxt = [384, 768, 1536]
-    cfg.cbm_pfi_enable = False
     cfg.use_pc_hbm = False
+    cfg.pc_hbm_enable = False
     cfg.compile_model = False
     cfg.img_size = int(args.img_size)
 
@@ -60,7 +60,6 @@ def main():
         state2, p2, m2 = tal.decoder.forward_p2_from_p3(state, p3)
         scaled_preds, p1, z_main = tal.decoder.forward_p1_from_p2(state2, p2)
         exported = model.forward_return_pc_hbm_features(x)
-        legacy = model.extract_cbm_memory_features(x)
 
     S = int(cfg.img_size)
     _assert_shape("x1", x1, (384, S // 4, S // 4))
@@ -78,8 +77,6 @@ def main():
     for key in ("x1", "x2", "x3", "x4", "p3", "p2", "m3", "m2", "channel_spec", "input_size"):
         assert key in exported, f"forward_return_pc_hbm_features missing {key}"
     assert tuple(exported["p2"].shape) == tuple(p2.shape)
-    assert tuple(legacy["x3"].shape) == tuple(x3.shape)
-    assert tuple(legacy["p3"].shape) == tuple(p3.shape)
     print("Swin-L shape check passed.")
 
 

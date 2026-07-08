@@ -3,7 +3,7 @@ import os
 
 COMMON_CONFIG_DIR='config/base/common.py'
 MODEL_CONFIG_DIR='config/base/model.py'
-CBM_CONFIG_DIR='config/base/cbm.py'
+PC_HBM_CONFIG_DIR='config/base/pc_hbm.py'
 
 from utils import Logger
 logger = Logger(name='Config', path='/tmp/talnet_preload.log')
@@ -14,7 +14,7 @@ class Config:
         run_cfg_path = os.path.abspath(os.path.normpath(run_cfg))
         self.merge_from_file(COMMON_CONFIG_DIR)
         self.merge_from_file(MODEL_CONFIG_DIR)
-        self.merge_from_file(CBM_CONFIG_DIR)
+        self.merge_from_file(PC_HBM_CONFIG_DIR)
         self.merge_from_file(run_cfg_path)
         self.run_cfg_path = run_cfg_path
         with open(run_cfg_path, "rb") as config_file:

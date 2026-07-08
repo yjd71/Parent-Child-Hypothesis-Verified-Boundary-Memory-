@@ -8,20 +8,19 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from PC_HBM.adaptive_mixture_head import AdaptiveMixtureHead
-from PC_HBM.boundary_query_head import BoundaryQueryHead1, BoundaryQueryHead2, BoundaryQueryHead3
-from PC_HBM.child_local_encoder import ChildLocalEncoder
-from PC_HBM.child_query_builder import ChildQueryBuilder
-from PC_HBM.child_verifier_v2 import ChildVerifierV2
-from PC_HBM.engine import PCHBMEngine
-from PC_HBM.parent_retriever import ParentRetriever
-from PC_HBM.p1_pixel_refinement_attention import P1PixelRefinementAttention
-from PC_HBM.p2_boundary_retarget_attention import P2BoundaryRetargetAttention
-from PC_HBM.p3_gated_residual import P3GatedResidual
-from PC_HBM.pc_config import apply_pc_hbm_defaults
-from PC_HBM.pc_hca import PCHCA
-from PC_HBM.pc_memory import PCHBMMemory
-from PC_HBM.utils import boundary_features_from_logits
+from PC_HBM.common import boundary_features_from_logits
+from PC_HBM.core import PCHBMEngine, apply_pc_hbm_defaults
+from PC_HBM.fusion import P3GatedResidual, PCHCA
+from PC_HBM.memory import PCHBMMemory
+from PC_HBM.refinement import (
+    AdaptiveMixtureHead,
+    BoundaryQueryHead1,
+    BoundaryQueryHead2,
+    BoundaryQueryHead3,
+    P1PixelRefinementAttention,
+    P2BoundaryRetargetAttention,
+)
+from PC_HBM.retrieval import ChildLocalEncoder, ChildQueryBuilder, ChildVerifierV2, ParentRetriever
 
 
 def cfg():
