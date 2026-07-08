@@ -277,6 +277,10 @@ class PCHBMEngine(nn.Module):
             "E_attn": token_aux["E_attn"],
             "G_attn": token_aux["G_attn"],
             "G_child_attn": token_aux["G_child_attn"],
+            "M_pc_token": token_aux["M_pc_token"],
+            "M_pc_evidence": token_aux["M_pc_evidence"],
+            "M_pc_residual": token_aux["M_pc_residual"],
+            "O_pc_token": token_aux["O_pc_token"],
             "gate_pc_token": gate_pc,
             "delta3_p3": delta3,
         }

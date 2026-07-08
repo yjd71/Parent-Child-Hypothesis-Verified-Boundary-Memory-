@@ -8,6 +8,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from PC_HBM.memory import parent_values_from_region
+from PC_HBM.fusion.pc_token_decoder import PCTokenDecoder
 from PC_HBM.retrieval import ParentRetriever
 from PC_HBM.retrieval.structured_prior_bias_net import StructuredPriorBiasNet
 
@@ -72,3 +73,30 @@ def test_structured_prior_bias_net_reads_fg_from_v4_and_bg_from_v5():
     )
 
     assert out[0, 0] > out[0, 1]
+
+
+def test_pc_token_decoder_m_pc_is_evidence_margin_when_residual_zero():
+    decoder = PCTokenDecoder(dim=4)
+    q3_new = torch.zeros(2, 4)
+    attn = torch.tensor([[2.0, 1.0, 1.0], [1.0, 3.0, 0.0]])
+    values = torch.zeros(2, 3, 8)
+    values[0, 0, 0] = 1.0
+    values[0, 1, 1] = 1.0
+    values[0, 2, 2] = 1.0
+    values[1, 0, 2] = 1.0
+    values[1, 1, 3] = 1.0
+    values[1, 2, 0] = 1.0
+    parent_ret = {
+        "top_parent_values": values,
+        "top_parent_geo": torch.zeros(2, 3, 6),
+    }
+    child_ver = {"G2_child_top": torch.zeros(2, 3, 6)}
+
+    out = decoder(q3_new, attn, parent_ret, child_ver)
+    weights = attn / attn.sum(dim=1, keepdim=True)
+    e_attn = (weights.unsqueeze(-1) * values).sum(dim=1)
+    expected = e_attn[:, 0] + e_attn[:, 1] - e_attn[:, 2] - e_attn[:, 3]
+
+    torch.testing.assert_close(out["M_pc_evidence"].squeeze(1), expected)
+    torch.testing.assert_close(out["M_pc_token"].squeeze(1), expected.clamp(-1.0, 1.0))
+    assert torch.all(out["M_pc_residual"] == 0)
