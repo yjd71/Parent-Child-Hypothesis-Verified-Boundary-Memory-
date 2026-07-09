@@ -1,20 +1,22 @@
 import os
 
 # training settings
-ckpt_dir = "/home/zhangqing/YJD/SCOD/PC-HBM/works/pc_hbm_full"
+ckpt_dir = "/home/zhangqing/YJD/SCOD/PC-HBM/works/pc_hbm_full_lr_ms23_27_u18_lu05"
 
 tot_epochs = 30
 
-sup_only_train_epoch = 15
+sup_only_train_epoch = 18
 distributed_train = False
 device_map = {
     'model': '*'
 }  # Only available for non distributed training
 rand_seed = 7
 lr = 1e-4
+scheduler_type = "multistep"
+lr_decay_epochs = [23, 27]
+lr_decay_rate = 0.2
 
-# Disable BCE in the last epochs and emphasize structure-aware losses.
-IoU_finetune_last_epochs = [0, -3][1]
+IoU_finetune_last_epochs = 0
 
 # model settings
 compile_model = False
@@ -46,11 +48,11 @@ testing_sets = "TE-COD10K+TE-CAMO"
 pred_save_root = os.path.join(ckpt_dir, 'training_preds')
 
 # eval
-eval_epoch = 23
+eval_epoch = 18
 eval_step = 1
 # save model_checkpoint
 save_step = 1
-save_last = 7
+save_last = 12
 
 # PC-HBM core
 use_pc_hbm = True
@@ -71,7 +73,7 @@ warmup_epoch = 5
 parent_start_epoch = 6
 child_start_epoch = 11
 attention_refine_start_epoch = 11
-unlabeled_start_epoch = 16
+unlabeled_start_epoch = 18
 
 # PC-HBM loss weights
 lambda_final = 1.0
@@ -84,7 +86,7 @@ lambda_branch = 0.2
 lambda_quality = 0.05
 lambda_usage = 0.02
 lambda_reg = 0.05
-lambda_u = 1.0
+lambda_u = 0.5
 
 # wandb
 ModelName = 'PrototypeNet'
