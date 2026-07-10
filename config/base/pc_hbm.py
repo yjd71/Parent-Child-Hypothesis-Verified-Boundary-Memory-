@@ -71,6 +71,15 @@ PC_HBM_DEFAULTS = {
     "pc_hbm_unsup_final_consistency_weight": 0.1,
     "pc_hbm_tau_oracle": 0.5,
     "pc_hbm_checkpoint_memory": True,
+    
+    "p3_boundary_max_tokens" : 600,
+    "p2_boundary_max_tokens" : 1200,
+    "p1_boundary_max_tokens" : 2500,
+    "p3_boundary_min_tokens" : 64,
+    "p2_boundary_min_tokens" : 128,
+    "p1_boundary_min_tokens" : 256,
+
+
 }
 
 for _pc_hbm_key, _pc_hbm_value in PC_HBM_DEFAULTS.items():

@@ -60,7 +60,10 @@ class PCHBMEngine(nn.Module):
         self.geometry_dim = int(getattr(self.config, "geometry_dim", 6))
         self.memory = PCHBMMemory(self.dim, self.value_dim, self.geometry_dim, config=self.config)
         self.memory.compat_meta = self._build_memory_compat_meta()
-        self.boundary3 = BoundaryQueryHead3(top_ratio=0.25)
+        self.boundary3 = BoundaryQueryHead3(
+            top_ratio=0.25,
+            max_tokens=getattr(config, "p3_boundary_max_tokens", 600),
+                                            )
         self.router = CamouflageContextRouter(self.channel_spec.x3, dim=self.dim, top_img_k=int(getattr(self.config, "cbm_top_img_k", 32)))
         self.parent_retriever = ParentRetrieverProxy(self.channel_spec.p3, self.dim, int(getattr(self.config, "parent_topk", 64)), float(getattr(self.config, "cbm_tau_parent", 0.07)))
         self.child_query = ChildQueryBuilder(self.channel_spec.p2, dim=self.dim, window=int(getattr(self.config, "child_window_size", 5)))
@@ -78,6 +81,7 @@ class PCHBMEngine(nn.Module):
             tau=float(getattr(self.config, "cbm_tau_bra", 0.10)),
             top_ratio=float(getattr(self.config, "p2_boundary_top_ratio", 0.25)),
             detach_refs=bool(getattr(self.config, "pc_hbm_detach_refs", True)),
+            max_tokens=getattr(config, "p2_boundary_max_tokens", 1200),
         )
         self.p1_pra = P1PixelRefinementAttention(
             self.channel_spec.p1,
@@ -86,6 +90,7 @@ class PCHBMEngine(nn.Module):
             tau=float(getattr(self.config, "cbm_tau_pra", 0.10)),
             top_ratio=float(getattr(self.config, "p1_boundary_top_ratio", 0.20)),
             detach_refs=bool(getattr(self.config, "pc_hbm_detach_refs", True)),
+            max_tokens=getattr(config, "p1_boundary_max_tokens", 2500),
         )
         self.mixture = AdaptiveMixtureHead(
             r_max=float(getattr(self.config, "r_max", 2.0)),

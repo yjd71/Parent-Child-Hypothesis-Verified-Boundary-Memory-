@@ -52,19 +52,23 @@ class BoundaryQueryHead(nn.Module):
 class BoundaryQueryHead3(BoundaryQueryHead):
     """p3 boundary scorer, input ``[B,5,40,40]``."""
 
-    def __init__(self, top_ratio: float = 0.25, max_tokens: int | None = None) -> None:
-        super().__init__(5, top_ratio=top_ratio, max_tokens=max_tokens)
-
+    # def __init__(self, top_ratio: float = 0.25, max_tokens: int | None = None) -> None:
+    #     super().__init__(5, top_ratio=top_ratio, max_tokens=max_tokens)
+    def __init__(self, top_ratio=0.25, min_tokens=64, max_tokens=600):
+        super().__init__(5, top_ratio=top_ratio, min_tokens=min_tokens, max_tokens=max_tokens)
 
 class BoundaryQueryHead2(BoundaryQueryHead):
     """p2 boundary scorer, input ``[B,8,80,80]``."""
 
-    def __init__(self, top_ratio: float = 0.25, max_tokens: int | None = None) -> None:
-        super().__init__(8, top_ratio=top_ratio, max_tokens=max_tokens)
-
+    # def __init__(self, top_ratio: float = 0.25, max_tokens: int | None = None) -> None:
+    #     super().__init__(8, top_ratio=top_ratio, max_tokens=max_tokens)
+    def __init__(self, top_ratio=0.25, min_tokens=128, max_tokens=1200):
+        super().__init__(8, top_ratio=top_ratio, min_tokens=min_tokens, max_tokens=max_tokens)
 
 class BoundaryQueryHead1(BoundaryQueryHead):
     """p1 boundary scorer, input ``[B,8,160,160]``."""
 
-    def __init__(self, top_ratio: float = 0.20, max_tokens: int | None = None) -> None:
-        super().__init__(8, top_ratio=top_ratio, max_tokens=max_tokens)
+    # def __init__(self, top_ratio: float = 0.20, max_tokens: int | None = None) -> None:
+    #     super().__init__(8, top_ratio=top_ratio, max_tokens=max_tokens)
+    def __init__(self, top_ratio=0.20, min_tokens=256, max_tokens=2500):
+        super().__init__(8, top_ratio=top_ratio, min_tokens=min_tokens, max_tokens=max_tokens)

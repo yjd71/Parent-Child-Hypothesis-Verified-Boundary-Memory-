@@ -1,0 +1,326 @@
+diff --git a/config/runs/run.py b/config/runs/run.py
+index 4a38dd3..58c3b46 100644
+--- a/config/runs/run.py
++++ b/config/runs/run.py
+@@ -1,11 +1,11 @@
+ import os
+ # training settings
+ 
+-ckpt_dir = "/home/zhangqing/YJD/SCOD/PC-HBM/works/pc_hbm_full_lr_ms23_27_u18_lu05"
++ckpt_dir = "/home/zhangqing/YJD/SCOD/PC-HBM/works/pc_hbm_full_40e_two_stage_cosine_sup20_u21"
+ 
+-tot_epochs = 30
++tot_epochs = 40
+ 
+-sup_only_train_epoch = 18
++sup_only_train_epoch = 20
+ 
+ distributed_train = False
+ 
+@@ -15,13 +15,16 @@ device_map = {
+ 
+ rand_seed = 7
+ 
+-lr = 1e-4
++lr = 8e-5
+ 
+-scheduler_type = "multistep"
+-
+-lr_decay_epochs = [23, 27]
+-
+-lr_decay_rate = 0.2
++# Two-stage cosine schedule aligned with the supervised-only boundary:
++#   stage 1: epoch <= sup_only_train_epoch
++#   stage 2: epoch >  sup_only_train_epoch
++scheduler_type = "two_stage_cosine"
++scheduler_stage1_lr = 8e-5
++scheduler_stage1_eta_min = 2e-5
++scheduler_stage2_lr = 3e-5
++scheduler_stage2_eta_min = 1e-6
+ 
+ IoU_finetune_last_epochs = 0
+ # model settings
+@@ -115,7 +118,7 @@ child_start_epoch = 11
+ 
+ attention_refine_start_epoch = 11
+ 
+-unlabeled_start_epoch = 18
++unlabeled_start_epoch = sup_only_train_epoch + 1
+ 
+ # PC-HBM loss weights
+ 
+diff --git a/engine/solver.py b/engine/solver.py
+index 1b09698..40593d3 100644
+--- a/engine/solver.py
++++ b/engine/solver.py
+@@ -1,11 +1,15 @@
+ class SemiSupervisedTrainer:
+     def _unlabeled_enabled(self, epoch):
+-        return epoch >= self.config.sup_only_train_epoch
++        return int(epoch) > int(self.config.sup_only_train_epoch)
+ 
+     def _pc_hbm_unlabeled_enabled(self, epoch):
+-        return bool(self.pc_hbm is not None and pc_hbm_unlabeled_enabled(self.config, epoch))
++        return bool(
++            self.pc_hbm is not None
++            and int(epoch) > int(self.config.sup_only_train_epoch)
++            and pc_hbm_unlabeled_enabled(self.config, epoch)
++        )
+ 
+     def _sync_teacher_this_epoch(self, epoch):
+         if self.pc_hbm is None:
+-            return epoch < self.config.sup_only_train_epoch
+-        return not pc_hbm_unlabeled_enabled(self.config, epoch)
++            return int(epoch) <= int(self.config.sup_only_train_epoch)
++        return not self._pc_hbm_unlabeled_enabled(epoch)
+diff --git a/models/build_model.py b/models/build_model.py
+index 63e8b43..6684bc4 100644
+--- a/models/build_model.py
++++ b/models/build_model.py
+@@ -8,6 +8,7 @@ from utils import Logger
+ from PC_HBM import build_pc_hbm, pc_hbm_enabled
+ from config import Config
+ 
++from .lr_scheduler import TwoStageCosineLR
+ from .talnet import ModelEMA
+ from .sinet import SINet_ResNet50
+ from .sinetv2 import SINet_v2
+@@ -17,6 +18,28 @@ from .fspnet import FSPNet
+ def _build_lr_scheduler(config: Config, optimizer: optim.Optimizer):
+     scheduler_type = str(getattr(config, "scheduler_type", "multistep")).strip().lower()
+ 
++    if scheduler_type in (
++        "two_stage_cosine",
++        "two-stage-cosine",
++        "two_stage_cosine_annealing",
++    ):
++        total_epochs = int(getattr(config, "tot_epochs", 1))
++        sup_only_train_epoch = int(getattr(config, "sup_only_train_epoch", 0))
++        stage1_lr = getattr(config, "scheduler_stage1_lr", getattr(config, "lr", 1e-4))
++        stage1_eta_min = getattr(config, "scheduler_stage1_eta_min", 0.0)
++        stage2_lr = getattr(config, "scheduler_stage2_lr", stage1_eta_min)
++        stage2_eta_min = getattr(config, "scheduler_stage2_eta_min", 0.0)
++
++        return TwoStageCosineLR(
++            optimizer,
++            total_epochs=total_epochs,
++            sup_only_train_epoch=sup_only_train_epoch,
++            stage1_lr=stage1_lr,
++            stage1_eta_min=stage1_eta_min,
++            stage2_lr=stage2_lr,
++            stage2_eta_min=stage2_eta_min,
++        )
++
+     if scheduler_type in ("cosine", "cosineannealing", "cosine_annealing"):
+         total_epochs = int(getattr(config, "scheduler_t_max", getattr(config, "tot_epochs", 1)))
+         warmup_epochs = max(0, int(getattr(config, "scheduler_warmup_epochs", 0)))
+diff --git a/models/lr_scheduler.py b/models/lr_scheduler.py
+new file mode 100644
+index 0000000..b53e693
+--- /dev/null
++++ b/models/lr_scheduler.py
+@@ -0,0 +1,115 @@
++"""Learning-rate schedulers used by the training entry points."""
++
++from __future__ import annotations
++
++import math
++from collections.abc import Sequence
++
++import torch
++
++
++class TwoStageCosineLR(torch.optim.lr_scheduler._LRScheduler):
++    """Two cosine phases split by ``sup_only_train_epoch``.
++
++    The repository trains epochs with inclusive indices ``0..tot_epochs``.
++    Therefore phase 1 covers ``epoch <= sup_only_train_epoch`` and phase 2
++    starts at ``sup_only_train_epoch + 1``. ``scheduler.step()`` is called at
++    the end of every epoch, so the learning rate produced after epoch ``e``
++    is the rate used by epoch ``e + 1``.
++
++    A small phase-2 restart is intentional: it gives the newly enabled
++    semi-supervised objective room to adapt without returning to the high
++    supervised-phase learning rate.
++    """
++
++    def __init__(
++        self,
++        optimizer: torch.optim.Optimizer,
++        *,
++        total_epochs: int,
++        sup_only_train_epoch: int,
++        stage1_lr: float | Sequence[float],
++        stage1_eta_min: float | Sequence[float],
++        stage2_lr: float | Sequence[float],
++        stage2_eta_min: float | Sequence[float],
++        last_epoch: int = -1,
++    ) -> None:
++        self.total_epochs = int(total_epochs)
++        self.sup_only_train_epoch = int(sup_only_train_epoch)
++
++        if self.total_epochs < 1:
++            raise ValueError("total_epochs must be >= 1")
++        if not 0 <= self.sup_only_train_epoch < self.total_epochs:
++            raise ValueError(
++                "sup_only_train_epoch must satisfy "
++                "0 <= sup_only_train_epoch < total_epochs"
++            )
++
++        num_groups = len(optimizer.param_groups)
++        self.stage1_lrs = self._expand(stage1_lr, num_groups, "stage1_lr")
++        self.stage1_eta_mins = self._expand(
++            stage1_eta_min, num_groups, "stage1_eta_min"
++        )
++        self.stage2_lrs = self._expand(stage2_lr, num_groups, "stage2_lr")
++        self.stage2_eta_mins = self._expand(
++            stage2_eta_min, num_groups, "stage2_eta_min"
++        )
++
++        for stage_name, starts, ends in (
++            ("stage1", self.stage1_lrs, self.stage1_eta_mins),
++            ("stage2", self.stage2_lrs, self.stage2_eta_mins),
++        ):
++            for start, end in zip(starts, ends):
++                if start <= 0.0 or end < 0.0 or end > start:
++                    raise ValueError(
++                        f"{stage_name} requires 0 <= eta_min <= start_lr"
++                    )
++
++        # Make the optimizer and scheduler agree on the LR used by epoch 0.
++        for group, lr in zip(optimizer.param_groups, self.stage1_lrs):
++            group["lr"] = lr
++
++        super().__init__(optimizer, last_epoch=last_epoch)
++
++    @staticmethod
++    def _expand(
++        value: float | Sequence[float],
++        num_groups: int,
++        name: str,
++    ) -> list[float]:
++        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
++            if len(value) != num_groups:
++                raise ValueError(
++                    f"{name} must contain one value per optimizer group "
++                    f"({num_groups} expected, got {len(value)})"
++                )
++            return [float(item) for item in value]
++        return [float(value)] * num_groups
++
++    @staticmethod
++    def _cosine(start: float, end: float, progress: float) -> float:
++        progress = min(max(float(progress), 0.0), 1.0)
++        return end + 0.5 * (start - end) * (
++            1.0 + math.cos(math.pi * progress)
++        )
++
++    def get_lr(self) -> list[float]:
++        # Clamp the extra step executed after the last training epoch.
++        epoch = min(max(int(self.last_epoch), 0), self.total_epochs)
++
++        if epoch <= self.sup_only_train_epoch:
++            denominator = max(1, self.sup_only_train_epoch)
++            progress = epoch / denominator
++            starts = self.stage1_lrs
++            ends = self.stage1_eta_mins
++        else:
++            stage2_start_epoch = self.sup_only_train_epoch + 1
++            denominator = max(1, self.total_epochs - stage2_start_epoch)
++            progress = (epoch - stage2_start_epoch) / denominator
++            starts = self.stage2_lrs
++            ends = self.stage2_eta_mins
++
++        return [
++            self._cosine(start, end, progress)
++            for start, end in zip(starts, ends)
++        ]
+diff --git a/tests/test_two_stage_cosine_scheduler.py b/tests/test_two_stage_cosine_scheduler.py
+new file mode 100644
+index 0000000..e470291
+--- /dev/null
++++ b/tests/test_two_stage_cosine_scheduler.py
+@@ -0,0 +1,83 @@
++import os
++import sys
++
++import pytest
++import torch
++
++REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
++if REPO_ROOT not in sys.path:
++    sys.path.insert(0, REPO_ROOT)
++
++from models.lr_scheduler import TwoStageCosineLR
++
++
++def _build_scheduler():
++    parameter = torch.nn.Parameter(torch.ones(()))
++    optimizer = torch.optim.Adam([parameter], lr=8e-5)
++    scheduler = TwoStageCosineLR(
++        optimizer,
++        total_epochs=40,
++        sup_only_train_epoch=20,
++        stage1_lr=8e-5,
++        stage1_eta_min=2e-5,
++        stage2_lr=3e-5,
++        stage2_eta_min=1e-6,
++    )
++    return parameter, optimizer, scheduler
++
++
++def _collect_epoch_lrs(optimizer, scheduler, total_epochs):
++    lrs = [optimizer.param_groups[0]["lr"]]
++    for _ in range(total_epochs):
++        optimizer.step()
++        scheduler.step()
++        lrs.append(optimizer.param_groups[0]["lr"])
++    return lrs
++
++
++def test_two_stage_cosine_lr_boundaries_and_monotonicity():
++    _, optimizer, scheduler = _build_scheduler()
++    lrs = _collect_epoch_lrs(optimizer, scheduler, total_epochs=40)
++
++    assert len(lrs) == 41  # repository epoch indices are 0..40
++    assert lrs[0] == pytest.approx(8e-5)
++    assert lrs[20] == pytest.approx(2e-5)
++    assert lrs[21] == pytest.approx(3e-5)
++    assert lrs[40] == pytest.approx(1e-6)
++
++    assert all(lrs[idx] >= lrs[idx + 1] for idx in range(0, 20))
++    assert all(lrs[idx] >= lrs[idx + 1] for idx in range(21, 40))
++
++
++def test_two_stage_cosine_lr_state_dict_resume():
++    parameter, optimizer, scheduler = _build_scheduler()
++    for _ in range(25):
++        optimizer.step()
++        scheduler.step()
++
++    optimizer_state = optimizer.state_dict()
++    scheduler_state = scheduler.state_dict()
++
++    resumed_parameter = torch.nn.Parameter(torch.ones(()))
++    resumed_optimizer = torch.optim.Adam([resumed_parameter], lr=8e-5)
++    resumed_scheduler = TwoStageCosineLR(
++        resumed_optimizer,
++        total_epochs=40,
++        sup_only_train_epoch=20,
++        stage1_lr=8e-5,
++        stage1_eta_min=2e-5,
++        stage2_lr=3e-5,
++        stage2_eta_min=1e-6,
++    )
++    resumed_optimizer.load_state_dict(optimizer_state)
++    resumed_scheduler.load_state_dict(scheduler_state)
++
++    optimizer.step()
++    scheduler.step()
++    resumed_optimizer.step()
++    resumed_scheduler.step()
++
++    assert resumed_scheduler.last_epoch == scheduler.last_epoch
++    assert resumed_optimizer.param_groups[0]["lr"] == pytest.approx(
++        optimizer.param_groups[0]["lr"]
++    )
