@@ -47,13 +47,25 @@ class P1LocalStructuredPrior(nn.Module):
 class P1PixelRefinementAttention(nn.Module):
     """Retarget p2 refs to p1 tokens with local attention."""
 
-    def __init__(self, p1_ch: int, dim: int = 512, window: int = 3, tau: float = 0.10, top_ratio: float = 0.20, detach_refs: bool = True) -> None:
+    def __init__(
+        self,
+        p1_ch: int,
+        dim: int = 512,
+        window: int = 3,
+        tau: float = 0.10,
+        top_ratio: float = 0.20,
+        detach_refs: bool = True,
+        max_tokens: int | None = 2500,
+    ) -> None:
         super().__init__()
         self.dim = int(dim)
         self.window = int(window)
         self.tau = float(tau)
         self.detach_refs = bool(detach_refs)
-        self.boundary_head = BoundaryQueryHead1(top_ratio=top_ratio)
+        self.boundary_head = BoundaryQueryHead1(
+            top_ratio=top_ratio,
+            max_tokens=max_tokens,
+        )
         self.query_encoder = nn.Conv2d(int(p1_ch), self.dim, kernel_size=1, bias=False)
         self.ref_encoder = nn.Sequential(
             nn.Conv2d(self.dim + 1 + 1 + 2 + 1, self.dim, kernel_size=1),
