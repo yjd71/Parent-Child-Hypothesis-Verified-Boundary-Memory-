@@ -86,8 +86,12 @@ lambda_usage = 0.02
 lambda_reg = 0.05
 lambda_u = 1.0
 use_hard_teacher_loss = True
-hard_teacher_loss_weight = 2.0
+hard_teacher_loss_weight = 1.0
 hard_teacher_threshold = 0.5
+hard_teacher_foreground_threshold = 0.7
+hard_teacher_background_threshold = 0.3
+hard_teacher_confidence_threshold = 0.25
+hard_teacher_rampup_epochs = 3
 use_soft_teacher_weighted_iou = True
 soft_teacher_weighted_iou_weight = 0.25
 

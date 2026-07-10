@@ -54,7 +54,41 @@ def _build_hard_teacher_target(
     return (pseudo_prob.detach() > float(threshold)).to(dtype=dtype)
 
 
-def _rsbl_hard_structure_loss(logits: torch.Tensor, hard_target: torch.Tensor) -> torch.Tensor:
+def _build_hard_teacher_valid_mask(
+    pseudo_prob: torch.Tensor,
+    confidence: torch.Tensor,
+    background_threshold: float,
+    foreground_threshold: float,
+    confidence_threshold: float,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return reliable foreground/background pixels; ambiguous pixels are ignored."""
+
+    probability_valid = (pseudo_prob.detach() >= float(foreground_threshold)) | (
+        pseudo_prob.detach() <= float(background_threshold)
+    )
+    confidence_valid = confidence.detach() >= float(confidence_threshold)
+    return (probability_valid & confidence_valid).to(dtype=dtype)
+
+
+def _teacher_edge_weight(target: torch.Tensor) -> torch.Tensor:
+    """RSBL-style boundary weight without artificial zero-padding borders."""
+
+    local_mean = F.avg_pool2d(
+        target,
+        kernel_size=31,
+        stride=1,
+        padding=15,
+        count_include_pad=False,
+    )
+    return 1.0 + 5.0 * torch.abs(local_mean - target)
+
+
+def _rsbl_hard_structure_loss(
+    logits: torch.Tensor,
+    hard_target: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     """RSBL/F3Net structure loss for one student logit and a hard target.
 
     Samples whose hard target is entirely background are excluded exactly as in
@@ -62,17 +96,22 @@ def _rsbl_hard_structure_loss(logits: torch.Tensor, hard_target: torch.Tensor) -
     ``logits``.
     """
 
-    valid = hard_target.sum(dim=(1, 2, 3)) > 0
-    if not torch.any(valid):
+    hard_target = hard_target.to(dtype=logits.dtype)
+    if valid_mask is None:
+        valid_mask = torch.ones_like(hard_target)
+    else:
+        valid_mask = valid_mask.to(device=logits.device, dtype=logits.dtype)
+
+    valid_samples = (hard_target * valid_mask).sum(dim=(1, 2, 3)) > 0
+    if not torch.any(valid_samples):
         return zero_like_loss(logits)
 
-    logits = logits[valid]
-    hard_target = hard_target[valid].to(dtype=logits.dtype)
-    weight = 1.0 + 5.0 * torch.abs(
-        F.avg_pool2d(hard_target, kernel_size=31, stride=1, padding=15) - hard_target
-    )
+    logits = logits[valid_samples]
+    hard_target = hard_target[valid_samples]
+    valid_mask = valid_mask[valid_samples]
+    weight = valid_mask * _teacher_edge_weight(hard_target)
     weighted_bce = F.binary_cross_entropy_with_logits(logits, hard_target, reduction="none")
-    weighted_bce = (weight * weighted_bce).sum(dim=(2, 3)) / weight.sum(dim=(2, 3))
+    weighted_bce = (weight * weighted_bce).sum(dim=(2, 3)) / weight.sum(dim=(2, 3)).clamp_min(1.0)
 
     probability = torch.sigmoid(logits)
     intersection = ((probability * hard_target) * weight).sum(dim=(2, 3))
@@ -86,16 +125,51 @@ def _confidence_aware_soft_weighted_iou_loss(
     soft_target: torch.Tensor,
     confidence: torch.Tensor,
 ) -> torch.Tensor:
-    """Confidence-weighted soft IoU with RSBL-style boundary emphasis."""
+    """Probability-preserving soft IoU with spatial and sample confidence."""
 
-    edge_weight = 1.0 + 5.0 * torch.abs(
-        F.avg_pool2d(soft_target, kernel_size=31, stride=1, padding=15) - soft_target
-    )
-    weight = confidence * edge_weight
+    sample_confidence = confidence.mean(dim=(1, 2, 3))
+    valid_samples = sample_confidence > 0
+    if not torch.any(valid_samples):
+        return zero_like_loss(logits)
+
+    logits = logits[valid_samples]
+    soft_target = soft_target[valid_samples]
+    confidence = confidence[valid_samples]
+    sample_confidence = sample_confidence[valid_samples]
+    weight = confidence * _teacher_edge_weight(soft_target)
     probability = torch.sigmoid(logits)
     intersection = ((probability * soft_target) * weight).sum(dim=(2, 3))
-    union = ((probability + soft_target - probability * soft_target) * weight).sum(dim=(2, 3))
-    return (1.0 - (intersection + 1.0) / (union + 1.0)).mean()
+    union = (
+        (probability.square() + soft_target.square() - probability * soft_target) * weight
+    ).sum(dim=(2, 3))
+    per_sample_loss = (1.0 - (intersection + 1.0) / (union + 1.0)).mean(dim=1)
+    return (per_sample_loss * sample_confidence).sum() / sample_confidence.sum().clamp_min(1e-6)
+
+
+def _hard_teacher_ramp_factor(config: Any, epoch: int | None) -> float:
+    """Linear hard-loss ramp; missing epoch preserves the full legacy weight."""
+
+    rampup_epochs = int(getattr(config, "hard_teacher_rampup_epochs", 3))
+    if epoch is None or rampup_epochs <= 0:
+        return 1.0
+    start_epoch = int(getattr(config, "unlabeled_start_epoch", 16))
+    progress = (int(epoch) - start_epoch + 1) / float(rampup_epochs)
+    return min(max(progress, 0.0), 1.0)
+
+
+def _validate_hard_teacher_thresholds(
+    background_threshold: float,
+    hard_threshold: float,
+    foreground_threshold: float,
+    confidence_threshold: float,
+) -> None:
+    if not 0.0 <= background_threshold < hard_threshold < foreground_threshold <= 1.0:
+        raise ValueError(
+            "hard teacher thresholds must satisfy "
+            "0 <= background < hard < foreground <= 1"
+        )
+    if not 0.0 <= confidence_threshold <= 1.0:
+        raise ValueError("hard_teacher_confidence_threshold must be in [0, 1]")
 
 
 def compute_pc_hbm_labeled_loss(outputs, aux: Dict[str, Any] | None, gt: torch.Tensor, config: Any) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -167,7 +241,13 @@ def compute_pc_hbm_labeled_loss(outputs, aux: Dict[str, Any] | None, gt: torch.T
     return total, log
 
 
-def compute_pc_hbm_unlabeled_loss(student_aux: Dict[str, Any], pseudo_prob: torch.Tensor, confidence: torch.Tensor, config: Any) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+def compute_pc_hbm_unlabeled_loss(
+    student_aux: Dict[str, Any],
+    pseudo_prob: torch.Tensor,
+    confidence: torch.Tensor,
+    config: Any,
+    epoch: int | None = None,
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Stage-4 soft and hard teacher loss on student z_nomix/z_main."""
 
     z_student = student_aux.get("z_nomix", student_aux.get("z_main"))
@@ -185,6 +265,8 @@ def compute_pc_hbm_unlabeled_loss(student_aux: Dict[str, Any], pseudo_prob: torc
     soft_weighted_iou_weight = float(getattr(config, "soft_teacher_weighted_iou_weight", 0.25))
     use_soft_weighted_iou = bool(getattr(config, "use_soft_teacher_weighted_iou", True))
     if use_soft_weighted_iou and soft_weighted_iou_weight > 0.0:
+        soft_iou_valid_samples = confidence.mean(dim=(1, 2, 3)) > 0
+        soft_teacher_iou_valid_sample_ratio = soft_iou_valid_samples.to(dtype=z_student.dtype).mean()
         soft_teacher_weighted_iou = _confidence_aware_soft_weighted_iou_loss(
             z_student,
             pseudo_prob,
@@ -192,6 +274,7 @@ def compute_pc_hbm_unlabeled_loss(student_aux: Dict[str, Any], pseudo_prob: torc
         )
     else:
         soft_teacher_weighted_iou = z_student.detach().new_zeros(())
+        soft_teacher_iou_valid_sample_ratio = z_student.detach().new_zeros(())
     soft_teacher_loss = soft_teacher_bce + soft_weighted_iou_weight * soft_teacher_weighted_iou
     final_weight = float(getattr(config, "pc_hbm_unsup_final_consistency_weight", 0.1))
     if bool(student_aux.get("mixture_skipped", False)) or str(student_aux.get("forward_mode", "")) == "student_core":
@@ -203,22 +286,54 @@ def compute_pc_hbm_unlabeled_loss(student_aux: Dict[str, Any], pseudo_prob: torc
         soft_teacher_loss = soft_teacher_loss + final_weight * (final_bce * high).sum() / high.sum().clamp_min(1.0)
 
     lambda_u = float(getattr(config, "lambda_u", 1.0))
-    hard_weight = float(getattr(config, "hard_teacher_loss_weight", 2.0))
+    hard_weight = float(getattr(config, "hard_teacher_loss_weight", 1.0))
+    hard_ramp_factor = _hard_teacher_ramp_factor(config, epoch)
     use_hard_teacher_loss = bool(getattr(config, "use_hard_teacher_loss", True))
-    if use_hard_teacher_loss and hard_weight > 0.0:
+    effective_hard_weight = max(hard_weight * hard_ramp_factor, 0.0) if use_hard_teacher_loss else 0.0
+    if effective_hard_weight > 0.0:
         hard_threshold = float(getattr(config, "hard_teacher_threshold", 0.5))
+        foreground_threshold = float(getattr(config, "hard_teacher_foreground_threshold", 0.7))
+        background_threshold = float(getattr(config, "hard_teacher_background_threshold", 0.3))
+        confidence_threshold = float(getattr(config, "hard_teacher_confidence_threshold", 0.25))
+        _validate_hard_teacher_thresholds(
+            background_threshold,
+            hard_threshold,
+            foreground_threshold,
+            confidence_threshold,
+        )
         hard_target = _build_hard_teacher_target(pseudo_prob, hard_threshold, z_student.dtype)
-        hard_teacher_loss = _rsbl_hard_structure_loss(z_student, hard_target)
-        loss_u_total = lambda_u * soft_teacher_loss + hard_weight * hard_teacher_loss
+        hard_valid_mask = _build_hard_teacher_valid_mask(
+            pseudo_prob,
+            confidence,
+            background_threshold,
+            foreground_threshold,
+            confidence_threshold,
+            z_student.dtype,
+        )
+        hard_valid_samples = (hard_target * hard_valid_mask).sum(dim=(1, 2, 3)) > 0
+        hard_teacher_valid_pixel_ratio = hard_valid_mask.mean()
+        hard_teacher_valid_sample_ratio = hard_valid_samples.to(dtype=z_student.dtype).mean()
+        hard_teacher_loss = _rsbl_hard_structure_loss(z_student, hard_target, hard_valid_mask)
+        hard_teacher_weighted_loss = effective_hard_weight * hard_teacher_loss
+        loss_u_total = lambda_u * soft_teacher_loss + hard_teacher_weighted_loss
     else:
         hard_teacher_loss = z_student.detach().new_zeros(())
+        hard_teacher_weighted_loss = z_student.detach().new_zeros(())
+        hard_teacher_valid_pixel_ratio = z_student.detach().new_zeros(())
+        hard_teacher_valid_sample_ratio = z_student.detach().new_zeros(())
         loss_u_total = lambda_u * soft_teacher_loss
     log = {
         "L_u": soft_teacher_loss.detach(),
         "soft_teacher_loss": soft_teacher_loss.detach(),
         "soft_teacher_bce": soft_teacher_bce.detach(),
         "soft_teacher_weighted_iou": soft_teacher_weighted_iou.detach(),
+        "soft_teacher_iou_valid_sample_ratio": soft_teacher_iou_valid_sample_ratio.detach(),
         "hard_teacher_loss": hard_teacher_loss.detach(),
+        "hard_teacher_ramp_factor": z_student.new_tensor(hard_ramp_factor).detach(),
+        "hard_teacher_effective_weight": z_student.new_tensor(effective_hard_weight).detach(),
+        "hard_teacher_weighted_loss": hard_teacher_weighted_loss.detach(),
+        "hard_teacher_valid_pixel_ratio": hard_teacher_valid_pixel_ratio.detach(),
+        "hard_teacher_valid_sample_ratio": hard_teacher_valid_sample_ratio.detach(),
         "loss_u_total": loss_u_total.detach(),
         "pseudo_conf_mean": confidence.mean().detach(),
     }

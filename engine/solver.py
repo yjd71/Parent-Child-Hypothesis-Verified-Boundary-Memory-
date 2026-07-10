@@ -291,7 +291,13 @@ class SemiSupervisedTrainer:
             return_debug_aux=False,
             store_last_aux=False,
         )
-        loss_u, log = compute_pc_hbm_unlabeled_loss(student_aux, pseudo_s, conf_s, self.config)
+        loss_u, log = compute_pc_hbm_unlabeled_loss(
+            student_aux,
+            pseudo_s,
+            conf_s,
+            self.config,
+            epoch=getattr(self, "current_epoch", None),
+        )
         self.loss_dict["loss_pix"] = loss_u.item()
         for key, value in log.items():
             self.loss_dict[key] = float(value.detach().item())

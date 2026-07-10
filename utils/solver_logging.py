@@ -32,7 +32,13 @@ _PC_HBM_METRIC_KEYS = {
     "soft_teacher_loss",
     "soft_teacher_bce",
     "soft_teacher_weighted_iou",
+    "soft_teacher_iou_valid_sample_ratio",
     "hard_teacher_loss",
+    "hard_teacher_ramp_factor",
+    "hard_teacher_effective_weight",
+    "hard_teacher_weighted_loss",
+    "hard_teacher_valid_pixel_ratio",
+    "hard_teacher_valid_sample_ratio",
     "loss_u_total",
 }
 
