@@ -1,22 +1,28 @@
 import os
 
 # training settings
-ckpt_dir = "/home/zhangqing/YJD/Prototype_final/CBM-PFI_withoutSAM_onePrompt/works/pc_hbm_full_384"
+ckpt_dir = "/home/zhangqing/YJD/SCOD/PC-HBM/works/pc_hbm_40e_two_stage_cosine_s20"
 
-tot_epochs = 30
+tot_epochs = 40
 
-sup_only_train_epoch = 18
+sup_only_train_epoch = 20
 distributed_train = False
 device_map = {
     'model': '*'
 }  # Only available for non distributed training
 rand_seed = 7
 lr = 1e-4
-scheduler_type = "multistep"
-lr_decay_epochs = [23, 27]
-lr_decay_rate = 0.2
+scheduler_type = "two_stage_cosine"
+stage1_initial_lr = 1e-4
+stage1_min_lr = 1e-7
+stage2_initial_lr = 1e-4
+stage2_min_lr = 1e-7
+preserve_optimizer_state_across_stages = True
+reset_optimizer_at_stage2 = False
+require_lr_stage_match_unlabeled_stage = True
+save_stage_boundary = True
 
-IoU_finetune_last_epochs = [0, -3][1]
+IoU_finetune_last_epochs = 0
 
 # model settings
 compile_model = False
@@ -49,11 +55,11 @@ testing_sets = "TE-CAMO+CHAMELEON"
 pred_save_root = os.path.join(ckpt_dir, 'training_preds')
 
 # eval
-eval_epoch = 1
+eval_epoch = 18
 eval_step = 1
 # save model_checkpoint
 save_step = 1
-save_last = 13
+save_last = 12
 
 # PC-HBM core
 use_pc_hbm = True
@@ -74,7 +80,7 @@ warmup_epoch = 5
 parent_start_epoch = 6
 child_start_epoch = 11
 attention_refine_start_epoch = 11
-unlabeled_start_epoch = 18
+unlabeled_start_epoch = 20
 
 # PC-HBM loss weights
 lambda_final = 1.0

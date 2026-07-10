@@ -20,6 +20,11 @@ from .loss import PixLoss
 from .evaluator import Evaluator
 
 
+def training_epoch_range(epoch_st, total_epochs):
+    """Return the strict 0-based, end-exclusive training epoch range."""
+    return range(int(epoch_st), int(total_epochs))
+
+
 class SemiSupervisedTrainer:
     def __init__(self, data_loaders, config, device, logger=None, writer=None):
         self.train_loader, self.test_loaders = data_loaders
@@ -121,7 +126,8 @@ class SemiSupervisedTrainer:
         enable_pc_hbm_loss = self._pc_hbm_active() and use_memory
         enable_unsup = self._pc_hbm_unlabeled_enabled(epoch) if self._pc_hbm_active() else self._unlabeled_enabled(epoch)
 
-        if epoch > total_epochs + self.config.IoU_finetune_last_epochs:
+        iou_finetune_offset = int(self.config.IoU_finetune_last_epochs)
+        if iou_finetune_offset < 0 and epoch >= total_epochs + iou_finetune_offset:
             self.pix_loss.lambdas_pix_last['bce'] *= 0
             self.pix_loss.lambdas_pix_last['ssim'] *= 1
             self.pix_loss.lambdas_pix_last['iou'] *= 0.5
@@ -397,6 +403,76 @@ class SemiSupervisedTrainer:
         epoch = int(epoch)
         return eval_step > 0 and epoch >= eval_start and (epoch - eval_start) % eval_step == 0
 
+    def _reset_optimizer_for_stage2(self, epoch):
+        split_epoch = int(getattr(self.config, "sup_only_train_epoch", -1))
+        if epoch != split_epoch or not bool(
+            getattr(self.config, "reset_optimizer_at_stage2", False)
+        ):
+            return False
+
+        from models.build_model import _build_lr_scheduler, _build_optimizer
+
+        self.model_optimizer = _build_optimizer(
+            self.config,
+            self.model,
+            lr=float(self.config.stage2_initial_lr),
+        )
+        self.model_lr_scheduler = _build_lr_scheduler(
+            self.config,
+            self.model_optimizer,
+        )
+        return True
+
+    def _step_lr_before_epoch(self, epoch):
+        previous_lr = float(self.model_optimizer.param_groups[0]["lr"])
+        optimizer_was_reset = self._reset_optimizer_for_stage2(epoch)
+        step_epoch = getattr(self.model_lr_scheduler, "step_epoch", None)
+        if not callable(step_epoch):
+            return
+
+        step_epoch(epoch)
+        current_lr = float(self.model_optimizer.param_groups[0]["lr"])
+        current_stage = int(self.model_lr_scheduler.current_stage)
+        if epoch == int(self.config.sup_only_train_epoch):
+            self.logger.key_info(
+                "[*] Two-stage cosine restart: "
+                f"epoch={epoch}, previous_lr={previous_lr:.3e}, "
+                f"restart_lr={current_lr:.3e}, "
+                f"optimizer_state_preserved={not optimizer_was_reset}"
+            )
+        self.logger.key_info(
+            f"[*] LR before epoch: epoch={epoch}, stage={current_stage}, lr={current_lr:.3e}"
+        )
+
+    def _should_save_checkpoint(self, epoch, total_epochs):
+        save_step = int(getattr(self.config, "save_step", 0))
+        save_last = int(getattr(self.config, "save_last", 0))
+        regular_save = (
+            save_step > 0
+            and epoch >= total_epochs - save_last
+            and epoch % save_step == 0
+        )
+        split_epoch = int(getattr(self.config, "sup_only_train_epoch", -1))
+        boundary_save = bool(getattr(self.config, "save_stage_boundary", False)) and epoch in {
+            split_epoch - 1,
+            split_epoch,
+        }
+        return regular_save or boundary_save
+
+    def _lr_schedule_meta(self, total_epochs):
+        active_stage = getattr(self.model_lr_scheduler, "current_stage", 0)
+        return {
+            "scheduler_type": str(getattr(self.config, "scheduler_type", "multistep")),
+            "tot_epochs": int(getattr(self.config, "tot_epochs", total_epochs)),
+            "sup_only_train_epoch": int(
+                getattr(self.config, "sup_only_train_epoch", -1)
+            ),
+            "active_stage": int(active_stage),
+            "current_lr": [
+                float(group["lr"]) for group in self.model_optimizer.param_groups
+            ],
+        }
+
     def launch_train(self, split, total_epochs: int):
         self.labeled_dataloader = prepare_dataloader(
             dataset=self.train_loader.dataset,
@@ -426,20 +502,21 @@ class SemiSupervisedTrainer:
             "The lenth between labeled_dataloader and unlabeled_dataloader is not equal!"
         )
 
-        for epoch in range(self.epoch_st, total_epochs + 1):
+        for epoch in training_epoch_range(self.epoch_st, total_epochs):
             if self.config.distributed_train:
                 self.unlabeled_dataloader.sampler.set_epoch(epoch)
                 self.labeled_dataloader.sampler.set_epoch(epoch)
+            self._step_lr_before_epoch(epoch)
             self.train_epoch(epoch, total_epochs)
             self.logger.success_info("[*] Epoch {} done.".format(epoch))
             self.logger.key_info("[*] Training Loss: {:.3f}".format(self.loss_log.avg))
-            self.model_lr_scheduler.step()
+            if not callable(getattr(self.model_lr_scheduler, "step_epoch", None)):
+                self.model_lr_scheduler.step()
             current_lr = self.model_optimizer.param_groups[0]["lr"]
             self.logger.key_info("[*] Current LR: {:.3e}".format(current_lr))
 
             if (
-                epoch >= total_epochs - self.config.save_last
-                and epoch % self.config.save_step == 0
+                self._should_save_checkpoint(epoch, total_epochs)
                 and ((not self.config.distributed_train) or torch.distributed.get_rank() == 0)
             ):
                 model_dict = {
@@ -447,6 +524,7 @@ class SemiSupervisedTrainer:
                     'optimizer': self.model_optimizer.state_dict(),
                     'lr_scheduler': self.model_lr_scheduler.state_dict(),
                     'epoch': epoch,
+                    'lr_schedule_meta': self._lr_schedule_meta(total_epochs),
                 }
                 pc_hbm = self._get_model_pc_hbm()
                 if pc_hbm is not None and bool(getattr(self.config, "pc_hbm_checkpoint_memory", True)):
@@ -459,7 +537,7 @@ class SemiSupervisedTrainer:
                 torch.distributed.barrier()
             if self._should_evaluate_epoch(epoch):
                 if (self.config.distributed_train and get_rank() == 0) or (not self.config.distributed_train):
-                    self.evaluate_online(epoch, is_last=(epoch == total_epochs))
+                    self.evaluate_online(epoch, is_last=(epoch == total_epochs - 1))
 
     def evaluate_online(self, epoch, is_last=False):
         if self.config.distributed_train and get_rank() != 0:

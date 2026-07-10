@@ -5,6 +5,7 @@ import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from utils import Logger
+from utils.two_stage_cosine_lr import TwoStageCosineLR
 from PC_HBM import build_pc_hbm, pc_hbm_enabled
 from config import Config
 from .talnet import ModelEMA
@@ -122,8 +123,73 @@ def _load_pc_hbm_memory_from_checkpoint(pc_hbm, checkpoint, config: Config, devi
         _log(logger, ("warn_info", "warning", "info"), f"[!] Failed to restore PC-HBM memory: {exc}. Fallback to baseline.")
 
 
+_TWO_STAGE_COSINE_NAMES = (
+    "two_stage_cosine",
+    "two-stage-cosine",
+    "two_stage_cosine_restart",
+)
+
+
+def _is_two_stage_cosine(config: Config) -> bool:
+    scheduler_type = str(getattr(config, "scheduler_type", "multistep")).strip().lower()
+    return scheduler_type in _TWO_STAGE_COSINE_NAMES
+
+
+def _build_optimizer(
+    config: Config,
+    model: torch.nn.Module,
+    lr: float = None,
+) -> optim.Optimizer:
+    optimizer_lr = float(config.lr if lr is None else lr)
+    if config.optimizer == 'AdamW':
+        return optim.AdamW(
+            params=model.parameters(),
+            lr=optimizer_lr,
+            weight_decay=float(getattr(config, "weight_decay", 1e-2)),
+        )
+    if config.optimizer == 'Adam':
+        return optim.Adam(
+            params=model.parameters(),
+            lr=optimizer_lr,
+            weight_decay=float(getattr(config, "weight_decay", 0.0)),
+        )
+    raise NotImplementedError(f"Unsupported optimizer: {config.optimizer}")
+
+
 def _build_lr_scheduler(config: Config, optimizer: optim.Optimizer):
     scheduler_type = str(getattr(config, "scheduler_type", "multistep")).strip().lower()
+    if scheduler_type in _TWO_STAGE_COSINE_NAMES:
+        total_epochs = int(config.tot_epochs)
+        split_epoch = int(config.sup_only_train_epoch)
+        if bool(getattr(config, "require_lr_stage_match_unlabeled_stage", False)):
+            unlabeled_start_epoch = int(getattr(config, "unlabeled_start_epoch", -1))
+            if split_epoch != unlabeled_start_epoch:
+                raise ValueError(
+                    "Two-stage LR boundary must match the unlabeled-stage boundary when "
+                    "require_lr_stage_match_unlabeled_stage=True: "
+                    f"sup_only_train_epoch={split_epoch}, "
+                    f"unlabeled_start_epoch={unlabeled_start_epoch}"
+                )
+        preserve_state = bool(
+            getattr(config, "preserve_optimizer_state_across_stages", True)
+        )
+        reset_at_stage2 = bool(getattr(config, "reset_optimizer_at_stage2", False))
+        if preserve_state == reset_at_stage2:
+            raise ValueError(
+                "Exactly one optimizer stage policy must be enabled: "
+                "preserve_optimizer_state_across_stages and reset_optimizer_at_stage2 "
+                f"are both {preserve_state}"
+            )
+        return TwoStageCosineLR(
+            optimizer,
+            total_epochs=total_epochs,
+            split_epoch=split_epoch,
+            stage1_initial_lr=float(config.stage1_initial_lr),
+            stage1_min_lr=float(config.stage1_min_lr),
+            stage2_initial_lr=float(config.stage2_initial_lr),
+            stage2_min_lr=float(config.stage2_min_lr),
+        )
+
     if scheduler_type in ("cosine", "cosineannealing", "cosine_annealing"):
         total_epochs = int(getattr(config, "scheduler_t_max", getattr(config, "tot_epochs", 1)))
         warmup_epochs = max(0, int(getattr(config, "scheduler_warmup_epochs", 0)))
@@ -198,12 +264,12 @@ def build_model_optimizers(config: Config, logger: Logger, device: torch.device,
     if config.precisionHigh:
         torch.set_float32_matmul_precision('high')
 
-    if config.optimizer == 'AdamW':
-        optimizer = optim.AdamW(params=model.parameters(), lr=config.lr, weight_decay=1e-2)
-    elif config.optimizer == 'Adam':
-        optimizer = optim.Adam(params=model.parameters(), lr=config.lr, weight_decay=0)
-    else:
-        raise NotImplementedError(f"Unsupported optimizer: {config.optimizer}")
+    initial_lr = (
+        float(config.stage1_initial_lr)
+        if _is_two_stage_cosine(config)
+        else float(config.lr)
+    )
+    optimizer = _build_optimizer(config, model, lr=initial_lr)
 
     lr_scheduler = _build_lr_scheduler(config, optimizer)
     logger.freeze_info("Scheduler type: {}".format(str(getattr(config, "scheduler_type", "multistep"))))
@@ -215,7 +281,24 @@ def build_model_optimizers(config: Config, logger: Logger, device: torch.device,
             except ValueError as exc:
                 _log(logger, ("warn_info", "warning", "info"), f"[!] Optimizer state was not restored: {exc}")
         if 'lr_scheduler' in checkpoint:
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            try:
+                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            except (ValueError, KeyError, TypeError) as exc:
+                _log(
+                    logger,
+                    ("warn_info", "warning", "info"),
+                    "[!] LR scheduler state was not restored: "
+                    f"{exc}. Reconstructing from checkpoint epoch.",
+                )
+                checkpoint_epoch = int(checkpoint.get('epoch', -1))
+                if hasattr(lr_scheduler, "step_epoch") and 0 <= checkpoint_epoch < int(config.tot_epochs):
+                    lr_scheduler.step_epoch(checkpoint_epoch)
+                    _log(
+                        logger,
+                        ("key_info", "info"),
+                        "[+] Two-stage LR reconstructed at checkpoint epoch "
+                        f"{checkpoint_epoch}.",
+                    )
         if 'epoch' in checkpoint:
             epoch_st = checkpoint['epoch'] + 1
             logger.key_info("[+] Resume training from epoch {}".format(epoch_st))
