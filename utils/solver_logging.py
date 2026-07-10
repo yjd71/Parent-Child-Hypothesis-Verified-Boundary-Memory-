@@ -29,7 +29,14 @@ _PC_HBM_METRIC_KEYS = {
     "route_entropy",
     "parent_entropy",
     "memory_ready",
+    "soft_teacher_loss",
+    "soft_teacher_bce",
+    "soft_teacher_weighted_iou",
+    "hard_teacher_loss",
+    "loss_u_total",
 }
+
+
 def log_info(logger, message: str) -> None:
     if logger is None:
         print(message)

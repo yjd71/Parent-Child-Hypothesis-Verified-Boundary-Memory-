@@ -87,7 +87,12 @@ lambda_branch = 0.2
 lambda_quality = 0.05
 lambda_usage = 0.02
 lambda_reg = 0.05
-lambda_u = 0.1
+lambda_u = 1.0
+use_hard_teacher_loss = True
+hard_teacher_loss_weight = 2.0
+hard_teacher_threshold = 0.5
+use_soft_teacher_weighted_iou = True
+soft_teacher_weighted_iou_weight = 0.25
 
 # PC-HBM memory/speed optimization without precision changes
 pc_hbm_unsup_student_core_only = True

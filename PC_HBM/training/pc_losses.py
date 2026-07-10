@@ -44,6 +44,60 @@ def seg_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return bce + dice_loss_with_logits(logits, target) + iou_loss_with_logits(logits, target)
 
 
+def _build_hard_teacher_target(
+    pseudo_prob: torch.Tensor,
+    threshold: float,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Binarize detached teacher probabilities with a strict threshold."""
+
+    return (pseudo_prob.detach() > float(threshold)).to(dtype=dtype)
+
+
+def _rsbl_hard_structure_loss(logits: torch.Tensor, hard_target: torch.Tensor) -> torch.Tensor:
+    """RSBL/F3Net structure loss for one student logit and a hard target.
+
+    Samples whose hard target is entirely background are excluded exactly as in
+    RSBL. If the whole batch is empty, return a differentiable zero connected to
+    ``logits``.
+    """
+
+    valid = hard_target.sum(dim=(1, 2, 3)) > 0
+    if not torch.any(valid):
+        return zero_like_loss(logits)
+
+    logits = logits[valid]
+    hard_target = hard_target[valid].to(dtype=logits.dtype)
+    weight = 1.0 + 5.0 * torch.abs(
+        F.avg_pool2d(hard_target, kernel_size=31, stride=1, padding=15) - hard_target
+    )
+    weighted_bce = F.binary_cross_entropy_with_logits(logits, hard_target, reduction="none")
+    weighted_bce = (weight * weighted_bce).sum(dim=(2, 3)) / weight.sum(dim=(2, 3))
+
+    probability = torch.sigmoid(logits)
+    intersection = ((probability * hard_target) * weight).sum(dim=(2, 3))
+    union = ((probability + hard_target) * weight).sum(dim=(2, 3))
+    weighted_iou = 1.0 - (intersection + 1.0) / (union - intersection + 1.0)
+    return (weighted_bce + weighted_iou).mean()
+
+
+def _confidence_aware_soft_weighted_iou_loss(
+    logits: torch.Tensor,
+    soft_target: torch.Tensor,
+    confidence: torch.Tensor,
+) -> torch.Tensor:
+    """Confidence-weighted soft IoU with RSBL-style boundary emphasis."""
+
+    edge_weight = 1.0 + 5.0 * torch.abs(
+        F.avg_pool2d(soft_target, kernel_size=31, stride=1, padding=15) - soft_target
+    )
+    weight = confidence * edge_weight
+    probability = torch.sigmoid(logits)
+    intersection = ((probability * soft_target) * weight).sum(dim=(2, 3))
+    union = ((probability + soft_target - probability * soft_target) * weight).sum(dim=(2, 3))
+    return (1.0 - (intersection + 1.0) / (union + 1.0)).mean()
+
+
 def compute_pc_hbm_labeled_loss(outputs, aux: Dict[str, Any] | None, gt: torch.Tensor, config: Any) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Compute full labelled PC-HBM loss and logging tensors."""
 
@@ -114,7 +168,7 @@ def compute_pc_hbm_labeled_loss(outputs, aux: Dict[str, Any] | None, gt: torch.T
 
 
 def compute_pc_hbm_unlabeled_loss(student_aux: Dict[str, Any], pseudo_prob: torch.Tensor, confidence: torch.Tensor, config: Any) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Stage-4 unlabeled loss: supervise student z_nomix/z_main, not z_final."""
+    """Stage-4 soft and hard teacher loss on student z_nomix/z_main."""
 
     z_student = student_aux.get("z_nomix", student_aux.get("z_main"))
     if z_student is None:
@@ -123,17 +177,52 @@ def compute_pc_hbm_unlabeled_loss(student_aux: Dict[str, Any], pseudo_prob: torc
         pseudo_prob = F.interpolate(pseudo_prob, size=z_student.shape[-2:], mode="nearest")
     if confidence.shape[-2:] != z_student.shape[-2:]:
         confidence = F.interpolate(confidence, size=z_student.shape[-2:], mode="bilinear", align_corners=False)
-    bce = F.binary_cross_entropy_with_logits(z_student, pseudo_prob.detach(), reduction="none")
-    loss = (bce * confidence.detach()).sum() / confidence.sum().clamp_min(1.0)
+    pseudo_prob = pseudo_prob.detach()
+    confidence = confidence.detach()
+
+    soft_bce = F.binary_cross_entropy_with_logits(z_student, pseudo_prob, reduction="none")
+    soft_teacher_bce = (soft_bce * confidence).sum() / confidence.sum().clamp_min(1.0)
+    soft_weighted_iou_weight = float(getattr(config, "soft_teacher_weighted_iou_weight", 0.25))
+    use_soft_weighted_iou = bool(getattr(config, "use_soft_teacher_weighted_iou", True))
+    if use_soft_weighted_iou and soft_weighted_iou_weight > 0.0:
+        soft_teacher_weighted_iou = _confidence_aware_soft_weighted_iou_loss(
+            z_student,
+            pseudo_prob,
+            confidence,
+        )
+    else:
+        soft_teacher_weighted_iou = z_student.detach().new_zeros(())
+    soft_teacher_loss = soft_teacher_bce + soft_weighted_iou_weight * soft_teacher_weighted_iou
     final_weight = float(getattr(config, "pc_hbm_unsup_final_consistency_weight", 0.1))
     if bool(student_aux.get("mixture_skipped", False)) or str(student_aux.get("forward_mode", "")) == "student_core":
         final_weight = 0.0
     z_final = student_aux.get("z_final")
     if z_final is not None and final_weight > 0:
-        final_bce = F.binary_cross_entropy_with_logits(z_final, pseudo_prob.detach(), reduction="none")
+        final_bce = F.binary_cross_entropy_with_logits(z_final, pseudo_prob, reduction="none")
         high = (confidence > 0.8).float()
-        loss = loss + final_weight * (final_bce * high).sum() / high.sum().clamp_min(1.0)
-    return float(getattr(config, "lambda_u", 1.0)) * loss, {"L_u": loss.detach(), "pseudo_conf_mean": confidence.mean().detach()}
+        soft_teacher_loss = soft_teacher_loss + final_weight * (final_bce * high).sum() / high.sum().clamp_min(1.0)
+
+    lambda_u = float(getattr(config, "lambda_u", 1.0))
+    hard_weight = float(getattr(config, "hard_teacher_loss_weight", 2.0))
+    use_hard_teacher_loss = bool(getattr(config, "use_hard_teacher_loss", True))
+    if use_hard_teacher_loss and hard_weight > 0.0:
+        hard_threshold = float(getattr(config, "hard_teacher_threshold", 0.5))
+        hard_target = _build_hard_teacher_target(pseudo_prob, hard_threshold, z_student.dtype)
+        hard_teacher_loss = _rsbl_hard_structure_loss(z_student, hard_target)
+        loss_u_total = lambda_u * soft_teacher_loss + hard_weight * hard_teacher_loss
+    else:
+        hard_teacher_loss = z_student.detach().new_zeros(())
+        loss_u_total = lambda_u * soft_teacher_loss
+    log = {
+        "L_u": soft_teacher_loss.detach(),
+        "soft_teacher_loss": soft_teacher_loss.detach(),
+        "soft_teacher_bce": soft_teacher_bce.detach(),
+        "soft_teacher_weighted_iou": soft_teacher_weighted_iou.detach(),
+        "hard_teacher_loss": hard_teacher_loss.detach(),
+        "loss_u_total": loss_u_total.detach(),
+        "pseudo_conf_mean": confidence.mean().detach(),
+    }
+    return loss_u_total, log
 
 
 def structure_aware_confidence(teacher_aux: Dict[str, Any]) -> torch.Tensor:

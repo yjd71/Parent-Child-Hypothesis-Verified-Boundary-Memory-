@@ -6,6 +6,7 @@ tests
 !tests/
 tests/*
 !tests/test_pc_hbm_shapes.py
+!tests/test_pc_hbm_teacher_losses.py
 ./cache
 .git
 .agents
