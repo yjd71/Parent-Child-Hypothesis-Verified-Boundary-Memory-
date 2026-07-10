@@ -31,7 +31,20 @@ class ModelEMA(nn.Module):
             return self.teacher.forward_return_pc_hbm_features(x)
         return self.student.forward_return_pc_hbm_features(x)
 
-    def forward_pc_hbm(self, x, memory=None, use_memory=True, return_all_logits=True, epoch=None, ema=False):
+    def forward_pc_hbm(
+        self,
+        x,
+        memory=None,
+        use_memory=True,
+        return_all_logits=True,
+        epoch=None,
+        ema=False,
+        forward_mode="full",
+        need_p1_pra=None,
+        need_final_mixture=None,
+        return_debug_aux=None,
+        store_last_aux=None,
+    ):
         target = self.teacher if ema else self.student
         return target.forward_pc_hbm(
             x,
@@ -40,6 +53,11 @@ class ModelEMA(nn.Module):
             return_all_logits=return_all_logits,
             epoch=epoch,
             engine=self.pc_hbm,
+            forward_mode=forward_mode,
+            need_p1_pra=need_p1_pra,
+            need_final_mixture=need_final_mixture,
+            return_debug_aux=return_debug_aux,
+            store_last_aux=store_last_aux,
         )
 
     def forward(self, x, ema=False, **kwargs):
@@ -174,7 +192,20 @@ class TalNet(nn.Module):
         del kwargs
         return self.forward_ori(x)
 
-    def forward_pc_hbm(self, img, memory=None, use_memory=True, return_all_logits=True, epoch=None, engine=None):
+    def forward_pc_hbm(
+        self,
+        img,
+        memory=None,
+        use_memory=True,
+        return_all_logits=True,
+        epoch=None,
+        engine=None,
+        forward_mode="full",
+        need_p1_pra=None,
+        need_final_mixture=None,
+        return_debug_aux=None,
+        store_last_aux=None,
+    ):
         active_engine = self.pc_hbm if engine is None else engine
         if active_engine is None:
             *_, features = self._build_decoder_features(img)
@@ -191,6 +222,8 @@ class TalNet(nn.Module):
                 "z_final": z_main,
                 "p_final": torch.sigmoid(z_main),
                 "pc_hbm_used": False,
+                "forward_mode": forward_mode,
+                "mixture_skipped": True,
             }
             return outs, aux
         return active_engine.forward_talnet(
@@ -200,6 +233,11 @@ class TalNet(nn.Module):
             use_memory=use_memory,
             return_all_logits=return_all_logits,
             epoch=epoch,
+            forward_mode=forward_mode,
+            need_p1_pra=need_p1_pra,
+            need_final_mixture=need_final_mixture,
+            return_debug_aux=return_debug_aux,
+            store_last_aux=store_last_aux,
         )
 
 class Decoder(nn.Module):

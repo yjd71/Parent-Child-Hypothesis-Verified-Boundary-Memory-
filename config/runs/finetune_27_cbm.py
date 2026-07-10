@@ -1,7 +1,7 @@
 import os
 
 # training settings
-ckpt_dir = "/home/zhangqing/YJD/SCOD/PC-HBM/works/pc_hbm_finetune_from27"
+ckpt_dir = "/home/zhangqing/YJD/Prototype_final/CBM-PFI_withoutSAM_onePrompt/works/pc_hbm_full"
 
 tot_epochs = 15
 
@@ -84,7 +84,7 @@ lambda_branch = 0.2
 lambda_quality = 0.05
 lambda_usage = 0.02
 lambda_reg = 0.05
-lambda_u = 1.0
+lambda_u = 0.1
 
 # wandb
 ModelName = 'PrototypeNet'

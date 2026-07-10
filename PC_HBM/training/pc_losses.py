@@ -126,6 +126,8 @@ def compute_pc_hbm_unlabeled_loss(student_aux: Dict[str, Any], pseudo_prob: torc
     bce = F.binary_cross_entropy_with_logits(z_student, pseudo_prob.detach(), reduction="none")
     loss = (bce * confidence.detach()).sum() / confidence.sum().clamp_min(1.0)
     final_weight = float(getattr(config, "pc_hbm_unsup_final_consistency_weight", 0.1))
+    if bool(student_aux.get("mixture_skipped", False)) or str(student_aux.get("forward_mode", "")) == "student_core":
+        final_weight = 0.0
     z_final = student_aux.get("z_final")
     if z_final is not None and final_weight > 0:
         final_bce = F.binary_cross_entropy_with_logits(z_final, pseudo_prob.detach(), reduction="none")

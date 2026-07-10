@@ -58,7 +58,7 @@ class PCHBMEngine(nn.Module):
         self.dim = int(getattr(self.config, "cbm_memory_dim", self.channel_spec.pc_dim))
         self.value_dim = int(getattr(self.config, "cbm_value_dim", self.channel_spec.value_dim))
         self.geometry_dim = int(getattr(self.config, "geometry_dim", 6))
-        self.memory = PCHBMMemory(self.dim, self.value_dim, self.geometry_dim)
+        self.memory = PCHBMMemory(self.dim, self.value_dim, self.geometry_dim, config=self.config)
         self.memory.compat_meta = self._build_memory_compat_meta()
         self.boundary3 = BoundaryQueryHead3(top_ratio=0.25)
         self.router = CamouflageContextRouter(self.channel_spec.x3, dim=self.dim, top_img_k=int(getattr(self.config, "cbm_top_img_k", 32)))
@@ -163,9 +163,27 @@ class PCHBMEngine(nn.Module):
         use_memory: bool = True,
         return_all_logits: bool = True,
         epoch: int | None = None,
+        forward_mode: str = "full",
+        need_p1_pra: bool | None = None,
+        need_final_mixture: bool | None = None,
+        return_debug_aux: bool | None = None,
+        store_last_aux: bool | None = None,
     ):
         """Run TALNet plus full PC-HBM and return ``(outputs, aux)``."""
 
+        (
+            forward_mode,
+            need_p1_pra,
+            need_final_mixture,
+            return_debug_aux,
+            store_last_aux,
+        ) = self._resolve_forward_policy(
+            forward_mode,
+            need_p1_pra,
+            need_final_mixture,
+            return_debug_aux,
+            store_last_aux,
+        )
         x1, x2, x3, x4, features = talnet._build_decoder_features(img)
         state, p3, m3 = talnet.decoder.forward_to_p3(features)
         state2_pre, p2_pre, m2_pre = talnet.decoder.forward_p2_from_p3(state, p3)
@@ -174,9 +192,8 @@ class PCHBMEngine(nn.Module):
         if fallback is not None:
             scaled_preds, p1, z_main = talnet.decoder.forward_p1_from_p2(state2_pre, p2_pre)
             outputs = self._outputs_from_state(state, m3, m2_pre, z_main)
-            aux = self._fallback_aux(fallback, x1, x2, x3, x4, p3, p2_pre, p1, z_main, outputs)
-            self.last_aux = aux
-            return outputs, aux
+            aux = self._fallback_aux(fallback, x1, x2, x3, x4, p3, p2_pre, p1, z_main, outputs, forward_mode=forward_mode)
+            return outputs, self._finalize_return_aux(aux, forward_mode, return_debug_aux, store_last_aux)
         prob3 = torch.sigmoid(m3)
         b3_input = boundary_features_from_logits(m3)
         B3, boundary3 = self.boundary3(b3_input)
@@ -188,13 +205,12 @@ class PCHBMEngine(nn.Module):
         if parent_ret["top_parent_keys"].numel() == 0:
             scaled_preds, p1, z_main = talnet.decoder.forward_p1_from_p2(state2_pre, p2_pre)
             outputs = self._outputs_from_state(state, m3, m2_pre, z_main)
-            aux = self._fallback_aux("parent_subbank_empty", x1, x2, x3, x4, p3, p2_pre, p1, z_main, outputs)
-            self.last_aux = aux
-            return outputs, aux
+            aux = self._fallback_aux("parent_subbank_empty", x1, x2, x3, x4, p3, p2_pre, p1, z_main, outputs, forward_mode=forward_mode)
+            return outputs, self._finalize_return_aux(aux, forward_mode, return_debug_aux, store_last_aux)
         if epoch is not None and int(epoch) < int(getattr(self.config, "child_start_epoch", 11)):
             scaled_preds, p1, z_main = talnet.decoder.forward_p1_from_p2(state2_pre, p2_pre)
             outputs = self._outputs_from_state(state, m3, m2_pre, z_main)
-            aux = self._fallback_aux("stage_parent_only", x1, x2, x3, x4, p3, p2_pre, p1, z_main, outputs)
+            aux = self._fallback_aux("stage_parent_only", x1, x2, x3, x4, p3, p2_pre, p1, z_main, outputs, forward_mode=forward_mode)
             aux["pc_hbm"].update(
                 {
                     "B3": B3,
@@ -215,8 +231,7 @@ class PCHBMEngine(nn.Module):
                     "parent_entropy": parent_ret["parent_entropy"],
                 }
             )
-            self.last_aux = aux
-            return outputs, aux
+            return outputs, self._finalize_return_aux(aux, forward_mode, return_debug_aux, store_last_aux)
         child_query = self.child_query(p2_pre, batch_ids3, flat_indices3, p3.shape[-2:])
         child_bank = memory_obj.get_child_by_ptr(parent_ret["top_child_ptrs"], device=img.device, dtype=img.dtype)
         child_ver = self.child_verifier(child_query["q_child"], child_query["G2_query"], parent_ret, child_bank)
@@ -241,18 +256,27 @@ class PCHBMEngine(nn.Module):
         state2, p2, m2 = talnet.decoder.forward_p2_from_p3(state, p3_corr)
         p2_aux = self.p2_bra(p2, torch.sigmoid(m2), pc_maps)
         scaled_preds, p1, z_main = talnet.decoder.forward_p1_from_p2(state2, p2_aux["p2_refined"])
-        p1_aux = self.p1_pra(p1, z_main, p2_aux)
-        mix_aux = self.mixture(
-            z_main,
-            p1_aux,
-            pc_maps,
-            epoch=epoch,
-            temperature=self._mixture_temperature(epoch),
-            eps_floor=self._mixture_eps(epoch),
-        )
+        z_nomix = z_main
+        if need_p1_pra and need_final_mixture:
+            p1_aux = self.p1_pra(p1, z_main, p2_aux)
+            mix_aux = self.mixture(
+                z_main,
+                p1_aux,
+                pc_maps,
+                epoch=epoch,
+                temperature=self._mixture_temperature(epoch),
+                eps_floor=self._mixture_eps(epoch),
+            )
+            z_final = mix_aux["z_final"]
+            p_final = mix_aux["p_final"]
+            mixture_skipped = False
+        else:
+            p1_aux = {}
+            mix_aux = {}
+            z_final = z_main
+            p_final = torch.sigmoid(z_main)
+            mixture_skipped = True
         outputs = self._outputs_from_state(state, m3, m2, z_main)
-        z_final = mix_aux["z_final"]
-        p_final = mix_aux["p_final"]
         pc_aux = {
             **pc_maps,
             "B3": B3,
@@ -303,7 +327,7 @@ class PCHBMEngine(nn.Module):
             "p2_refined": p2_aux["p2_refined"],
             "p1": p1,
             "z_main": z_main,
-            "z_nomix": z_main,
+            "z_nomix": z_nomix,
             "z_final": z_final,
             "p_final": p_final,
             "pc_hbm": pc_aux,
@@ -313,10 +337,118 @@ class PCHBMEngine(nn.Module):
             "features": {"x1": x1, "x2": x2, "x3": x3, "x4": x4},
             "p_main": torch.sigmoid(z_main).detach(),
             "pc_hbm_used": True,
+            "forward_mode": forward_mode,
+            "mixture_skipped": mixture_skipped,
         }
-        aux["diagnostics"] = collect_pc_hbm_diagnostics(aux)
-        self.last_aux = aux
-        return outputs, aux
+        return outputs, self._finalize_return_aux(aux, forward_mode, return_debug_aux, store_last_aux)
+
+    def _resolve_forward_policy(
+        self,
+        forward_mode: str,
+        need_p1_pra: bool | None,
+        need_final_mixture: bool | None,
+        return_debug_aux: bool | None,
+        store_last_aux: bool | None,
+    ) -> tuple[str, bool, bool, bool, bool]:
+        forward_mode = str(forward_mode or "full")
+        if forward_mode not in {"full", "teacher_pseudo", "student_core"}:
+            raise ValueError(f"Unsupported PC-HBM forward_mode: {forward_mode}")
+        if forward_mode == "teacher_pseudo":
+            need_p1_pra = True
+            need_final_mixture = True
+        elif forward_mode == "student_core":
+            need_p1_pra = False
+            need_final_mixture = False
+        else:
+            need_p1_pra = True if need_p1_pra is None else bool(need_p1_pra)
+            need_final_mixture = True if need_final_mixture is None else bool(need_final_mixture)
+
+        if return_debug_aux is None:
+            key = "pc_hbm_return_debug_aux_train" if self.training else "pc_hbm_return_debug_aux_eval"
+            return_debug_aux = bool(getattr(self.config, key, False))
+        if store_last_aux is None:
+            key = "pc_hbm_store_last_aux_train" if self.training else "pc_hbm_store_last_aux_eval"
+            store_last_aux = bool(getattr(self.config, key, False))
+        return forward_mode, bool(need_p1_pra), bool(need_final_mixture), bool(return_debug_aux), bool(store_last_aux)
+
+    def _finalize_return_aux(self, aux: Dict[str, Any], forward_mode: str, return_debug_aux: bool, store_last_aux: bool) -> Dict[str, Any]:
+        if return_debug_aux and "diagnostics" not in aux:
+            aux["diagnostics"] = collect_pc_hbm_diagnostics(aux)
+        self._store_last_aux(aux, store_last_aux)
+        if forward_mode == "teacher_pseudo" and bool(getattr(self.config, "pc_hbm_slim_teacher_aux", True)):
+            return self._slim_teacher_pseudo_aux(aux)
+        if forward_mode == "student_core" and bool(getattr(self.config, "pc_hbm_slim_student_aux", True)):
+            return self._slim_student_unsup_aux(aux)
+        return aux
+
+    def _store_last_aux(self, aux: Dict[str, Any], store_last_aux: bool) -> None:
+        if store_last_aux:
+            self.last_aux = self._slim_last_aux(aux)
+        else:
+            self.last_aux = None
+
+    def _slim_teacher_pseudo_aux(self, aux: Dict[str, Any]) -> Dict[str, Any]:
+        pc = aux.get("pc_hbm", {}) or {}
+        mix = aux.get("mixture", {}) or {}
+        out = {
+            "z_main": aux.get("z_main"),
+            "z_nomix": aux.get("z_nomix", aux.get("z_main")),
+            "z_final": aux.get("z_final", aux.get("z_main")),
+            "p_final": aux.get("p_final"),
+            "p_main": aux.get("p_main"),
+            "pc_hbm": {
+                "C23_map": pc.get("C23_map"),
+                "route_entropy": pc.get("route_entropy"),
+            },
+            "mixture": {
+                "pi": mix.get("pi"),
+                "B_pix": mix.get("B_pix"),
+                "Mask_corr": mix.get("Mask_corr"),
+            },
+            "pc_hbm_used": aux.get("pc_hbm_used", False),
+            "fallback_reason": aux.get("fallback_reason"),
+            "forward_mode": aux.get("forward_mode"),
+            "mixture_skipped": aux.get("mixture_skipped", False),
+        }
+        if "diagnostics" in aux:
+            out["diagnostics"] = self._detach_debug_value(aux["diagnostics"])
+        return out
+
+    def _slim_student_unsup_aux(self, aux: Dict[str, Any]) -> Dict[str, Any]:
+        out = {
+            "z_main": aux.get("z_main"),
+            "z_nomix": aux.get("z_nomix", aux.get("z_main")),
+            "z_final": aux.get("z_final"),
+            "pc_hbm_used": aux.get("pc_hbm_used", False),
+            "fallback_reason": aux.get("fallback_reason"),
+            "forward_mode": aux.get("forward_mode"),
+            "mixture_skipped": aux.get("mixture_skipped", False),
+        }
+        if "diagnostics" in aux:
+            out["diagnostics"] = self._detach_debug_value(aux["diagnostics"])
+        return out
+
+    def _slim_last_aux(self, aux: Dict[str, Any]) -> Dict[str, Any]:
+        diagnostics = aux.get("diagnostics")
+        if diagnostics is None:
+            diagnostics = collect_pc_hbm_diagnostics(aux)
+        return {
+            "pc_hbm_used": aux.get("pc_hbm_used", False),
+            "fallback_reason": aux.get("fallback_reason"),
+            "forward_mode": aux.get("forward_mode"),
+            "mixture_skipped": aux.get("mixture_skipped", False),
+            "diagnostics": self._detach_debug_value(diagnostics),
+        }
+
+    def _detach_debug_value(self, value):
+        if torch.is_tensor(value):
+            tensor = value.detach().float().cpu()
+            return tensor.reshape(()) if tensor.numel() == 1 else tensor.mean().reshape(())
+        if isinstance(value, dict):
+            return {key: self._detach_debug_value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return type(value)(self._detach_debug_value(item) for item in value)
+        return value
 
     def compute_losses(self, outputs, aux, gt):
         from ..training.pc_losses import compute_pc_hbm_labeled_loss
@@ -421,7 +553,7 @@ class PCHBMEngine(nn.Module):
             return "stage_memory_disabled"
         return None
 
-    def _fallback_aux(self, reason, x1, x2, x3, x4, p3, p2, p1, z_main, outputs):
+    def _fallback_aux(self, reason, x1, x2, x3, x4, p3, p2, p1, z_main, outputs, forward_mode="full"):
         z_final = z_main
         zeros3 = p3.new_zeros(p3.size(0), 1, p3.size(2), p3.size(3))
         aux = {
@@ -455,8 +587,9 @@ class PCHBMEngine(nn.Module):
             "features": {"x1": x1, "x2": x2, "x3": x3, "x4": x4},
             "fallback_reason": reason,
             "pc_hbm_used": False,
+            "forward_mode": forward_mode,
+            "mixture_skipped": True,
         }
-        aux["diagnostics"] = collect_pc_hbm_diagnostics(aux)
         return aux
 
     def _outputs_from_state(self, state, m3, m2, z_main):

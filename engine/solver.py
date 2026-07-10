@@ -267,17 +267,29 @@ class SemiSupervisedTrainer:
                 use_memory=use_memory,
                 return_all_logits=True,
                 epoch=getattr(self, "current_epoch", None),
+                forward_mode="teacher_pseudo",
+                need_p1_pra=True,
+                need_final_mixture=True,
+                return_debug_aux=False,
+                store_last_aux=False,
             )
-            teacher_pseudo = teacher_aux.get("p_final", torch.sigmoid(teacher_aux["z_final"]))
-            confidence = structure_aware_confidence(teacher_aux)
+            teacher_pseudo = teacher_aux.get("p_final", torch.sigmoid(teacher_aux["z_final"])).detach()
+            confidence = structure_aware_confidence(teacher_aux).detach()
         pseudo_s = self._align_pseudo_to_strong(teacher_pseudo, geom)
         conf_s = self._align_pseudo_to_strong(confidence, geom)
+        del teacher_aux, teacher_pseudo, confidence, img_u_w
         img_u_s = student_unsup_batch[0].to(self.device)
+        student_core_only = bool(getattr(self.config, "pc_hbm_unsup_student_core_only", True))
         _, student_aux = self.model.forward_pc_hbm(
             img_u_s,
             use_memory=use_memory,
             return_all_logits=True,
             epoch=getattr(self, "current_epoch", None),
+            forward_mode="student_core" if student_core_only else "full",
+            need_p1_pra=False if student_core_only else getattr(self.config, "pc_hbm_unsup_student_need_p1_pra", None),
+            need_final_mixture=False if student_core_only else getattr(self.config, "pc_hbm_unsup_student_need_final_mixture", None),
+            return_debug_aux=False,
+            store_last_aux=False,
         )
         loss_u, log = compute_pc_hbm_unlabeled_loss(student_aux, pseudo_s, conf_s, self.config)
         self.loss_dict["loss_pix"] = loss_u.item()
@@ -287,6 +299,7 @@ class SemiSupervisedTrainer:
         self.model_optimizer.zero_grad()
         loss_u.backward()
         self.model_optimizer.step()
+        del student_aux, pseudo_s, conf_s, img_u_s, loss_u
 
     def _extract_unsup_views(self, unsup_batch):
         if isinstance(unsup_batch, dict):
