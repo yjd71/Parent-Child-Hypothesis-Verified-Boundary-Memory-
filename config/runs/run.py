@@ -3,9 +3,9 @@ import os
 # training settings
 ckpt_dir = "/home/zhangqing/YJD/SCOD/PC-HBM/works/pc_hbm_40e_constlr_routeconf_u05_h025_full4"
 
-tot_epochs = 40
+tot_epochs = 30
 
-sup_only_train_epoch = 20
+sup_only_train_epoch = 15
 distributed_train = False
 device_map = {
     'model': '*'
@@ -17,12 +17,12 @@ lr_decay_epochs = [10000]
 lr_decay_rate = 0.5
 save_stage_boundary = True
 
-IoU_finetune_last_epochs = 0
+IoU_finetune_last_epochs = -6
 
 # model settings
 compile_model = False
 precisionHigh = True
-img_size = 384
+img_size = 640
 
 backbone = 'swin_v1_l'
 lateral_channels_in_collection = [3072, 1536, 768, 384]
@@ -31,8 +31,8 @@ cxt = [384, 768, 1536]
 
 # data settings
 load_all = True
-batch_size = 16
-batch_size_valid = 16
+batch_size = 6
+batch_size_valid = 6
 data_split = [0.05]  # [0.01, 0.05, 0.1]
 
 # Generate this file first with scripts/generate_random_indices.py.
@@ -50,11 +50,11 @@ testing_sets = "TE-CAMO+CHAMELEON"
 pred_save_root = os.path.join(ckpt_dir, 'training_preds')
 
 # eval
-eval_epoch = 18
+eval_epoch = 15
 eval_step = 1
 # save model_checkpoint
 save_step = 1
-save_last = 12
+save_last = 15
 
 # PC-HBM core
 use_pc_hbm = True
@@ -75,7 +75,7 @@ warmup_epoch = 5
 parent_start_epoch = 6
 child_start_epoch = 11
 attention_refine_start_epoch = 11
-unlabeled_start_epoch = 20
+unlabeled_start_epoch = 15
 
 # PC-HBM loss weights
 lambda_final = 1.0
@@ -88,7 +88,8 @@ lambda_branch = 0.2
 lambda_quality = 0.05
 lambda_usage = 0.02
 lambda_reg = 0.05
-lambda_u = 0.5
+lambda_u = 0.1
+
 use_hard_teacher_loss = True
 hard_teacher_loss_weight = 0.25
 hard_teacher_threshold = 0.5
