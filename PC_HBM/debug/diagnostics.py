@@ -22,6 +22,7 @@ DIAGNOSTIC_KEYS = (
     "parent_topk_region_acc",
     "parent_entropy",
     "route_entropy",
+    "route_entropy_norm",
     "child_verify_auc",
     "child_score_fg_boundary_mean",
     "child_score_bg_near_mean",
@@ -45,8 +46,8 @@ DIAGNOSTIC_KEYS = (
     "branch_oracle_sup_ratio",
     "z_main_loss",
     "z_final_loss",
-    "pseudo_conf_mean",
-    "pseudo_conf_boundary_mean",
+    "pseudo_certainty_mean",
+    "pseudo_certainty_boundary_mean",
 )
 
 
@@ -59,6 +60,7 @@ def collect_pc_hbm_diagnostics(aux: Dict[str, Any], gt: torch.Tensor | None = No
     mix = aux.get("mixture", {}) or {}
     diag["parent_entropy"] = _mean(pc.get("parent_entropy"), ref)
     diag["route_entropy"] = _mean(pc.get("route_entropy"), ref)
+    diag["route_entropy_norm"] = _mean(pc.get("route_entropy_norm"), ref)
     diag["C23_mean"] = _mean(pc.get("C23_map"), ref)
     c23 = pc.get("C23_map")
     b3 = pc.get("B3")
@@ -132,9 +134,13 @@ def collect_pc_hbm_diagnostics(aux: Dict[str, Any], gt: torch.Tensor | None = No
             diag["pi_def_on_misalign"] = _masked_mean(pi[:, 2:3], edge, ref)
     p_final = aux.get("p_final")
     if torch.is_tensor(p_final):
-        conf = (2.0 * (p_final - 0.5).abs()).clamp(0.0, 1.0)
-        diag["pseudo_conf_mean"] = conf.mean()
-        diag["pseudo_conf_boundary_mean"] = _masked_mean(conf, _boundary(p_final), ref)
+        certainty = (2.0 * (p_final - 0.5).abs()).clamp(0.0, 1.0)
+        diag["pseudo_certainty_mean"] = certainty.mean()
+        diag["pseudo_certainty_boundary_mean"] = _masked_mean(
+            certainty,
+            _boundary(p_final),
+            ref,
+        )
     return diag
 
 

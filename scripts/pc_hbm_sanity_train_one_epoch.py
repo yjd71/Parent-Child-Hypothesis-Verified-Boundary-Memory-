@@ -119,6 +119,9 @@ def main():
     pc = aux["pc_hbm"]
     assert pc["P3_group"].shape[-1] == 4
     assert pc["top_parent_region_ids"].shape == pc["S_child"].shape
+    assert torch.isfinite(pc["route_entropy_norm"]).all()
+    assert pc["route_entropy_norm"].min() >= 0
+    assert pc["route_entropy_norm"].max() <= 1
 
     with torch.no_grad():
         _, teacher_aux = engine.forward_talnet(model, img, memory=engine.memory, use_memory=True, epoch=16)
@@ -128,6 +131,8 @@ def main():
     loss_u, log_u = compute_pc_hbm_unlabeled_loss(student_aux, pseudo, confidence, config)
     assert torch.isfinite(loss_u)
     assert "L_u" in log_u
+    assert "final_consistency_loss" in log_u
+    assert torch.isfinite(log_u["final_consistency_loss"])
     print(
         "pc_hbm_sanity ok "
         f"loss={float(loss.detach().cpu()):.4f} "

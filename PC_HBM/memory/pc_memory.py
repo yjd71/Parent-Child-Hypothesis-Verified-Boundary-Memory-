@@ -158,7 +158,12 @@ class PCHBMMemory:
         """Route ``[B,512]`` query to top labelled image IDs."""
 
         if not self.is_ready():
-            return {"top_img_ids": [[] for _ in range(q_route.size(0))], "top_img_scores": q_route.new_empty(q_route.size(0), 0), "route_entropy": q_route.new_zeros(q_route.size(0))}
+            return {
+                "top_img_ids": [[] for _ in range(q_route.size(0))],
+                "top_img_scores": q_route.new_empty(q_route.size(0), 0),
+                "route_entropy": q_route.new_zeros(q_route.size(0)),
+                "route_entropy_norm": q_route.new_zeros(q_route.size(0)),
+            }
         original_device = q_route.device
         use_cache = self._cache_enabled(original_device, "route")
         if use_cache:
@@ -182,11 +187,22 @@ class PCHBMMemory:
         scores, indices = torch.topk(sim, k=k, dim=1)
         probs = torch.softmax(scores, dim=1)
         entropy = -(probs * probs.clamp_min(EPS).log()).sum(dim=1)
+        if k > 1:
+            entropy_max = entropy.new_tensor(float(k)).log()
+            entropy_norm = (entropy / entropy_max.clamp_min(EPS)).clamp(0.0, 1.0)
+        else:
+            entropy_norm = torch.zeros_like(entropy)
         top_ids = [[img_ids[int(idx)] for idx in row] for row in indices.detach().cpu().tolist()]
         if scores.device != original_device:
             scores = scores.to(device=original_device, non_blocking=True)
             entropy = entropy.to(device=original_device, non_blocking=True)
-        return {"top_img_ids": top_ids, "top_img_scores": scores, "route_entropy": entropy}
+            entropy_norm = entropy_norm.to(device=original_device, non_blocking=True)
+        return {
+            "top_img_ids": top_ids,
+            "top_img_scores": scores,
+            "route_entropy": entropy,
+            "route_entropy_norm": entropy_norm,
+        }
 
     def get_parent_subbank(self, top_img_ids: Iterable[Iterable[object]] | Iterable[object] | None, device=None, dtype=None) -> Dict[str, Any]:
         """Return parent entries whose metadata image_id is in selected top images."""

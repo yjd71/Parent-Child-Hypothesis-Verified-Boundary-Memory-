@@ -223,6 +223,7 @@ class PCHBMEngine(nn.Module):
                     "batch_ids3": batch_ids3,
                     "flat_indices3": flat_indices3,
                     "route_entropy": route["route_entropy"],
+                    "route_entropy_norm": route["route_entropy_norm"],
                     "top_img_ids": route["top_img_ids"],
                     "top_img_scores": route["top_img_scores"],
                     "top_parent_keys": parent_ret["top_parent_keys"],
@@ -289,6 +290,7 @@ class PCHBMEngine(nn.Module):
             "batch_ids3": batch_ids3,
             "flat_indices3": flat_indices3,
             "route_entropy": route["route_entropy"],
+            "route_entropy_norm": route["route_entropy_norm"],
             "top_img_ids": route["top_img_ids"],
             "top_img_scores": route["top_img_scores"],
             "route_context": route["route_context"],
@@ -404,6 +406,7 @@ class PCHBMEngine(nn.Module):
             "pc_hbm": {
                 "C23_map": pc.get("C23_map"),
                 "route_entropy": pc.get("route_entropy"),
+                "route_entropy_norm": pc.get("route_entropy_norm"),
             },
             "mixture": {
                 "pi": mix.get("pi"),

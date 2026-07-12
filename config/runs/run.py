@@ -1,7 +1,7 @@
 import os
 
 # training settings
-ckpt_dir = "/home/zhangqing/YJD/SCOD/PC-HBM/works/pc_hbm_40e_two_stage_cosine_s20"
+ckpt_dir = "/home/zhangqing/YJD/SCOD/PC-HBM/works/pc_hbm_40e_constlr_routeconf_u05_h025_full4"
 
 tot_epochs = 40
 
@@ -12,14 +12,9 @@ device_map = {
 }  # Only available for non distributed training
 rand_seed = 7
 lr = 1e-4
-scheduler_type = "two_stage_cosine"
-stage1_initial_lr = 1e-4
-stage1_min_lr = 1e-7
-stage2_initial_lr = 1e-4
-stage2_min_lr = 1e-7
-preserve_optimizer_state_across_stages = True
-reset_optimizer_at_stage2 = False
-require_lr_stage_match_unlabeled_stage = True
+scheduler_type = "multistep"
+lr_decay_epochs = [10000]
+lr_decay_rate = 0.5
 save_stage_boundary = True
 
 IoU_finetune_last_epochs = 0
@@ -93,22 +88,21 @@ lambda_branch = 0.2
 lambda_quality = 0.05
 lambda_usage = 0.02
 lambda_reg = 0.05
-lambda_u = 1.0
+lambda_u = 0.5
 use_hard_teacher_loss = True
-hard_teacher_loss_weight = 1.0
+hard_teacher_loss_weight = 0.25
 hard_teacher_threshold = 0.5
 hard_teacher_foreground_threshold = 0.7
 hard_teacher_background_threshold = 0.3
 hard_teacher_confidence_threshold = 0.25
-hard_teacher_rampup_epochs = 3
+hard_teacher_rampup_epochs = 5
 use_soft_teacher_weighted_iou = True
 soft_teacher_weighted_iou_weight = 0.25
 
 # PC-HBM memory/speed optimization without precision changes
-pc_hbm_unsup_student_core_only = True
-pc_hbm_unsup_student_need_p1_pra = False
-pc_hbm_unsup_student_need_final_mixture = False
-pc_hbm_unsup_final_consistency_weight = 0.0
+pc_hbm_unsup_full_forward_interval = 4
+pc_hbm_unsup_final_consistency_weight = 0.05
+log_branch_grad_norms = True
 
 pc_hbm_store_last_aux_train = False
 pc_hbm_store_last_aux_eval = False

@@ -479,7 +479,7 @@ def test_disabled_soft_weighted_iou_skips_helper_and_keeps_only_soft_bce():
 
 
 def test_pc_hbm_config_sources_use_requested_teacher_loss_values():
-    expected = {
+    defaults = {
         "lambda_u": 1.0,
         "use_hard_teacher_loss": True,
         "hard_teacher_loss_weight": 1.0,
@@ -492,14 +492,26 @@ def test_pc_hbm_config_sources_use_requested_teacher_loss_values():
         "soft_teacher_weighted_iou_weight": 0.25,
     }
     base = runpy.run_path(str(ROOT / "config" / "base" / "pc_hbm.py"))["PC_HBM_DEFAULTS"]
-    for key, value in expected.items():
+    for key, value in defaults.items():
         assert PC_HBM_DEFAULTS[key] == value
         assert base[key] == value
 
-    for relative_path in ("config/runs/run.py", "config/runs/finetune_27_cbm.py"):
-        run_config = runpy.run_path(str(ROOT / relative_path))
-        for key, value in expected.items():
-            assert run_config[key] == value
+    finetune_config = runpy.run_path(str(ROOT / "config/runs/finetune_27_cbm.py"))
+    for key, value in defaults.items():
+        assert finetune_config[key] == value
+
+    run_config = runpy.run_path(str(ROOT / "config/runs/run.py"))
+    run_expected = {
+        **defaults,
+        "lambda_u": 0.5,
+        "hard_teacher_loss_weight": 0.25,
+        "hard_teacher_rampup_epochs": 5,
+    }
+    for key, value in run_expected.items():
+        assert run_config[key] == value
+    assert run_config["pc_hbm_unsup_full_forward_interval"] == 4
+    assert run_config["pc_hbm_unsup_final_consistency_weight"] == 0.05
+    assert run_config["log_branch_grad_norms"] is True
 
 
 def test_solver_passes_current_epoch_to_unlabeled_teacher_loss():

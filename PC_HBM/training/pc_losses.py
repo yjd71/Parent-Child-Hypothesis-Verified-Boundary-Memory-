@@ -280,21 +280,45 @@ def compute_pc_hbm_unlabeled_loss(
     if bool(student_aux.get("mixture_skipped", False)) or str(student_aux.get("forward_mode", "")) == "student_core":
         final_weight = 0.0
     z_final = student_aux.get("z_final")
+    final_consistency_loss = z_student.detach().new_zeros(())
+    final_consistency_weighted_loss = z_student.detach().new_zeros(())
     if z_final is not None and final_weight > 0:
-        final_bce = F.binary_cross_entropy_with_logits(z_final, pseudo_prob, reduction="none")
-        high = (confidence > 0.8).float()
-        soft_teacher_loss = soft_teacher_loss + final_weight * (final_bce * high).sum() / high.sum().clamp_min(1.0)
+        final_target = pseudo_prob
+        final_confidence = confidence
+        if final_target.shape[-2:] != z_final.shape[-2:]:
+            final_target = F.interpolate(final_target, size=z_final.shape[-2:], mode="nearest")
+        if final_confidence.shape[-2:] != z_final.shape[-2:]:
+            final_confidence = F.interpolate(
+                final_confidence,
+                size=z_final.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        final_bce = F.binary_cross_entropy_with_logits(
+            z_final,
+            final_target,
+            reduction="none",
+        )
+        final_consistency_loss = (
+            (final_bce * final_confidence).sum()
+            / final_confidence.sum().clamp_min(1.0)
+        )
+        final_consistency_weighted_loss = final_weight * final_consistency_loss
+        soft_teacher_loss = soft_teacher_loss + final_consistency_weighted_loss
 
     lambda_u = float(getattr(config, "lambda_u", 1.0))
     hard_weight = float(getattr(config, "hard_teacher_loss_weight", 1.0))
     hard_ramp_factor = _hard_teacher_ramp_factor(config, epoch)
     use_hard_teacher_loss = bool(getattr(config, "use_hard_teacher_loss", True))
     effective_hard_weight = max(hard_weight * hard_ramp_factor, 0.0) if use_hard_teacher_loss else 0.0
+    confidence_threshold = float(getattr(config, "hard_teacher_confidence_threshold", 0.25))
+    pseudo_conf_valid_pixel_ratio = (confidence >= confidence_threshold).to(
+        dtype=z_student.dtype
+    ).mean()
     if effective_hard_weight > 0.0:
         hard_threshold = float(getattr(config, "hard_teacher_threshold", 0.5))
         foreground_threshold = float(getattr(config, "hard_teacher_foreground_threshold", 0.7))
         background_threshold = float(getattr(config, "hard_teacher_background_threshold", 0.3))
-        confidence_threshold = float(getattr(config, "hard_teacher_confidence_threshold", 0.25))
         _validate_hard_teacher_thresholds(
             background_threshold,
             hard_threshold,
@@ -328,6 +352,9 @@ def compute_pc_hbm_unlabeled_loss(
         "soft_teacher_bce": soft_teacher_bce.detach(),
         "soft_teacher_weighted_iou": soft_teacher_weighted_iou.detach(),
         "soft_teacher_iou_valid_sample_ratio": soft_teacher_iou_valid_sample_ratio.detach(),
+        "final_consistency_loss": final_consistency_loss.detach(),
+        "final_consistency_weighted_loss": final_consistency_weighted_loss.detach(),
+        "final_consistency_effective_weight": z_student.new_tensor(final_weight).detach(),
         "hard_teacher_loss": hard_teacher_loss.detach(),
         "hard_teacher_ramp_factor": z_student.new_tensor(hard_ramp_factor).detach(),
         "hard_teacher_effective_weight": z_student.new_tensor(effective_hard_weight).detach(),
@@ -336,6 +363,7 @@ def compute_pc_hbm_unlabeled_loss(
         "hard_teacher_valid_sample_ratio": hard_teacher_valid_sample_ratio.detach(),
         "loss_u_total": loss_u_total.detach(),
         "pseudo_conf_mean": confidence.mean().detach(),
+        "pseudo_conf_valid_pixel_ratio": pseudo_conf_valid_pixel_ratio.detach(),
     }
     return loss_u_total, log
 
@@ -359,7 +387,12 @@ def structure_aware_confidence(teacher_aux: Dict[str, Any]) -> torch.Tensor:
     pc = teacher_aux.get("pc_hbm", {}) or {}
     pi = mix.get("pi")
     if pi is not None:
-        mix_ent = -(pi * pi.clamp_min(1e-6).log()).sum(dim=1, keepdim=True) / torch.log(torch.tensor(4.0, device=pi.device, dtype=pi.dtype))
+        if pi.size(1) > 1:
+            entropy_max = pi.new_tensor(float(pi.size(1))).log()
+            mix_ent = -(pi * pi.clamp_min(1e-6).log()).sum(dim=1, keepdim=True)
+            mix_ent = (mix_ent / entropy_max.clamp_min(1e-6)).clamp(0.0, 1.0)
+        else:
+            mix_ent = torch.zeros_like(pi[:, :1])
         if mix_ent.shape[-2:] != certainty.shape[-2:]:
             mix_ent = F.interpolate(mix_ent, size=certainty.shape[-2:], mode="bilinear", align_corners=False)
     else:
@@ -369,9 +402,14 @@ def structure_aware_confidence(teacher_aux: Dict[str, Any]) -> torch.Tensor:
         c23_up = torch.zeros_like(certainty)
     else:
         c23_up = F.interpolate(c23, size=certainty.shape[-2:], mode="bilinear", align_corners=False).clamp(0.0, 1.0)
-    route_ent = pc.get("route_entropy")
+    route_ent = pc.get("route_entropy_norm")
+    if route_ent is None:
+        route_ent = pc.get("route_entropy")
     if isinstance(route_ent, torch.Tensor) and route_ent.numel() > 0:
-        route_penalty = route_ent.view(route_ent.size(0), 1, 1, 1).to(device=certainty.device, dtype=certainty.dtype)
+        route_penalty = route_ent.view(route_ent.size(0), 1, 1, 1).to(
+            device=certainty.device,
+            dtype=certainty.dtype,
+        ).clamp(0.0, 1.0)
     else:
         route_penalty = torch.zeros_like(certainty[:, :, :1, :1])
     return (certainty * agreement * (1.0 - 0.5 * mix_ent) * (1.0 - 0.5 * c23_up) * (1.0 - 0.25 * route_penalty)).clamp(0.0, 1.0)

@@ -25,6 +25,24 @@ def training_epoch_range(epoch_st, total_epochs):
     return range(int(epoch_st), int(total_epochs))
 
 
+def optimizer_grad_l2_norm(optimizer):
+    """Return the global L2 norm of the current optimizer gradients."""
+    total_sq = None
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            gradient = gradient.detach()
+            if gradient.is_sparse:
+                gradient = gradient.coalesce().values()
+            gradient_sq = gradient.float().pow(2).sum()
+            total_sq = gradient_sq if total_sq is None else total_sq + gradient_sq
+    if total_sq is None:
+        return 0.0
+    return float(total_sq.sqrt().item())
+
+
 class SemiSupervisedTrainer:
     def __init__(self, data_loaders, config, device, logger=None, writer=None):
         self.train_loader, self.test_loaders = data_loaders
@@ -36,7 +54,7 @@ class SemiSupervisedTrainer:
             self.criterion_gdt = nn.BCELoss()
 
         self.pix_loss = PixLoss(config)
-        self.loss_log = AverageMeter()
+        self.epoch_meters = {}
 
         self.global_step = 0
         self.device = device
@@ -57,6 +75,145 @@ class SemiSupervisedTrainer:
         self.pc_hbm = self._get_model_pc_hbm()
 
     @retry_if_cuda_oom
+    def _reset_epoch_meters(self):
+        self.epoch_meters = {
+            "Sup": {"loss": AverageMeter(), "grad_norm": AverageMeter()},
+            "Unsup": {"loss": AverageMeter(), "grad_norm": AverageMeter()},
+        }
+        self.unsup_full_forward_meter = AverageMeter()
+
+    def _record_branch_update(self, branch_name, loss_value, batch_size, grad_norm):
+        meters = self.epoch_meters[branch_name]
+        meters["loss"].update(float(loss_value), int(batch_size))
+        if grad_norm is not None:
+            meters["grad_norm"].update(float(grad_norm))
+
+    def _reduced_meter(self, meter):
+        reduction_device = self.model_optimizer.param_groups[0]["params"][0].device
+        values = torch.tensor(
+            [float(meter.sum), float(meter.count)],
+            dtype=torch.float64,
+            device=reduction_device,
+        )
+        if (
+            self.config.distributed_train
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.SUM)
+        count = float(values[1].item())
+        return (float(values[0].item()) / count if count > 0 else None), count
+
+    def _build_epoch_summary(self, enable_unsup):
+        sup_loss, sup_samples = self._reduced_meter(self.epoch_meters["Sup"]["loss"])
+        sup_grad_norm, sup_grad_updates = self._reduced_meter(
+            self.epoch_meters["Sup"]["grad_norm"]
+        )
+        summary = {
+            "sup_loss": sup_loss,
+            "sup_samples": sup_samples,
+            "sup_grad_norm": sup_grad_norm,
+            "sup_grad_updates": sup_grad_updates,
+            "unsup_enabled": bool(enable_unsup),
+        }
+        if enable_unsup:
+            unsup_loss, unsup_samples = self._reduced_meter(
+                self.epoch_meters["Unsup"]["loss"]
+            )
+            unsup_grad_norm, unsup_grad_updates = self._reduced_meter(
+                self.epoch_meters["Unsup"]["grad_norm"]
+            )
+            full_forward_ratio, unsup_updates = self._reduced_meter(
+                self.unsup_full_forward_meter
+            )
+            summary.update(
+                {
+                    "unsup_loss": unsup_loss,
+                    "unsup_samples": unsup_samples,
+                    "unsup_grad_norm": unsup_grad_norm,
+                    "unsup_grad_updates": unsup_grad_updates,
+                    "unsup_full_forward_ratio": full_forward_ratio,
+                    "unsup_updates": unsup_updates,
+                }
+            )
+        return summary
+
+    def _log_epoch_summary(self, epoch, summary):
+        def formatted(value, spec):
+            return format(value, spec) if value is not None else "not-recorded"
+
+        message = (
+            f"[*] Epoch {epoch} branch summary: "
+            f"Sup loss={formatted(summary['sup_loss'], '.6f')}, "
+            f"grad_norm={formatted(summary['sup_grad_norm'], '.6e')}"
+        )
+        if summary["unsup_enabled"]:
+            message += (
+                f"; Unsup loss={formatted(summary['unsup_loss'], '.6f')}, "
+                f"grad_norm={formatted(summary['unsup_grad_norm'], '.6e')}, "
+                "full_forward_ratio="
+                f"{formatted(summary['unsup_full_forward_ratio'], '.3f')}"
+            )
+        else:
+            message += "; Unsup=disabled"
+        self.logger.key_info(message)
+
+        is_rank_zero = (
+            not self.config.distributed_train
+            or not torch.distributed.is_initialized()
+            or get_rank() == 0
+        )
+        if not is_rank_zero:
+            return
+        metrics = {}
+        if summary["sup_loss"] is not None:
+            metrics["Epoch/Sup-loss"] = summary["sup_loss"]
+        if summary["sup_grad_norm"] is not None:
+            metrics["Epoch/Sup-grad_norm"] = summary["sup_grad_norm"]
+        if summary["unsup_enabled"]:
+            if summary["unsup_loss"] is not None:
+                metrics["Epoch/Unsup-loss"] = summary["unsup_loss"]
+            if summary["unsup_grad_norm"] is not None:
+                metrics["Epoch/Unsup-grad_norm"] = summary["unsup_grad_norm"]
+            if summary["unsup_full_forward_ratio"] is not None:
+                metrics["Epoch/Unsup-full_forward_ratio"] = summary[
+                    "unsup_full_forward_ratio"
+                ]
+        if metrics:
+            wandb.log(metrics, step=self.global_step)
+
+    def _log_training_policy(self):
+        if not self._pc_hbm_active():
+            return
+        self.logger.key_info(
+            "[*] PC-HBM unsupervised policy: "
+            f"start_epoch={int(getattr(self.config, 'unlabeled_start_epoch', 16))}, "
+            f"lambda_u={float(getattr(self.config, 'lambda_u', 1.0)):.3f}, "
+            "hard_weight="
+            f"{float(getattr(self.config, 'hard_teacher_loss_weight', 1.0)):.3f}, "
+            "hard_ramp_epochs="
+            f"{int(getattr(self.config, 'hard_teacher_rampup_epochs', 3))}, "
+            "soft_iou_enabled="
+            f"{bool(getattr(self.config, 'use_soft_teacher_weighted_iou', True))}, "
+            "soft_iou_weight="
+            f"{float(getattr(self.config, 'soft_teacher_weighted_iou_weight', 0.25)):.3f}, "
+            "student_full_forward_interval="
+            f"{int(getattr(self.config, 'pc_hbm_unsup_full_forward_interval', 0))}, "
+            "final_consistency_weight="
+            f"{float(getattr(self.config, 'pc_hbm_unsup_final_consistency_weight', 0.0)):.3f}, "
+            "branch_grad_norms="
+            f"{bool(getattr(self.config, 'log_branch_grad_norms', False))}"
+        )
+
+    def _use_full_unsup_student(self, batch_idx):
+        interval = int(getattr(self.config, "pc_hbm_unsup_full_forward_interval", 0))
+        if interval < 0:
+            raise ValueError(
+                "pc_hbm_unsup_full_forward_interval must be non-negative, "
+                f"got {interval}"
+            )
+        return interval > 0 and int(batch_idx) % interval == 0
+
     def _train_batch(
         self,
         batch,
@@ -68,6 +225,7 @@ class SemiSupervisedTrainer:
     ):
         inputs = batch[0].to(self.device)
         gts = batch[1].to(self.device) if gt_replace is None else gt_replace
+        loss_dict = {}
 
         module_aux = None
         if self._pc_hbm_active():
@@ -97,27 +255,37 @@ class SemiSupervisedTrainer:
         if self._pc_hbm_active() and enable_pc_hbm_loss:
             loss_pix = self.pc_hbm.compute_losses(scaled_preds, module_aux, torch.clamp(gts, 0, 1)) * loss_alpha
             for loss_name, loss_value in self.pc_hbm.loss_dict.items():
-                self.loss_dict[loss_name] = loss_value
+                loss_dict[loss_name] = loss_value
         else:
             loss_pix = self.pix_loss(scaled_preds, torch.clamp(gts, 0, 1)) * loss_alpha
-        self.loss_dict['loss_pix'] = loss_pix.item()
+        loss_dict['loss_pix'] = loss_pix.item()
 
         loss = loss_pix
         if self.config.out_ref and not self._pc_hbm_active():
             loss = loss + loss_gdt
-            self.loss_dict['loss_gdt'] = loss_gdt.item() if hasattr(loss_gdt, "item") else float(loss_gdt)
+            loss_dict['loss_gdt'] = loss_gdt.item() if hasattr(loss_gdt, "item") else float(loss_gdt)
 
-        self.loss_log.update(loss.item(), inputs.size(0))
         self.model_optimizer.zero_grad()
         loss.backward()
+        grad_norm = None
+        if bool(getattr(self.config, "log_branch_grad_norms", False)):
+            grad_norm = optimizer_grad_l2_norm(self.model_optimizer)
+            loss_dict["grad_norm"] = grad_norm
+        self._record_branch_update(
+            branch_name,
+            loss.item(),
+            inputs.size(0),
+            grad_norm,
+        )
         self.model_optimizer.step()
+        return loss_dict
 
     @retry_if_cuda_oom
     def train_epoch(self, epoch, total_epochs):
         self.logger.key_info("[+] Training epoch {} ...".format(epoch))
         self.current_epoch = int(epoch)
         self.model.train()
-        self.loss_dict = {}
+        self._reset_epoch_meters()
         self.pc_hbm = self._get_model_pc_hbm()
         if self._pc_hbm_active():
             self._prepare_pc_hbm_epoch(epoch)
@@ -145,7 +313,7 @@ class SemiSupervisedTrainer:
                 elif batch_idx == 25:
                     self.cnt += 1
 
-            self._train_batch(
+            sup_metrics = self._train_batch(
                 sup_batch,
                 use_memory=use_memory,
                 enable_pc_hbm_loss=enable_pc_hbm_loss,
@@ -154,7 +322,7 @@ class SemiSupervisedTrainer:
             if log_base_progress or log_module_progress:
                 log_training_progress(
                     logger=self.logger,
-                    loss_dict=self.loss_dict,
+                    loss_dict=sup_metrics,
                     title='Semi-Supervised Training Losses',
                     wandb_prefix="Sup",
                     epoch=epoch,
@@ -169,11 +337,15 @@ class SemiSupervisedTrainer:
 
             if enable_unsup:
                 if self._pc_hbm_active():
-                    self._train_pc_hbm_unsup(unsup_batch, use_memory)
+                    unsup_metrics = self._train_pc_hbm_unsup(
+                        unsup_batch,
+                        use_memory,
+                        batch_idx,
+                    )
                     if log_base_progress or log_module_progress:
                         log_training_progress(
                             logger=self.logger,
-                            loss_dict=self.loss_dict,
+                            loss_dict=unsup_metrics,
                             title='Unsueprvised Training Losses',
                             wandb_prefix="Unsup",
                             epoch=epoch,
@@ -206,7 +378,7 @@ class SemiSupervisedTrainer:
                     )
                     teacher_pseudo = teacher_preds[-1].sigmoid()
                 pseudo_s = self._align_pseudo_to_strong(teacher_pseudo, geom)
-                self._train_batch(
+                unsup_metrics = self._train_batch(
                     student_unsup_batch,
                     gt_replace=pseudo_s,
                     loss_alpha=float(getattr(self.config, "lambda_u", 1.0)),
@@ -218,7 +390,7 @@ class SemiSupervisedTrainer:
                 if log_base_progress or log_module_progress:
                     log_training_progress(
                         logger=self.logger,
-                        loss_dict=self.loss_dict,
+                        loss_dict=unsup_metrics,
                         title='Unsueprvised Training Losses',
                         wandb_prefix="Unsup",
                         epoch=epoch,
@@ -245,7 +417,7 @@ class SemiSupervisedTrainer:
                 else:
                     self.model.ema_update(self.global_step)
 
-        return self.loss_log.avg
+        return self._build_epoch_summary(enable_unsup)
 
     def _prepare_pc_hbm_epoch(self, epoch):
         if self.pc_hbm is None:
@@ -259,7 +431,7 @@ class SemiSupervisedTrainer:
             info += f", fallback_reason={error}"
         self._log_module_info(info)
 
-    def _train_pc_hbm_unsup(self, unsup_batch, use_memory):
+    def _train_pc_hbm_unsup(self, unsup_batch, use_memory, batch_idx):
         if self.config.distributed_train:
             self.model.module.teacher.eval()
         else:
@@ -281,19 +453,22 @@ class SemiSupervisedTrainer:
             )
             teacher_pseudo = teacher_aux.get("p_final", torch.sigmoid(teacher_aux["z_final"])).detach()
             confidence = structure_aware_confidence(teacher_aux).detach()
+            teacher_pc = teacher_aux.get("pc_hbm", {}) or {}
+            route_entropy = teacher_pc.get("route_entropy")
+            route_entropy_norm = teacher_pc.get("route_entropy_norm")
         pseudo_s = self._align_pseudo_to_strong(teacher_pseudo, geom)
         conf_s = self._align_pseudo_to_strong(confidence, geom)
         del teacher_aux, teacher_pseudo, confidence, img_u_w
         img_u_s = student_unsup_batch[0].to(self.device)
-        student_core_only = bool(getattr(self.config, "pc_hbm_unsup_student_core_only", True))
+        student_full_forward = self._use_full_unsup_student(batch_idx)
         _, student_aux = self.model.forward_pc_hbm(
             img_u_s,
             use_memory=use_memory,
             return_all_logits=True,
             epoch=getattr(self, "current_epoch", None),
-            forward_mode="student_core" if student_core_only else "full",
-            need_p1_pra=False if student_core_only else getattr(self.config, "pc_hbm_unsup_student_need_p1_pra", None),
-            need_final_mixture=False if student_core_only else getattr(self.config, "pc_hbm_unsup_student_need_final_mixture", None),
+            forward_mode="full" if student_full_forward else "student_core",
+            need_p1_pra=student_full_forward,
+            need_final_mixture=student_full_forward,
             return_debug_aux=False,
             store_last_aux=False,
         )
@@ -304,14 +479,32 @@ class SemiSupervisedTrainer:
             self.config,
             epoch=getattr(self, "current_epoch", None),
         )
-        self.loss_dict["loss_pix"] = loss_u.item()
+        loss_dict = {"loss_pix": loss_u.item()}
         for key, value in log.items():
-            self.loss_dict[key] = float(value.detach().item())
-        self.loss_log.update(loss_u.item(), img_u_s.size(0))
+            loss_dict[key] = float(value.detach().item())
+        loss_dict["pc_hbm_unsup_full_forward"] = float(student_full_forward)
+        if torch.is_tensor(route_entropy) and route_entropy.numel() > 0:
+            loss_dict["route_entropy"] = float(route_entropy.detach().mean().item())
+        if torch.is_tensor(route_entropy_norm) and route_entropy_norm.numel() > 0:
+            loss_dict["route_entropy_norm"] = float(
+                route_entropy_norm.detach().mean().item()
+            )
+        self.unsup_full_forward_meter.update(float(student_full_forward))
         self.model_optimizer.zero_grad()
         loss_u.backward()
+        grad_norm = None
+        if bool(getattr(self.config, "log_branch_grad_norms", False)):
+            grad_norm = optimizer_grad_l2_norm(self.model_optimizer)
+            loss_dict["grad_norm"] = grad_norm
+        self._record_branch_update(
+            "Unsup",
+            loss_u.item(),
+            img_u_s.size(0),
+            grad_norm,
+        )
         self.model_optimizer.step()
         del student_aux, pseudo_s, conf_s, img_u_s, loss_u
+        return loss_dict
 
     def _extract_unsup_views(self, unsup_batch):
         if isinstance(unsup_batch, dict):
@@ -403,47 +596,6 @@ class SemiSupervisedTrainer:
         epoch = int(epoch)
         return eval_step > 0 and epoch >= eval_start and (epoch - eval_start) % eval_step == 0
 
-    def _reset_optimizer_for_stage2(self, epoch):
-        split_epoch = int(getattr(self.config, "sup_only_train_epoch", -1))
-        if epoch != split_epoch or not bool(
-            getattr(self.config, "reset_optimizer_at_stage2", False)
-        ):
-            return False
-
-        from models.build_model import _build_lr_scheduler, _build_optimizer
-
-        self.model_optimizer = _build_optimizer(
-            self.config,
-            self.model,
-            lr=float(self.config.stage2_initial_lr),
-        )
-        self.model_lr_scheduler = _build_lr_scheduler(
-            self.config,
-            self.model_optimizer,
-        )
-        return True
-
-    def _step_lr_before_epoch(self, epoch):
-        previous_lr = float(self.model_optimizer.param_groups[0]["lr"])
-        optimizer_was_reset = self._reset_optimizer_for_stage2(epoch)
-        step_epoch = getattr(self.model_lr_scheduler, "step_epoch", None)
-        if not callable(step_epoch):
-            return
-
-        step_epoch(epoch)
-        current_lr = float(self.model_optimizer.param_groups[0]["lr"])
-        current_stage = int(self.model_lr_scheduler.current_stage)
-        if epoch == int(self.config.sup_only_train_epoch):
-            self.logger.key_info(
-                "[*] Two-stage cosine restart: "
-                f"epoch={epoch}, previous_lr={previous_lr:.3e}, "
-                f"restart_lr={current_lr:.3e}, "
-                f"optimizer_state_preserved={not optimizer_was_reset}"
-            )
-        self.logger.key_info(
-            f"[*] LR before epoch: epoch={epoch}, stage={current_stage}, lr={current_lr:.3e}"
-        )
-
     def _should_save_checkpoint(self, epoch, total_epochs):
         save_step = int(getattr(self.config, "save_step", 0))
         save_last = int(getattr(self.config, "save_last", 0))
@@ -460,17 +612,13 @@ class SemiSupervisedTrainer:
         return regular_save or boundary_save
 
     def _lr_schedule_meta(self, total_epochs):
-        active_stage = getattr(self.model_lr_scheduler, "current_stage", 0)
         return {
             "scheduler_type": str(getattr(self.config, "scheduler_type", "multistep")),
             "tot_epochs": int(getattr(self.config, "tot_epochs", total_epochs)),
-            "sup_only_train_epoch": int(
-                getattr(self.config, "sup_only_train_epoch", -1)
-            ),
-            "active_stage": int(active_stage),
             "current_lr": [
                 float(group["lr"]) for group in self.model_optimizer.param_groups
             ],
+            "scheduler_epoch": int(getattr(self.model_lr_scheduler, "last_epoch", -1)),
         }
 
     def launch_train(self, split, total_epochs: int):
@@ -501,17 +649,16 @@ class SemiSupervisedTrainer:
         assert len(self.labeled_dataloader) == len(self.unlabeled_dataloader), (
             "The lenth between labeled_dataloader and unlabeled_dataloader is not equal!"
         )
+        self._log_training_policy()
 
         for epoch in training_epoch_range(self.epoch_st, total_epochs):
             if self.config.distributed_train:
                 self.unlabeled_dataloader.sampler.set_epoch(epoch)
                 self.labeled_dataloader.sampler.set_epoch(epoch)
-            self._step_lr_before_epoch(epoch)
-            self.train_epoch(epoch, total_epochs)
+            epoch_summary = self.train_epoch(epoch, total_epochs)
             self.logger.success_info("[*] Epoch {} done.".format(epoch))
-            self.logger.key_info("[*] Training Loss: {:.3f}".format(self.loss_log.avg))
-            if not callable(getattr(self.model_lr_scheduler, "step_epoch", None)):
-                self.model_lr_scheduler.step()
+            self._log_epoch_summary(epoch, epoch_summary)
+            self.model_lr_scheduler.step()
             current_lr = self.model_optimizer.param_groups[0]["lr"]
             self.logger.key_info("[*] Current LR: {:.3e}".format(current_lr))
 

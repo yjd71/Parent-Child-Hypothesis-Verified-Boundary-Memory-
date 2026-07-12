@@ -5,7 +5,6 @@ import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from utils import Logger
-from utils.two_stage_cosine_lr import TwoStageCosineLR
 from PC_HBM import build_pc_hbm, pc_hbm_enabled
 from config import Config
 from .talnet import ModelEMA
@@ -123,18 +122,6 @@ def _load_pc_hbm_memory_from_checkpoint(pc_hbm, checkpoint, config: Config, devi
         _log(logger, ("warn_info", "warning", "info"), f"[!] Failed to restore PC-HBM memory: {exc}. Fallback to baseline.")
 
 
-_TWO_STAGE_COSINE_NAMES = (
-    "two_stage_cosine",
-    "two-stage-cosine",
-    "two_stage_cosine_restart",
-)
-
-
-def _is_two_stage_cosine(config: Config) -> bool:
-    scheduler_type = str(getattr(config, "scheduler_type", "multistep")).strip().lower()
-    return scheduler_type in _TWO_STAGE_COSINE_NAMES
-
-
 def _build_optimizer(
     config: Config,
     model: torch.nn.Module,
@@ -158,38 +145,6 @@ def _build_optimizer(
 
 def _build_lr_scheduler(config: Config, optimizer: optim.Optimizer):
     scheduler_type = str(getattr(config, "scheduler_type", "multistep")).strip().lower()
-    if scheduler_type in _TWO_STAGE_COSINE_NAMES:
-        total_epochs = int(config.tot_epochs)
-        split_epoch = int(config.sup_only_train_epoch)
-        if bool(getattr(config, "require_lr_stage_match_unlabeled_stage", False)):
-            unlabeled_start_epoch = int(getattr(config, "unlabeled_start_epoch", -1))
-            if split_epoch != unlabeled_start_epoch:
-                raise ValueError(
-                    "Two-stage LR boundary must match the unlabeled-stage boundary when "
-                    "require_lr_stage_match_unlabeled_stage=True: "
-                    f"sup_only_train_epoch={split_epoch}, "
-                    f"unlabeled_start_epoch={unlabeled_start_epoch}"
-                )
-        preserve_state = bool(
-            getattr(config, "preserve_optimizer_state_across_stages", True)
-        )
-        reset_at_stage2 = bool(getattr(config, "reset_optimizer_at_stage2", False))
-        if preserve_state == reset_at_stage2:
-            raise ValueError(
-                "Exactly one optimizer stage policy must be enabled: "
-                "preserve_optimizer_state_across_stages and reset_optimizer_at_stage2 "
-                f"are both {preserve_state}"
-            )
-        return TwoStageCosineLR(
-            optimizer,
-            total_epochs=total_epochs,
-            split_epoch=split_epoch,
-            stage1_initial_lr=float(config.stage1_initial_lr),
-            stage1_min_lr=float(config.stage1_min_lr),
-            stage2_initial_lr=float(config.stage2_initial_lr),
-            stage2_min_lr=float(config.stage2_min_lr),
-        )
-
     if scheduler_type in ("cosine", "cosineannealing", "cosine_annealing"):
         total_epochs = int(getattr(config, "scheduler_t_max", getattr(config, "tot_epochs", 1)))
         warmup_epochs = max(0, int(getattr(config, "scheduler_warmup_epochs", 0)))
@@ -238,6 +193,52 @@ def _build_lr_scheduler(config: Config, optimizer: optim.Optimizer):
     raise NotImplementedError(f"Unsupported scheduler_type: {scheduler_type}")
 
 
+def _canonical_scheduler_type(value) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    compact = normalized.replace("_", "")
+    if compact in {"multistep", "step"}:
+        return "multistep"
+    if compact in {"cosine", "cosineannealing"}:
+        return "cosine"
+    if compact in {
+        "twostagecosine",
+        "twostagecosineannealing",
+        "twostagecosinerestart",
+        "twostagecosinelr",
+    }:
+        return "two_stage_cosine"
+    return normalized
+
+
+def _checkpoint_scheduler_type(checkpoint) -> str | None:
+    if not isinstance(checkpoint, dict):
+        return None
+    meta = checkpoint.get("lr_schedule_meta")
+    if isinstance(meta, dict) and meta.get("scheduler_type") is not None:
+        return _canonical_scheduler_type(meta["scheduler_type"])
+    state = checkpoint.get("lr_scheduler")
+    if isinstance(state, dict) and state.get("scheduler_name") is not None:
+        return _canonical_scheduler_type(state["scheduler_name"])
+    return None
+
+
+def _restore_fixed_optimizer_lr(
+    optimizer: optim.Optimizer,
+    base_lr: float,
+    scheduler_state=None,
+) -> None:
+    group_scales = []
+    if isinstance(scheduler_state, dict):
+        group_scales = list(scheduler_state.get("group_scales", []))
+    for index, group in enumerate(optimizer.param_groups):
+        scale = group.get("lr_scale")
+        if scale is None and index < len(group_scales):
+            scale = group_scales[index]
+        scale = float(scale) if scale is not None else 1.0
+        group["lr"] = float(base_lr) * scale
+        group["initial_lr"] = float(base_lr) * scale
+
+
 def build_model_optimizers(config: Config, logger: Logger, device: torch.device, resume: str = None) -> any:
     model = build_model(config)
     pc_hbm = _attach_pc_hbm_if_enabled(config, logger, device, model)
@@ -264,23 +265,47 @@ def build_model_optimizers(config: Config, logger: Logger, device: torch.device,
     if config.precisionHigh:
         torch.set_float32_matmul_precision('high')
 
-    initial_lr = (
-        float(config.stage1_initial_lr)
-        if _is_two_stage_cosine(config)
-        else float(config.lr)
-    )
-    optimizer = _build_optimizer(config, model, lr=initial_lr)
+    optimizer = _build_optimizer(config, model, lr=float(config.lr))
 
     lr_scheduler = _build_lr_scheduler(config, optimizer)
     logger.freeze_info("Scheduler type: {}".format(str(getattr(config, "scheduler_type", "multistep"))))
 
     if checkpoint is not None and bool(getattr(config, "resume_training_state", False)):
+        configured_scheduler_type = _canonical_scheduler_type(
+            getattr(config, "scheduler_type", "multistep")
+        )
+        checkpoint_scheduler_type = _checkpoint_scheduler_type(checkpoint)
+        scheduler_mismatch = (
+            checkpoint_scheduler_type is not None
+            and checkpoint_scheduler_type != configured_scheduler_type
+        )
+        optimizer_state_restored = False
         if 'optimizer' in checkpoint:
             try:
                 optimizer.load_state_dict(checkpoint['optimizer'])
+                optimizer_state_restored = True
             except ValueError as exc:
                 _log(logger, ("warn_info", "warning", "info"), f"[!] Optimizer state was not restored: {exc}")
-        if 'lr_scheduler' in checkpoint:
+        if scheduler_mismatch:
+            _restore_fixed_optimizer_lr(
+                optimizer,
+                float(config.lr),
+                checkpoint.get('lr_scheduler'),
+            )
+            _log(
+                logger,
+                ("warn_info", "warning", "info"),
+                "[!] Checkpoint scheduler type "
+                f"{checkpoint_scheduler_type!r} does not match configured type "
+                f"{configured_scheduler_type!r}; scheduler state was skipped and "
+                f"optimizer LR was restored to {float(config.lr):.3e} while keeping "
+                + (
+                    "the restored optimizer moments."
+                    if optimizer_state_restored
+                    else "the freshly initialized optimizer state."
+                ),
+            )
+        elif 'lr_scheduler' in checkpoint:
             try:
                 lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             except (ValueError, KeyError, TypeError) as exc:
@@ -288,17 +313,8 @@ def build_model_optimizers(config: Config, logger: Logger, device: torch.device,
                     logger,
                     ("warn_info", "warning", "info"),
                     "[!] LR scheduler state was not restored: "
-                    f"{exc}. Reconstructing from checkpoint epoch.",
+                    f"{exc}. Using the freshly configured scheduler.",
                 )
-                checkpoint_epoch = int(checkpoint.get('epoch', -1))
-                if hasattr(lr_scheduler, "step_epoch") and 0 <= checkpoint_epoch < int(config.tot_epochs):
-                    lr_scheduler.step_epoch(checkpoint_epoch)
-                    _log(
-                        logger,
-                        ("key_info", "info"),
-                        "[+] Two-stage LR reconstructed at checkpoint epoch "
-                        f"{checkpoint_epoch}.",
-                    )
         if 'epoch' in checkpoint:
             epoch_st = checkpoint['epoch'] + 1
             logger.key_info("[+] Resume training from epoch {}".format(epoch_st))
